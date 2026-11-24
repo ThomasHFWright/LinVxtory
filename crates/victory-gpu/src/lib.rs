@@ -29,6 +29,8 @@ mod drvwatch;
 #[cfg(windows)]
 mod draw;
 pub mod dxgi;
+#[cfg(windows)]
+mod dxc;
 pub mod fence;
 pub mod frame;
 #[cfg(windows)]
