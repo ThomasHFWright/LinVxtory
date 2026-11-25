@@ -18,6 +18,11 @@
 //! is gone and fills in zeros). A write that faults is not ours to take:
 //! the destination is host memory, which is always there; such a fault
 //! goes on to the handlers after this one.
+//!
+//! Write-back from host buffers uses a separate instruction and catches both
+//! read and write faults there before retrying through the kernel. Adapted from
+//! UwUCammie's victory-fork PR #1032, d919676c5b775408296cea28489e786c5d5cc78d.
+//! On this branch it also requires `VICTORY_WRITE_PLAIN=1`; it is off by default.
 
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -149,13 +154,31 @@ fn note_fault(from: usize, len: usize) {
     RECENT[last & 1023].store(last, Relaxed);
 }
 
-/// The handler that turns a read fault inside [`guarded`] into its return
-/// of false; put first in the line, once.
+/// Only redirect faults from our own instructions. The read-side guard-page
+/// behavior predates write-back and is kept unchanged.
 #[cfg(target_arch = "x86_64")]
-fn install() {
+fn fault_exit(rip: u64, code: i32, access: Option<usize>) -> Option<u64> {
     use windows_sys::Win32::Foundation::{
         EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
     };
+    let unavailable = code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR;
+    if rip == (&raw const victory_copy_guarded_at) as u64 {
+        if (unavailable && access == Some(0)) || code == EXCEPTION_GUARD_PAGE {
+            return Some((&raw const victory_copy_guarded_fault) as u64);
+        }
+    } else if rip == (&raw const victory_write_guarded_at) as u64
+        && matches!(access, Some(0 | 1))
+        && (unavailable || code == EXCEPTION_GUARD_PAGE)
+    {
+        return Some((&raw const victory_write_guarded_fault) as u64);
+    }
+    None
+}
+
+/// Returns false on a read fault in [`guarded`] or a read/write fault in
+/// [`guarded_write`]; put first in the line, once.
+#[cfg(target_arch = "x86_64")]
+fn install() {
     use windows_sys::Win32::System::Diagnostics::Debug::{
         AddVectoredExceptionHandler, EXCEPTION_CONTINUE_EXECUTION, EXCEPTION_CONTINUE_SEARCH, EXCEPTION_POINTERS,
     };
@@ -163,25 +186,10 @@ fn install() {
         // SAFETY: the system passes the exception being dispatched and the
         // context it will continue with.
         let (r, context) = unsafe { (&*(*info).ExceptionRecord, &mut *(*info).ContextRecord) };
-        // Only at our own copy/write instructions.
-        if context.Rip == (&raw const victory_copy_guarded_at) as u64 {
-            const READ: usize = 0;
-            let read = r.NumberParameters >= 1 && r.ExceptionInformation[0] == READ;
-            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && read;
-            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-                context.Rip = (&raw const victory_copy_guarded_fault) as u64;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
-            return EXCEPTION_CONTINUE_SEARCH;
-        }
-        if context.Rip == (&raw const victory_write_guarded_at) as u64 {
-            const WRITE: usize = 1;
-            let write = r.NumberParameters >= 1 && r.ExceptionInformation[0] == WRITE;
-            let gone = (r.ExceptionCode == EXCEPTION_ACCESS_VIOLATION || r.ExceptionCode == EXCEPTION_IN_PAGE_ERROR) && write;
-            if gone || r.ExceptionCode == EXCEPTION_GUARD_PAGE {
-                context.Rip = (&raw const victory_write_guarded_fault) as u64;
-                return EXCEPTION_CONTINUE_EXECUTION;
-            }
+        let access = (r.NumberParameters >= 1).then(|| r.ExceptionInformation[0]);
+        if let Some(exit) = fault_exit(context.Rip, r.ExceptionCode, access) {
+            context.Rip = exit;
+            return EXCEPTION_CONTINUE_EXECUTION;
         }
         EXCEPTION_CONTINUE_SEARCH
     }
@@ -214,32 +222,34 @@ fn guarded(_: *mut u8, _: *const u8, _: usize) -> bool {
 }
 
 /// Copies `len` bytes from host memory `from` into title memory `to` in place;
-/// false if a destination page is not mapped or not writable.
+/// false if a source or destination page faults. A prefix may already have
+/// been written: the caller must retry the whole range through the kernel.
+/// Neither this copy nor the fallback is atomic against concurrent remapping.
 #[cfg(target_arch = "x86_64")]
-fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
+pub(crate) fn guarded_write(to: *mut u8, from: *const u8, len: usize) -> bool {
     install();
-    // SAFETY: `from` is our readable host buffer; any unmapped or read-only
-    // destination page ends the write with 0 via [`install`].
+    // SAFETY: the caller owns the source and destination ranges; a fault at
+    // either range ends the write with 0 via [`install`].
     unsafe { victory_write_guarded(to, from, len) != 0 }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-fn guarded_write(_: *mut u8, _: *const u8, _: usize) -> bool {
+pub(crate) fn guarded_write(_: *mut u8, _: *const u8, _: usize) -> bool {
     false
 }
 
 fn write_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_WRITE_PLAIN").is_none_or(|v| v != "0"))
+    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_WRITE_PLAIN").is_some_and(|v| v == "1"))
 }
 
 /// Writes made in place, their bytes, and the writes that met an unmapped or
-/// read-only destination page (falling back to the kernel's write).
+/// source or unwritable destination page (falling back to the kernel's write).
 static WRITE_COUNT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
-/// With [`on`] (and `VICTORY_WRITE_PLAIN!=0`): writes host memory at `from`
-/// into title memory at `to` in place; false if disabled or a destination page
-/// is not writable (caller falls back to `NtWriteVirtualMemory`).
+/// With [`on`] and `VICTORY_WRITE_PLAIN=1`: writes host memory at `from`
+/// into title memory at `to` in place; false if disabled or either range
+/// faults (caller retries the whole range through the kernel).
 pub(crate) fn write(to: *mut u8, from: *const u8, len: usize) -> bool {
     if !write_on() {
         return false;
@@ -305,6 +315,34 @@ mod tests {
     };
 
     const PAGE: usize = 4096;
+
+    #[test]
+    fn write_fault_dispatch_requires_our_instruction_and_read_or_write_access() {
+        use windows_sys::Win32::Foundation::{
+            EXCEPTION_ACCESS_VIOLATION, EXCEPTION_GUARD_PAGE, EXCEPTION_IN_PAGE_ERROR,
+        };
+        let write = (&raw const victory_write_guarded_at) as u64;
+        let read = (&raw const victory_copy_guarded_at) as u64;
+        let exit = Some((&raw const victory_write_guarded_fault) as u64);
+        for code in [EXCEPTION_ACCESS_VIOLATION, EXCEPTION_IN_PAGE_ERROR, EXCEPTION_GUARD_PAGE] {
+            for access in [Some(0), Some(1)] {
+                assert_eq!(fault_exit(write, code, access), exit);
+                assert_eq!(fault_exit(0, code, access), None, "wrong instruction");
+            }
+            for access in [Some(8), Some(2), None] {
+                assert_eq!(fault_exit(write, code, access), None, "execute, unknown or missing access");
+            }
+        }
+        assert_eq!(fault_exit(write, 0, Some(1)), None, "unrelated exception");
+        assert_eq!(fault_exit(read, EXCEPTION_ACCESS_VIOLATION, Some(1)), None);
+        assert_eq!(fault_exit(read, EXCEPTION_ACCESS_VIOLATION, Some(8)), None);
+        assert_eq!(fault_exit(read, EXCEPTION_ACCESS_VIOLATION, None), None);
+        assert_eq!(
+            fault_exit(read, EXCEPTION_GUARD_PAGE, None),
+            Some((&raw const victory_copy_guarded_fault) as u64),
+            "preserve the pre-existing read-side guard behavior"
+        );
+    }
 
     #[test]
     fn memory_that_is_there_is_copied() {

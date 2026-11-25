@@ -7117,9 +7117,20 @@ fn direct_writes() -> bool {
 /// Copies host memory into title memory after a submission (what shaders
 /// wrote), leaving pages that are not mapped alone.
 pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
+    write_mapped_with(dst, src, len, direct_writes(), crate::plaincopy::write);
+}
+
+// Explicit policy lets the synthetic tests exercise both kernel fallbacks
+// and the guarded attempt without changing process-wide environment caches.
+fn write_mapped_with(
+    dst: *mut u8,
+    src: *const u8,
+    len: usize,
+    direct: bool,
+    try_plain: impl FnOnce(*mut u8, *const u8, usize) -> bool,
+) {
     use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
-    let direct = direct_writes();
     let write = |at: usize, n: usize| {
         let from = src.wrapping_add(at - dst as usize);
         let mut done = 0;
@@ -7135,7 +7146,9 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         // destination.
         unsafe { WriteProcessMemory(GetCurrentProcess(), at as _, from.cast(), n, &mut done) != 0 }
     };
-    if len == 0 || crate::plaincopy::write(dst, src, len) || write(dst as usize, len) {
+    // A failed guarded write may have stored a prefix. Retry from the start,
+    // as after a partial kernel write; pages may have been remapped meanwhile.
+    if len == 0 || try_plain(dst, src, len) || write(dst as usize, len) {
         return;
     }
     for_pieces(dst as usize, len, 64 << 10, |at, n| {
@@ -7146,6 +7159,10 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
         }
     });
 }
+
+#[cfg(all(test, target_arch = "x86_64"))]
+#[path = "host/guarded_write_tests.rs"]
+mod guarded_write_tests;
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
 /// `step`.
