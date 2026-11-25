@@ -151,3 +151,29 @@ the same first world compute bind, the earlier run presented 63 frames
 (0.36 FPS) and this run presented 67 (0.38 FPS). Cache warmth, the visible
 shot, and background observation differed. Keep the pipeline wait setting
 experimental.
+
+## Paired-wave and upload trial
+
+The compute translator incorporates changes from PiloteCode's
+[paired waves](https://github.com/fxceless/victory-fork/pull/854) and
+[second shader round](https://github.com/fxceless/victory-fork/pull/993).
+It can represent a 64-lane compute wave on the 32-lane host. On GE-Proton
+11-14 and an RTX 5090, all four formerly refused compute shaders and four
+tiled cascade-shadow shaders validated and created pipelines. The title also
+created all four formerly refused pipelines during the run. Correct shadow
+appearance in gameplay remains unverified.
+
+An opt-in port of independent upload fills from tunczzz's
+[frame-rate work](https://github.com/fxceless/victory-fork/pull/995) runs with
+`VICTORY_WIDE_FILLS=1`. Partial private-memory reads now check only the
+write-watch pages they cover. The native shader suite passed 253 tests with
+two ignored. The focused Proton run passed 52 tests covering paired waves,
+fills, indirect execution, watches, texture readback and completion ordering.
+
+With zero pipeline wait, the trial stopped itself after 619.71 seconds at
+title image offset `0x5149aec`. The title reported frame 2250, prestreaming,
+1,561 streaming requests and 45,000 of 45,000 instance slots occupied.
+No OOM kill occurred. The scripted gameplay probe was scheduled later.
+The three-minute window beginning three minutes after the first world compute
+bind presented 74 frames (0.42 FPS), versus 67 (0.38 FPS) on the preceding
+zero-wait build. These runs differ in shader preparation and visible shots.

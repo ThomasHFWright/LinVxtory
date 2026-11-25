@@ -422,16 +422,21 @@ impl Tracked {
     /// Kernel queries reset their answers atomically; publish those writes to
     /// every holder under the guard lock before any tracker can consume them.
     /// Failed spans stay dirty and must not be guarded as if still pool memory.
-    fn poll_pools(&self) -> BTreeSet<usize> {
+    fn poll_pools(&self, from: usize, to: usize) -> BTreeSet<usize> {
         use windows_sys::Win32::System::Memory::GetWriteWatch;
         const WRITE_WATCH_FLAG_RESET: u32 = 1;
         let mut failed = BTreeSet::new();
-        if self.pools.is_empty() { return failed; }
+        if self.pools.is_empty() || from >= to { return failed; }
+        // A take consumes 64 KiB tracking pages, so poll every kernel page
+        // of those pages, but leave unrelated pool history for its holders.
+        let from = from / PAGE * PAGE;
+        let to = to.checked_next_multiple_of(PAGE).unwrap_or(usize::MAX);
         // Bound scratch space and each query, even for very large buffers.
         let mut found = [0usize; 256];
         let mut g = guards();
         for &(start, end) in &self.pools {
-            let mut at = start;
+            let mut at = start.max(from);
+            let end = end.min(to);
             while at < end {
                 let next = at.saturating_add(found.len() * 4096).min(end);
                 let (mut count, mut granularity) = (found.len(), 0);
@@ -491,13 +496,13 @@ impl Tracked {
     /// read as zeros, with no copy to try (each such page cost a dozen
     /// failing kernel reads, 7-30 ms a frame in run perf4).
     pub(crate) fn take_split(&self, from: usize, to: usize) -> (Runs, Runs) {
-        let failed = self.poll_pools();
-        self.recheck_absent();
-        let had_absent = !self.absent.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         let (from, to) = (from.max(self.start), to.min(self.end));
         if from >= to {
             return (Vec::new(), Vec::new());
         }
+        let failed = self.poll_pools(from, to);
+        self.recheck_absent();
+        let had_absent = !self.absent.lock().unwrap_or_else(|e| e.into_inner()).is_empty();
         let pages: Vec<usize> = {
             #[cfg(feature = "diagnostics")]
             let waited = Timed(std::time::Instant::now(), crate::copystat::C::GuardWaitUs);
@@ -552,7 +557,7 @@ impl Tracked {
 
     /// Whether page `page` (a page number) changed since it was taken.
     pub(crate) fn changed(&self, page: usize) -> bool {
-        self.poll_pools();
+        self.poll_pools(self.start, self.end);
         self.changed
             .0
             .lock()
@@ -563,7 +568,7 @@ impl Tracked {
     /// The caller made pages (page numbers) of its copy equal to title
     /// memory itself (what shaders wrote went back): taken and guarded.
     pub(crate) fn taken(&self, pages: &[usize]) {
-        let failed = self.poll_pools();
+        let failed = self.poll_pools(self.start, self.end);
         let filtered;
         let pages = if failed.is_empty() { pages } else {
             filtered = pages.iter().copied().filter(|p| !failed.contains(p)).collect::<Vec<_>>();
@@ -582,10 +587,14 @@ impl Tracked {
     }
 
     /// Whether no page changed since it was taken: then [`Tracked::take`]
-    /// finds nothing. Views cost no lock; pools poll kernel writes. A write
+    /// finds nothing. Dirty bits answer false immediately; pools which
+    /// appear clean still poll kernel writes. A write
     /// racing this answer is found by the next asking, as one racing a take.
     pub(crate) fn clean(&self) -> bool {
-        self.poll_pools();
+        // A negative answer consumes no kernel history. A later take still
+        // polls its range; another clean holder can poll and fan out first.
+        if !clean_bit(self.changed.2) { return false; }
+        self.poll_pools(self.start, self.end);
         self.recheck_absent();
         clean_bit(self.changed.2)
     }
@@ -1031,6 +1040,86 @@ pub(crate) mod tests {
         assert!(!t.clean(), "native recommit must not leave a stale clean tracker");
         assert_eq!(t.take(p, p + PAGE), [(p, p + PAGE)]);
         assert!(t.clean(), "the replacement contents have been taken");
+    }
+
+    #[test]
+    fn partial_takes_leave_other_pool_writes_pending_and_fan_out_when_polled() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_DECOMMIT};
+        struct Pool(usize);
+        impl Drop for Pool { fn drop(&mut self) { free(self.0); } }
+        let p = pool(4);
+        let _pool = Pool(p);
+        let far = p + 3 * PAGE;
+        let buffer = track_copy(p, 4 * PAGE, false).unwrap();
+        let texture = track(far, PAGE, false).unwrap();
+        buffer.take(p, p + 4 * PAGE);
+        texture.take(far, far + PAGE);
+        assert!(buffer.clean() && texture.clean());
+        // A kernel-visible write outside the requested range, with no remap hook or fault.
+        unsafe {
+            assert_ne!(VirtualFree(far as *mut _, PAGE, MEM_DECOMMIT), 0);
+            assert_eq!(VirtualAlloc(far as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, far);
+            ((far + PAGE - 5) as *mut u8).write_volatile(7);
+        }
+        assert!(buffer.take(p - 1, p).is_empty());
+        assert!(buffer.take(p + 4 * PAGE, p + 5 * PAGE).is_empty());
+        assert!(buffer.take(p, p + PAGE).is_empty());
+        let mut found = [0usize; PAGE / 4096];
+        let (mut count, mut granularity) = (found.len(), 0);
+        // SAFETY: our committed page and enough outputs; no reset consumes its history.
+        assert_eq!(unsafe {
+            GetWriteWatch(0, far as *const _, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        }, 0);
+        assert!(found[..count].iter().any(|&at| far <= at && at < far + PAGE),
+            "taking the near page must not query/reset the distant page");
+        // Asking for one byte must still poll its whole 64 KiB tracking page,
+        // including the write in a different 4 KiB kernel page near its end.
+        assert_eq!(buffer.take(far + 1, far + 2), [(far + 1, far + 2)]);
+        assert!(!clean_bit(texture.changed.2), "reset fans out to the overlapping holder first");
+        assert_eq!(texture.take(far, far + PAGE), [(far, far + PAGE)]);
+        assert_eq!(buffer.take(far, far + PAGE), [(far, far + PAGE)], "partial take stays dirty");
+        assert!(buffer.clean() && texture.clean());
+        buffer.arm(far, far + PAGE);
+        texture.arm(far, far + PAGE);
+        // SAFETY: the consumed page is guarded again for both holders.
+        unsafe { ((far + PAGE - 5) as *mut u8).write_volatile(8) };
+        assert_eq!(buffer.saved(far / PAGE).unwrap()[PAGE - 5], 7);
+        assert_eq!(texture.saved(far / PAGE).unwrap()[PAGE - 5], 7);
+    }
+
+    #[test]
+    fn already_dirty_clean_check_leaves_native_writes_for_other_holders() {
+        use windows_sys::Win32::System::Memory::{GetWriteWatch, MEM_DECOMMIT};
+        struct Pool(usize);
+        impl Drop for Pool { fn drop(&mut self) { free(self.0); } }
+        let p = pool(2);
+        let _pool = Pool(p);
+        let far = p + PAGE;
+        let buffer = track(p, 2 * PAGE, false).unwrap();
+        let texture = track(far, PAGE, false).unwrap();
+        buffer.take(p, p + 2 * PAGE);
+        texture.take(far, far + PAGE);
+        assert!(buffer.clean() && texture.clean());
+        // SAFETY: first write faults into the guard; the recommitted second page does not.
+        unsafe {
+            (p as *mut u8).write_volatile(1);
+            assert_ne!(VirtualFree(far as *mut _, PAGE, MEM_DECOMMIT), 0);
+            assert_eq!(VirtualAlloc(far as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, far);
+            (far as *mut u8).write_volatile(2);
+        }
+        assert!(!buffer.clean());
+        let mut found = [0usize; PAGE / 4096];
+        let (mut count, mut granularity) = (found.len(), 0);
+        // SAFETY: inspect without consuming the other holder's native write history.
+        assert_eq!(unsafe {
+            GetWriteWatch(0, far as *const _, PAGE, found.as_mut_ptr().cast(), &mut count, &mut granularity)
+        }, 0);
+        assert!(count > 0, "a known dirty answer must not poll/reset unrelated writes");
+        assert!(clean_bit(texture.changed.2), "the native write has not been polled yet");
+        assert!(!texture.clean(), "a holder which appears clean must still poll for recommits");
+        assert_eq!(texture.take(far, far + PAGE), [(far, far + PAGE)]);
+        assert_eq!(buffer.take(p, p + 2 * PAGE), [(p, p + 2 * PAGE)]);
+        assert!(buffer.clean() && texture.clean());
     }
 
     #[test]

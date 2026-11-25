@@ -2443,7 +2443,30 @@ impl HostList {
     fn run_deferred(&self, batch: &mut Batch) {
         #[cfg(feature = "diagnostics")]
         use crate::copystat::{C, add};
-        for step in &self.deferred().copies {
+        let deferred = self.deferred();
+        let steps = &deferred.copies;
+        let wide_fills = crate::fills::enabled();
+        let mut next = 0;
+        while let Some(step) = steps.get(next) {
+            if wide_fills && matches!(step, Step::Fill(..)) {
+                let started = std::time::Instant::now();
+                let (count, bytes) = crate::fills::run_prefix(&steps[next..], |s| match *s {
+                    Step::Fill(dst, src, len) => Some((dst, src, len)),
+                    _ => None,
+                }, |(dst, src, len)| copy_mapped(dst as *mut u8, src as *const u8, len, false));
+                next += count;
+                let micros = started.elapsed().as_micros() as u64;
+                #[cfg(feature = "diagnostics")]
+                {
+                    add(C::Copies, count as u64);
+                    add(C::CopyBytes, bytes as u64);
+                    add(C::StepCopyUs, micros);
+                }
+                PREPARING[0].fetch_add(micros, Ordering::Relaxed);
+                PREPARING[1].fetch_add(bytes as u64, Ordering::Relaxed);
+                continue;
+            }
+            next += 1;
             let started = std::time::Instant::now();
             #[cfg(feature = "diagnostics")]
             let _timed = crate::watch::Timed(

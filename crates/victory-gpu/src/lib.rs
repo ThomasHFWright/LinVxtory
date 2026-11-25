@@ -37,6 +37,8 @@ mod dxc;
 #[cfg(windows)]
 pub mod external;
 pub mod fence;
+#[cfg(any(windows, test))]
+mod fills;
 pub mod frame;
 #[cfg(any(windows, test))]
 mod fresh_table;
