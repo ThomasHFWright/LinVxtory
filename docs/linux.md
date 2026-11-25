@@ -83,3 +83,9 @@ faulted. Breadcrumbs narrowed the likely crash region to a compute dispatch;
 no descriptor-QA mismatch was reported. A separate `VICTORY_HEAP_SYNC_TABLES=1`
 trial also faulted and showed no normal world geometry. Neither diagnostic
 experiment establishes a gameplay fix.
+
+The CBV size clamp from [PR24](https://github.com/fxceless/victory-fork/pull/24)
+by NuraadGit is applied to both host creation paths. Two explicitly invoked
+actual-path tests pass under Wine; the D3D12 info queue is unavailable there,
+so this proves creation/device survival, not native debug-layer validation.
+Gameplay impact is not yet established.

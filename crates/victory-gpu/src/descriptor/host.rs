@@ -1801,7 +1801,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: size.min(64 << 10).next_multiple_of(256),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2741,7 +2741,7 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: size.min(64 << 10).next_multiple_of(256),
             };
             // SAFETY: a slot of our heap; the range lies in the host copy.
             unsafe { device.CreateConstantBufferView(Some(&desc), at) };
@@ -3133,6 +3133,79 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Run each device regression in its own process, with diagnostics and
+    // VICTORY_D3D12_DEBUG=1. An unclamped negative control removes the device.
+    #[test]
+    #[ignore = "requires an isolated D3D12 device; run explicitly"]
+    fn constant_buffer_make_keeps_the_device_alive() {
+        check_constant_buffer_creation(false);
+    }
+
+    #[test]
+    #[ignore = "requires an isolated D3D12 device; run explicitly"]
+    fn constant_buffer_constant_at_keeps_the_device_alive() {
+        check_constant_buffer_creation(true);
+    }
+
+    fn check_constant_buffer_creation(dynamic: bool) {
+        use windows::core::Interface;
+
+        let host = host().expect("a D3D12 host is required, not a skipped test");
+        let heap = HostHeap::new(false, 4).expect("a view heap");
+        let slot = heap.dynamic(1).expect("a dynamic descriptor slot");
+        let (buffer, _) = host.upload_buffer(4 << 20).expect("a live backing buffer");
+        let memory = vec![0u8; 4 << 20];
+        let address = (memory.as_ptr() as u64).next_multiple_of(64 << 10);
+        let queue = host.device.cast::<ID3D12InfoQueue>().ok();
+        if queue.is_none() {
+            eprintln!("no D3D12 info queue: checking device survival only");
+        }
+        // SAFETY: all resources are live; only descriptor creation and
+        // device/debug-queue queries occur here, with no GPU submission.
+        unsafe {
+            assert!(host.device.GetDeviceRemovedReason().is_ok(), "device alive before CBVs");
+            let sizes = [0, 1, 255, 256, 257, 480, 65_535, 65_536, 65_537, 896_256, 969_472, 1_406_720, 2_785_536];
+            // Only constant_at can test u32::MAX without asking shadow::find
+            // to resolve a synthetic 4 GiB title-memory range.
+            for size in sizes.into_iter().chain(dynamic.then_some(u32::MAX)) {
+                if let Some(queue) = &queue {
+                    queue.ClearStoredMessages();
+                }
+                let _kept = if dynamic {
+                    let gpu = if size == 0 { 0 } else { buffer.GetGPUVirtualAddress() };
+                    heap.constant_at(slot, gpu, size);
+                    None
+                } else {
+                    Some(make(&View::Constant(address, size), heap.cpu(slot))
+                        .expect("the real make path must create a descriptor")
+                        .expect("the descriptor must retain its backing resource"))
+                };
+                if let Some(queue) = &queue {
+                    for i in 0..queue.GetNumStoredMessages() {
+                        let mut bytes = 0;
+                        queue.GetMessage(i, None, &mut bytes).expect("debug message size");
+                        let mut storage = vec![0u64; bytes.div_ceil(8)];
+                        let message = storage.as_mut_ptr().cast::<D3D12_MESSAGE>();
+                        queue.GetMessage(i, Some(message), &mut bytes).expect("debug message");
+                        let m = &*message;
+                        let description = std::slice::from_raw_parts(m.pDescription, m.DescriptionByteLength);
+                        assert!(
+                            m.Severity.0 > D3D12_MESSAGE_SEVERITY_ERROR.0,
+                            "CBV size {size}, dynamic={dynamic}: D3D12 id {}: {}",
+                            m.ID.0,
+                            String::from_utf8_lossy(description),
+                        );
+                    }
+                }
+                assert!(
+                    host.device.GetDeviceRemovedReason().is_ok(),
+                    "CBV size {size}, dynamic={dynamic}: device removed",
+                );
+            }
+        }
+    }
+
 
     /// Exercise the same classification and mapped write as note_buffer,
     /// without constructing a host device or silently skipping on Linux.
