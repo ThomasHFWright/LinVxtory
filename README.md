@@ -42,6 +42,10 @@ The executable remains `victory.exe`.
   [VIctory PR454](https://github.com/Marvisak/VIctory/pull/454).
 - **NuraadGit:** the constant-buffer size limit fix from
   [victory-fork PR24](https://github.com/fxceless/victory-fork/pull/24).
+- **gomeaw:** the cross-page buffer transfer fix and synthetic regressions from
+  [victory-fork PR846](https://github.com/fxceless/victory-fork/pull/846).
+- **ryotdev:** initialized/root UAV test support adapted from
+  [victory-fork PR33](https://github.com/fxceless/victory-fork/pull/33).
 - **jtrudeau1530:** reports of Linux memory-range and descriptor synchronization
   issues that informed independently implemented fixes here.
 

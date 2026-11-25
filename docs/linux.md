@@ -115,11 +115,28 @@ and mixed latches, nested counter resets, and fallback cases. The old code fails
 the follow-barrier regression; the fix passes. The Windows cases also validate
 the production serialized DXIL. The full shader suite under Wine reports
 **221 passed, 1 known failure, 3 ignored**: the existing stub-digest expectation
-still fails. Build, Clippy and asset policy pass. Gameplay impact is pending a
-separate trial.
+still fails. Build, Clippy and asset policy pass. The subsequent game trial still hit an MMU fault at world entry, without
+verified normal geometry. The correction has not resolved gameplay.
 
 Runtime comparisons using the older vkd3d descriptor backend and disabling
 VRAM buffer copies also hit MMU faults (approximately 141 and 131 seconds).
 Neither produced verified normal world geometry. Three compute DXIL containers
 from the earlier crash regions pass Microsoft's validator; this does not prove
 correct SPIR-V translation or runtime behavior.
+
+
+## Transfers crossing a page boundary
+
+The [PR846](https://github.com/fxceless/victory-fork/pull/846) fix by gomeaw is
+applied to wide global loads/stores and scalar loads. A transfer that crosses a
+64 KiB title-memory page now resolves the second page independently, including
+address carry and missing-page notification. Same-page accesses remain vectorized.
+
+All **61 synthetic GPU cases pass on the RTX 5090 under Wine**, in three test
+families. They cover separate biased views, every aligned split position,
+4 GiB carry, missing-page values/faults, and store canaries. Restoring the previous
+lowering while retaining the tests makes all three families fail at the first
+crossing x2 case: loads read the wrong mapping, and stores change a canary.
+The fixture uses gomeaw's validation cases and ryotdev's initialized/root UAV
+support; hardware selection is adapted for Linux. No title data is used.
+Clippy and the Windows build pass. Gameplay impact remains to be tested.
