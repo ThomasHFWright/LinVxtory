@@ -1,7 +1,7 @@
 # Upstream integration — 2026-11-25
 
-Work in progress: Marvisak/VIctory main `13f91caee25f2fdf2c062be5f7a27f058e51cbca`
-contains 402 commits beyond the shared ancestor `ffe310e`. The previous Linux
+The published Linux build at `cbe8b3b` includes Marvisak/VIctory main
+`13f91caee25f2fdf2c062be5f7a27f058e51cbca`, 402 commits beyond the shared ancestor `ffe310e`. The previous Linux
 source is retained locally at `backup/pre-marvisak-20261125` (`fd467c9`).
 The previous tested executable and runtime remain preserved.
 
@@ -141,4 +141,13 @@ especially textures and heaps, remains the largest measured cost.
 This bounded run did not reproduce the earlier title assertion at image offset
 `0x5149aec`; it does not establish that the assertion is fixed. The previous
 merged run hit it after 581.39 seconds. All four paths remain experimental and
-opt-in. The merge has not yet been committed or pushed.
+opt-in. The source and matching executable are available in the [cbe8b3b prerelease](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-cbe8b3b).
+
+With the same executable and `VICTORY_PIPELINE_WAIT_MS=0`, an offline RTX 5090
+trial ended after 590.71 seconds on a title breakpoint at image offset
+`0x63966f` (exit 3). The opening cinematic rendered. Input probes did not
+establish control. In the three-minute window starting three minutes after
+the same first world compute bind, the earlier run presented 63 frames
+(0.36 FPS) and this run presented 67 (0.38 FPS). Cache warmth, the visible
+shot, and background observation differed. Keep the pipeline wait setting
+experimental.

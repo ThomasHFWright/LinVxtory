@@ -22,7 +22,7 @@ performance, controllable gameplay, then more complete textures and models.
 
 ## Current Linux status
 
-Integration of Marvisak/VIctory through `13f91ca` (2026-11-25) is in progress.
+The [Linux diagnostic build](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-cbe8b3b) includes Marvisak/VIctory through `13f91ca` (2026-11-25).
 The merged build now passes its initial loading crash after correcting shader
 handle annotations and restoring host wave-width discovery. The failing shader
 pair validates and creates on the GPU; 10 focused regressions pass. The retry
