@@ -1,3 +1,12 @@
+# LinVictory
+
+Linux rendering investigation based on our strongest verified local VIctory run.
+It shows partial world geometry with debug shading; **normal gameplay is not
+working yet**. See [the pinned baseline and provenance](docs/linvictory-baseline.md).
+The executable remains `victory.exe`. Upstream README follows.
+
+---
+
 # VIctory
 
 Runs Grand Theft Auto VI (Xbox Series X|S) natively on Windows, from files

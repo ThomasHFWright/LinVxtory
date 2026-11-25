@@ -82,6 +82,8 @@ pub(crate) struct State {
     dynamic: Vec<(usize, u32, u32)>,
     /// A fresh table of the stage being bound could not be made.
     table_failed: bool,
+    #[cfg(feature = "diagnostics")]
+    bound_probe: String,
 }
 
 impl Drop for State {
@@ -420,6 +422,8 @@ impl State {
     /// not be made.
     fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
         let l = &list.list;
+        #[cfg(feature = "diagnostics")]
+        self.bound_probe.clear();
         // Heaps first: a root signature with directly indexed heaps must be
         // set after them.
         if self.host_heaps != self.heaps {
@@ -461,6 +465,11 @@ impl State {
         }
         for stage in &p.stages {
             let t = stage.translated();
+            #[cfg(feature = "diagnostics")]
+            let probe = {
+                static HASH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+                HASH.get_or_init(|| std::env::var("VICTORY_BINDING_PROBE").unwrap_or_default()) == &stage.shader.hash
+            };
             self.table_failed = false;
             let made = self.tables(list, &t.used, compute);
             if self.table_failed {
@@ -485,6 +494,11 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                if probe {
+                    use std::fmt::Write;
+                    let _ = write!(self.bound_probe, " host constants p{param}={values:?}");
+                }
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -492,6 +506,20 @@ impl State {
                     } else {
                         l.SetGraphicsRoot32BitConstants(param, dwords, values.as_ptr().cast(), 0);
                     }
+                }
+            }
+            #[cfg(feature = "diagnostics")]
+            if probe {
+                use std::fmt::Write;
+                for u in t.used.iter().filter(|u| u.root == RootType::Table) {
+                    let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else { continue; };
+                    let Some(heap) = self.heap_of(table) else { continue; };
+                    let Some(host) = heap.host() else { continue; };
+                    let base = made.iter().find(|m| m.0 == u.slot).map(|m| m.1 / 32).or_else(|| heap.index(table));
+                    let Some(index) = base.map(|b| b + u.table_offset_dwords / 8) else { continue; };
+                    let detail = host.describe_bound(index);
+                    list.probe_binding(host.binding_address(index), detail.clone());
+                    let _ = write!(self.bound_probe, " | {:?} s{}+{} host[{index}] {detail}", u.kind, u.slot, u.table_offset_dwords);
                 }
             }
             for (views, srv) in [(&stage.root_cbvs, false), (&stage.root_srvs, true)] {
@@ -616,6 +644,10 @@ impl State {
             return;
         }
         #[cfg(feature = "diagnostics")]
+        if !self.bound_probe.is_empty() {
+            tracing::info!(x, y, z, bindings = %self.bound_probe, "binding probe dispatch");
+        }
+        #[cfg(feature = "diagnostics")]
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
@@ -656,6 +688,7 @@ impl State {
             }
         }
         let _ = write!(text, " tables {:?}", self.reads(compute));
+        text.push_str(&self.bound_probe);
         text
     }
 

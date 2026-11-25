@@ -305,6 +305,8 @@ pub(crate) struct HostList {
     /// data without marker texts), with the host GPU range a copy reads.
     #[cfg(feature = "diagnostics")]
     notes: Mutex<Vec<Note>>,
+    #[cfg(feature = "diagnostics")]
+    bindings: Mutex<Vec<(usize, usize, String)>>,
     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
     /// and at the end, and where they are read back.
     #[cfg(feature = "diagnostics")]
@@ -484,6 +486,8 @@ impl Host {
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
+                bindings: Mutex::default(),
+                #[cfg(feature = "diagnostics")]
                 stamps: OnceLock::new(),
             })
         }
@@ -504,7 +508,11 @@ impl Host {
     pub(crate) fn execute_title(&self, runs: &[&HostList]) {
         let mut submitted = self.submitted.lock().unwrap_or_else(|e| e.into_inner());
         crate::watch::new_submission();
+        #[cfg(feature = "diagnostics")]
+        for list in runs { list.probe_binding_changes("before-resync"); }
         crate::descriptor::resync_title_writes();
+        #[cfg(feature = "diagnostics")]
+        for list in runs { list.probe_binding_changes("after-resync"); }
         self.submit(&mut submitted, runs);
     }
 
@@ -517,6 +525,10 @@ impl Host {
         let mut firsts = Vec::with_capacity(runs.len());
         let mut batch = Batch::default();
         for list in runs {
+            #[cfg(feature = "diagnostics")]
+            if std::env::var_os("VICTORY_SUBMISSION_PROBE").is_some() {
+                list.probe_stamps(true);
+            }
             list.run_deferred(&mut batch);
             firsts.push(lists.len());
             if let Some(prelude) = list.prelude() {
@@ -551,6 +563,28 @@ impl Host {
                     .and_then(|()| self.fence.SetEventOnCompletion(*submitted, self.event));
                 match waited {
                     Ok(()) => {
+                        #[cfg(feature = "diagnostics")]
+                        if std::env::var_os("VICTORY_SUBMISSION_PROBE").is_some() {
+                            let status = WaitForSingleObject(self.event, 10_000);
+                            if status != windows::Win32::Foundation::WAIT_OBJECT_0 {
+                                tracing::error!(submission = *submitted, group = i, ?status,
+                                    completed = self.fence.GetCompletedValue(), "submission probe timeout");
+                                for (index, run) in runs.iter().enumerate() {
+                                    run.probe_binding_changes("timeout");
+                                    let stamps = run.probe_stamps(false);
+                                    tracing::error!(list = index, ?stamps, "submission probe resolved timestamp slots");
+                                    let notes = run.notes.lock().unwrap_or_else(|e| e.into_inner());
+                                    for (command, (note, range)) in notes.iter().enumerate() {
+                                        tracing::error!(list = index, command, ?range, %note, "submission probe command");
+                                    }
+                                }
+                                fail(format_args!("submission probe fence timeout{}{}",
+                                    self.removal_data(runs), last_notes(runs)));
+                            }
+                        } else {
+                            WaitForSingleObject(self.event, INFINITE);
+                        }
+                        #[cfg(not(feature = "diagnostics"))]
                         WaitForSingleObject(self.event, INFINITE);
                     }
                     Err(e) => tracing::warn!(error = %e, "host submission not waited for"),
@@ -798,10 +832,31 @@ impl Host {
 }
 
 impl HostList {
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn probe_binding(&self, address: usize, before: String) {
+        let command = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len();
+        self.bindings.lock().unwrap_or_else(|e| e.into_inner()).push((command, address, before));
+    }
+
+    #[cfg(feature = "diagnostics")]
+    fn probe_binding_changes(&self, phase: &str) {
+        let bindings = self.bindings.lock().unwrap_or_else(|e| e.into_inner());
+        if bindings.is_empty() { return; }
+        let mut changed = 0;
+        for (command, address, before) in bindings.iter() {
+            let current = crate::descriptor::host::bound_at(*address);
+            if &current != before {
+                changed += 1;
+                tracing::warn!(phase, command, address, %before, %current, "binding probe changed");
+            }
+        }
+        tracing::info!(phase, checked = bindings.len(), changed, "binding probe comparison");
+    }
+
     /// The timestamp heap and its read-back buffer (diagnostics, timing on).
     #[cfg(feature = "diagnostics")]
     fn stamps(&self) -> Option<&(ID3D12QueryHeap, ID3D12Resource)> {
-        if !timing() {
+        if !timing() && std::env::var_os("VICTORY_SUBMISSION_PROBE").is_none() {
             return None;
         }
         self.stamps
@@ -842,6 +897,29 @@ impl HostList {
                 Some((heap?, back?))
             })
             .as_ref()
+    }
+
+    /// Local diagnostic only: clear before submit, or sample progress after a timeout.
+    #[cfg(feature = "diagnostics")]
+    fn probe_stamps(&self, clear: bool) -> Vec<usize> {
+        let Some((_, back)) = self.stamps() else { return Vec::new(); };
+        let mut data = std::ptr::null_mut();
+        let range = D3D12_RANGE { Begin: 0, End: if clear { 0 } else { STAMPS as usize * 8 } };
+        // SAFETY: the readback allocation has STAMPS u64 slots. Clearing occurs only
+        // before submission under the submission lock; timeout reads are diagnostic
+        // snapshots, not a claim that the entire command list has completed.
+        unsafe {
+            if back.Map(0, Some(&range), Some(&mut data)).is_err() { return Vec::new(); }
+            let ptr = data.cast::<u64>();
+            let mut resolved = Vec::new();
+            for i in 0..STAMPS as usize {
+                if clear { ptr.add(i).write_volatile(0); }
+                else if ptr.add(i).read_volatile() != 0 { resolved.push(i); }
+            }
+            let written = D3D12_RANGE { Begin: 0, End: if clear { STAMPS as usize * 8 } else { 0 } };
+            back.Unmap(0, Some(&written));
+            resolved
+        }
     }
 
     /// The noted commands that took longest on the GPU, longest first, as
@@ -900,6 +978,8 @@ impl HostList {
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        #[cfg(feature = "diagnostics")]
+        self.bindings.lock().unwrap_or_else(|e| e.into_inner()).clear();
         {
             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
             (scratch.current, scratch.used) = (0, 0);
@@ -997,9 +1077,14 @@ impl HostList {
     fn note(&self, what: impl FnOnce() -> String, range: Option<(u64, u64)>) {
         if dred_on() {
             let at = self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32;
-            if let Some((heap, _)) = self.stamps() && at < STAMPS - 1 {
-                // SAFETY: an open list and our query heap.
-                unsafe { self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at) };
+            if let Some((heap, back)) = self.stamps() && at < STAMPS - 1 {
+                // SAFETY: an open list, a valid timestamp index and our readback buffer.
+                unsafe {
+                    self.list.EndQuery(heap, D3D12_QUERY_TYPE_TIMESTAMP, at);
+                    if std::env::var_os("VICTORY_SUBMISSION_PROBE").is_some() {
+                        self.list.ResolveQueryData(heap, D3D12_QUERY_TYPE_TIMESTAMP, at, 1, back, u64::from(at) * 8);
+                    }
+                }
             }
             let what = what();
             let text: Vec<u16> = what.encode_utf16().chain([0]).collect();
@@ -1392,6 +1477,51 @@ pub(crate) fn write_mapped(dst: *mut u8, src: *const u8, len: usize) {
             });
         }
     });
+}
+
+/// Copies the `runs` of `src` (byte ranges, as offsets) to the same offsets
+/// from `dst` in title memory. Stores them directly when all of them lie in
+/// committed read-write memory, a single query: a call into the kernel per
+/// run cost over a second a frame in the world, where shaders' scattered
+/// writes make thousands of runs a piece. Otherwise each goes through
+/// [`write_mapped`], which leaves pages that are not mapped alone.
+pub(crate) fn write_runs(dst: *mut u8, src: *const u8, runs: &[(usize, usize)]) {
+    let (Some(&(first, _)), Some(&(_, end))) = (runs.first(), runs.last()) else {
+        return;
+    };
+    if writable(dst as usize + first, end - first) {
+        for &(s, e) in runs {
+            // SAFETY: the source is our host copy; the destination was
+            // committed read-write just above. A guarded block that is
+            // guarded again meanwhile faults into our handler, which opens
+            // it. shortcut: a title thread unmapping or protecting this
+            // memory between the query and the stores would crash us; the
+            // GPU's bytes go back before the title is told the submission is
+            // done, so only a title that frees memory the GPU still writes
+            // could.
+            unsafe { std::ptr::copy_nonoverlapping(src.add(s), dst.add(s), e - s) };
+        }
+    } else {
+        for &(s, e) in runs {
+            write_mapped(dst.wrapping_add(s), src.wrapping_add(s), e - s);
+        }
+    }
+}
+
+/// Whether all of `[at, at + len)` is committed read-write memory now.
+pub(crate) fn writable(at: usize, len: usize) -> bool {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_READWRITE, VirtualQuery,
+    };
+    // SAFETY: plain data filled in by the query.
+    let mut info: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out pointer of the right size.
+    let n = unsafe { VirtualQuery(at as *const _, &mut info, size_of_val(&info)) };
+    // The answer covers the pages from `at`'s that share its state.
+    n != 0
+        && info.State == MEM_COMMIT
+        && info.Protect == PAGE_READWRITE
+        && at.saturating_add(len) <= info.BaseAddress as usize + info.RegionSize
 }
 
 /// Calls `f` with the pieces of `[start, start + len)` cut at multiples of
