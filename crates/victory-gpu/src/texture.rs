@@ -1621,6 +1621,104 @@ mod title_memory_tests {
 #[cfg(test)]
 mod staging_bounds_tests {
     use super::staging_subresource;
+    use victory_formats::texture::{Dimension, Error, Swizzle, Texture, TextureDesc};
+
+    // Synthetic footprints: 512-byte placement, 256-byte rows, no trailing
+    // padding after the last active row. Compare the real detiler with
+    // individual element addresses, not a tile/detile round trip.
+    fn check_short_subresources(desc: TextureDesc) {
+        let texture = Texture::new(&desc).unwrap();
+        let layout = &texture.planes[0].layout;
+        let tiled: Vec<u8> = (0..layout.size)
+            .map(|i| (i.wrapping_mul(0x9e37_79b9) >> 24) as u8)
+            .collect();
+        let slices = if desc.dimension == Dimension::Tex3d { 1 } else { desc.depth_or_array };
+        let element = layout.desc.element_bytes as usize;
+        const OFFSET: usize = 512;
+        const PITCH: usize = 256;
+        const GUARD: usize = 32;
+        for slice in 0..slices {
+            for (mip, m) in layout.mips.iter().enumerate() {
+                let active = m.width as usize * element;
+                assert!(active < PITCH);
+                let depth_pitch = PITCH * m.height as usize;
+                let padded = depth_pitch * m.depth as usize;
+                let need = (m.depth as usize - 1) * depth_pitch
+                    + (m.height as usize - 1) * PITCH + active;
+                let total = OFFSET + need;
+                let mut allocation = vec![0xcc; GUARD + total + GUARD];
+                let mut expected = allocation.clone();
+                for z in 0..m.depth {
+                    let source_slice = if desc.dimension == Dimension::Tex3d { z } else { slice };
+                    for y in 0..m.height {
+                        for x in 0..m.width {
+                            let source = layout.offset(mip as u32, x, y, source_slice).unwrap() as usize;
+                            let dest = GUARD + OFFSET + z as usize * depth_pitch
+                                + y as usize * PITCH + x as usize * element;
+                            expected[dest..dest + element].copy_from_slice(&tiled[source..source + element]);
+                        }
+                    }
+                }
+                let data = &mut allocation[GUARD..GUARD + total];
+                let linear = staging_subresource(data, OFFSET as u64, padded).unwrap();
+                assert_eq!(linear.len(), need, "mip {mip} slice {slice}");
+                layout.detile(&tiled, mip as u32, slice, linear, PITCH, depth_pitch).unwrap();
+                // Includes both outer guards, preceding subresource space,
+                // and every row/depth padding byte inside this allocation.
+                assert_eq!(allocation, expected, "mip {mip} slice {slice}");
+                let mut short = vec![0xcc; need - 1];
+                assert_eq!(
+                    layout.detile(&tiled, mip as u32, slice, &mut short, PITCH, depth_pitch),
+                    Err(Error::TooSmall),
+                );
+                assert!(short.iter().all(|&b| b == 0xcc));
+            }
+        }
+    }
+
+    #[test]
+    fn bc7_mips_and_array_slices_detile_into_short_final_rows() {
+        check_short_subresources(TextureDesc {
+            dimension: Dimension::Tex2d,
+            width: 20,
+            height: 12,
+            depth_or_array: 2,
+            mips: 5,
+            format: 98, // DXGI_FORMAT_BC7_UNORM: 16 bytes per 4x4 block.
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        });
+    }
+
+    #[test]
+    fn volume_mips_detile_into_short_final_depth_rows() {
+        check_short_subresources(TextureDesc {
+            dimension: Dimension::Tex3d,
+            width: 10,
+            height: 6,
+            depth_or_array: 5,
+            mips: 4,
+            format: 28, // DXGI_FORMAT_R8G8B8A8_UNORM.
+            samples: 1,
+            swizzle: Swizzle::SW_4KB_S,
+        });
+    }
+
+    #[test]
+    fn unheld_mip_zero_fill_stays_inside_short_allocation() {
+        // Last mip of 10x6 RGBA8 (5x3), and a single BC7 block.
+        for (offset, rows, active) in [(1536usize, 3usize, 20usize), (512, 1, 16)] {
+            let total = offset + (rows - 1) * 256 + active;
+            let mut allocation = vec![0xa5; 32 + total + 32];
+            let mut expected = allocation.clone();
+            expected[32 + offset..32 + total].fill(0);
+            let data = &mut allocation[32..32 + total];
+            // The same bounded slice and fill used for an unheld mip in
+            // Staging::detile; residency selection itself is not exercised.
+            staging_subresource(data, offset as u64, 256 * rows).unwrap().fill(0);
+            assert_eq!(allocation, expected);
+        }
+    }
 
     #[test]
     fn final_staging_row_does_not_include_unallocated_padding() {
