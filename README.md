@@ -24,9 +24,9 @@ normal gameplay. Performance work comes after visible, functioning scenes.
 **Normal in-world visuals now render on Linux; interactive gameplay is not yet
 verified.** A local integration of the code-table fix in
 [PR1006](https://github.com/fxceless/victory-fork/pull/1006) produced textured
-characters, floor geometry and lighting on an RTX 5090. The run lasted 9 minutes
-44 seconds without the previous NVIDIA Xid fault, then ended with a title
-assertion. Rendering remains incomplete and very slow. See
+characters, floor geometry and lighting on an RTX 5090. Two runs lasted 9 minutes
+44 seconds and 8 minutes 55 seconds without the previous NVIDIA Xid fault; both
+ended with the same title assertion. Rendering remains incomplete and very slow. See
 [Linux validation](docs/linux.md) for the exact scope, runtime and checks.
 
 The active branch is `linux-edge`, initially based on fxceless/victory-fork

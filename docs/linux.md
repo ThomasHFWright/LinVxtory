@@ -14,8 +14,13 @@ The exact code-table change from [PR1006](https://github.com/fxceless/victory-fo
 at `4e7af7b01356417864b935bd1fffc7d0dece266f` was the change between two trials
 using the same app/runtime corrections. The preceding build hit Xid 13 at
 world entry after 131 seconds. The new build ran for 583.74 seconds without
-an NVIDIA Xid, then exited with a title breakpoint (`0x80000003`). This is
+an NVIDIA Xid, then exited with a title breakpoint (`0x80000003`). A second
+run of the same binary/runtime with validation disabled produced real world
+scenes and no Xid for 534.58 seconds, then hit the same breakpoint. This is
 progress past the earlier GPU failure, not a claim of complete stability.
+The repeat recorded no memory-limit, swap-limit or OOM events; memory pressure
+was substantial, but allocation failure is not established as the assertion's
+cause. Removing validation did not resolve the slow rendering.
 
 Captured production shader tables shrank from 18,368 to 632 bytes and from
 16,640 to 616 bytes; the retained values exactly match their original trailing
