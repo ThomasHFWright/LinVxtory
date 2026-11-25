@@ -177,3 +177,20 @@ No OOM kill occurred. The scripted gameplay probe was scheduled later.
 The three-minute window beginning three minutes after the first world compute
 bind presented 74 frames (0.42 FPS), versus 67 (0.38 FPS) on the preceding
 zero-wait build. These runs differ in shader preparation and visible shots.
+
+### Indexed wineserver trial on the RTX 5090
+
+Both runs used the paired-wave executable, zero pipeline wait, wide fills and
+the same shader-cache directory. From 180 to 330 seconds after the first bind of
+compute `02384a60fda6f2d0`, stock GE-Proton 11-14 advanced 59 frames in 146.3
+seconds (0.40 FPS). A private GE11-14 wineserver with indexed view lookup
+advanced 148 in 149.2 seconds (0.99 FPS). Rates use the first and last logged
+present in the window. The camera sequence advances with the title and cache
+contents changed between runs, so the visible workload can differ.
+
+The indexed run closed itself after 393.28 seconds at `0x5149aec`. Its own
+report listed frame 1488, 1,586 streaming requests, 22,478 of 22,500 building
+slots and all 45,000 instance slots occupied. Both servers reached this
+breakpoint before the scheduled control test. The indexed server is a separate
+runtime experiment. The application release contains the same executable used
+for both runs.

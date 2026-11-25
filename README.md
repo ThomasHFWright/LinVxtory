@@ -33,11 +33,13 @@ ten minutes until the test harness stopped it, without an observed crash or GPU
 reset. Gathering and texture readback executed in the title; no frame-rate gain
 or controllable gameplay is established. See
 [upstream integration](docs/upstream-integration.md) for remaining checks.
-The paired-wave build creates the four compute pipelines that previously failed
+The [paired-wave build](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-10532b2) creates the four compute pipelines that previously failed
 on the RTX 5090. The offline trial rendered the intro for 10 minutes 20 seconds
 before a title breakpoint. Its streaming report showed all 45,000 instance slots
 occupied. World rendering measured 0.42 FPS over a three-minute sample.
-Player control remains unverified.
+On the same executable, a private indexed GE-Proton 11-14 wineserver improved a
+150-second world sample from 0.40 to 0.99 FPS. The title still filled its
+instance list and closed before player control could be verified.
 
 The world-rendering observations below describe the preserved pre-merge build.
 
