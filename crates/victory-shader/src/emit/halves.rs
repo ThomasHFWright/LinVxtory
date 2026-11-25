@@ -16,7 +16,7 @@ impl<'a> Lower<'a> {
     /// half; a float view's value it would not take apart). A use is a
     /// read as an operand ([`crate::ir::operand_reads`]): a later write of
     /// the register reads the value only to keep it in the lanes EXEC
-    /// leaves alone, and a phi carries it on, its own uses counting. False
+    /// leaves alone. Follow that write and phis to their later uses. False
     /// without a use.
     pub(super) fn read_only_as_halves(&self, value: Value) -> bool {
         let p = self.x.p;
@@ -33,6 +33,17 @@ impl<'a> Lower<'a> {
                 for i in &b.insts {
                     if !i.reads.iter().any(|r| r.1 == value) {
                         continue;
+                    }
+                    // A write may preserve inactive lanes or untouched bits, even
+                    // when the same register is also an explicit half operand.
+                    // Without a proof of complete overwrite, follow its new value.
+                    for &(reg, next) in &i.writes {
+                        if matches!(reg, Reg::V(_))
+                            && i.read(reg) == Some(value)
+                            && seen.insert(next)
+                        {
+                            todo.push(next);
+                        }
                     }
                     let operands = crate::ir::operand_reads(p, i);
                     let regs: Vec<Reg> = i
@@ -146,3 +157,7 @@ impl<'a> Lower<'a> {
         halves
     }
 }
+
+#[cfg(test)]
+#[path = "halves_tests.rs"]
+mod tests;

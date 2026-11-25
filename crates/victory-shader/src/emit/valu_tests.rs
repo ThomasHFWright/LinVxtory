@@ -2075,7 +2075,9 @@ fn half_places_are_the_descriptors_the_program_loads() {
     runtime.extend_from_slice(&mubuf_idxen(LOAD_D16_XYZW, 1, 0, 8));
     runtime.extend_from_slice(&mubuf_idxen(STORE_D16_XYZW, 1, 0, 12));
     runtime.push(S_ENDPGM);
-    assert_eq!(lowered(&runtime).half_views, [(1, 16)]);
+    // The dynamic source can alias the fixed destination in the same table.
+    // Both keep legacy float conversion until their ranges can be proved disjoint.
+    assert!(lowered(&runtime).half_views.is_empty());
 }
 
 /// A format load of whole dwords (`buffer_load_format_x`, not d16) whose
