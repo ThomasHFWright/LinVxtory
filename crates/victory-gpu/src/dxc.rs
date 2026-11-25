@@ -394,6 +394,28 @@ void main() { b.Store(8, b.Load(0) + b.Load(4)); }
         println!("D3D12 took the root signature and made the pipeline");
     }
 
+    #[test]
+    fn inflight_fetch_shader_keeps_its_root_signature_under_wine() {
+        let bytes = compile(crate::host::CARD_FETCH, "main", "cs_5_1")
+            .expect("the in-flight fetch shader must compile");
+        assert!(carries_root_signature(&bytes));
+        let device = device().expect("a D3D12 device for the fetch pipeline regression");
+        // SAFETY: the compiled shader owns its root signature; bytes stay live.
+        unsafe {
+            let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes).unwrap();
+            device.CreateComputePipelineState::<ID3D12PipelineState>(
+                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
+                    pRootSignature: std::mem::transmute_copy(&root),
+                    CS: D3D12_SHADER_BYTECODE {
+                        pShaderBytecode: bytes.as_ptr().cast(),
+                        BytecodeLength: bytes.len(),
+                    },
+                    ..Default::default()
+                },
+            ).expect("the fetch shader must create a pipeline");
+        }
+    }
+
     /// A source can hold several entries: only the entry carrying the
     /// attribute asks for a root signature, so only it is retried with DXC.
     #[test]

@@ -1,3 +1,17 @@
+# LinVictory
+
+Linux/Proton development based on the latest rendering work in
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork).
+Current rendering base: `0b0074e` (2026-11-25 12:43 UTC).
+The active branch is `linux-edge`; `linux-main` is an archived older experiment.
+
+This branch adds Wine runtime shader compilation support and an opt-in title
+watchdog hook. **Linux gameplay is not yet verified.** The Windows results below
+are upstream's. See [Linux validation](docs/linux.md) for our setup and results.
+The executable stays `victory.exe`; original history, credits and license remain.
+
+---
+
 # VIctory fork (work in progress)
 
 A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a

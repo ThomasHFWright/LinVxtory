@@ -1,0 +1,51 @@
+# Linux validation
+
+LinVictory follows current fxceless/victory-fork rendering work, pinned initially
+to `0b0074e0b2765e574c622e9a3de566f20f04135b`. Older debug-rendering experiments
+are archived; they are not the active source base.
+
+## Compatibility changes
+
+- [PR20](https://github.com/fxceless/victory-fork/pull/20): runtime HLSL falls
+  back to DXC when Wine's compiler refuses it or drops its root signature.
+- [PR454](https://github.com/Marvisak/VIctory/pull/454): opt-in, build/signature
+  checked watchdog hook (`VICTORY_NO_WATCHDOG=1`); use an external time limit.
+- The latest clamp variants, in-flight copy shader and indirect benchmark use
+  that shared compiler path. A regression creates the copy shader's root
+  signature and compute pipeline on D3D12 under Wine.
+- Compiler API calls in tests are adapted; three existing Clippy findings were
+  cleaned up without changing renderer behavior.
+
+The imported commits preserve their original authors. No shader skips,
+assertion bypasses or forced debug pixel shaders are added.
+
+## Test environment and results
+
+CachyOS, RTX 5090, NVIDIA 620.73.04, Rust 1.98.1, Windows MSVC cross-build,
+GE-Proton 11-14 Wine/DXGI, Microsoft DXC/DXIL 1.9.2609.
+The local D3D12 runtime uses vkd3d-proton `cae8353ed7959c4` with dxil-spirv
+`e084e35c4506210b44f6b7df3bbf31a1026545b8`, which avoided three isolated compiler
+recursions observed in earlier Linux trials. This does not establish correct
+rendering or GPU stability.
+
+Diagnostics build and prepare pass. Nine Windows library suites under Wine:
+**554 passed, 7 failed, 12 ignored**. All four compiler-fallback regressions pass,
+including the new in-flight copy shader. Integration fixtures were not run.
+
+Failures: three pipeline-library expectations, the shader stub digest,
+Windows event-log subscription, `WSAConnectByList`, and host device information.
+The Windows driver watcher cannot subscribe under this Wine runtime; the local
+launcher separately watches Linux kernel NVIDIA Xid messages and stops its run.
+These failures remain visible; they are not counted as passes.
+
+## Runtime trial
+
+Normal rendering validation is pending. Use separate cache/data/prefix folders,
+read-only input and an offline sandbox. Set native `d3d12,d3d12core,dxgi` DLL
+overrides and Windows paths for `VICTORY_DXC` / `VICTORY_DXIL`. The local baseline
+turns off `VK_NV_raw_access_chains` and opts into the title-watchdog hook with an
+external deadline. Other rendering switches retain upstream defaults, including
+its per-stage shader loop bounds; no uniform loop-limit override is used.
+
+Only source and aggregate results are published. Game files, generated shaders,
+logs, screenshots, caches and runtime binaries remain local.

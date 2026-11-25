@@ -2009,7 +2009,7 @@ mod bare_cost {
     use windows::Win32::Graphics::Dxgi::Common::*;
     use windows::Win32::Graphics::Dxgi::*;
     use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
-    use windows::core::{Interface, s};
+    use windows::core::Interface;
 
     use crate::host::{compile, transition};
 
@@ -2094,7 +2094,6 @@ void work() {
         heap_pairs: [[Option<ID3D12DescriptorHeap>; 2]; 2],
         tables: [D3D12_GPU_DESCRIPTOR_HANDLE; 2],
         targets: [D3D12_CPU_DESCRIPTOR_HANDLE; 2],
-        depth_written: D3D12_CPU_DESCRIPTOR_HANDLE,
         depth_tested: D3D12_CPU_DESCRIPTOR_HANDLE,
         stamps: ID3D12QueryHeap,
         back: ID3D12Resource,
@@ -2231,12 +2230,12 @@ void work() {
         /// The default adapter, as the layer takes it; `None` without one
         /// or on a software adapter.
         fn new() -> Option<Self> {
-            let vs = compile(DRAW, s!("corner"), s!("vs_5_1")).ok()?;
+            let vs = compile(DRAW, "corner", "vs_5_1").ok()?;
             let ps = [
-                compile(DRAW, s!("first"), s!("ps_5_1")).ok()?,
-                compile(DRAW, s!("second"), s!("ps_5_1")).ok()?,
+                compile(DRAW, "first", "ps_5_1").ok()?,
+                compile(DRAW, "second", "ps_5_1").ok()?,
             ];
-            let cs = compile(WORK, s!("work"), s!("cs_5_1")).ok()?;
+            let cs = compile(WORK, "work", "cs_5_1").ok()?;
             // SAFETY: plain object creation on a device of our own; the
             // views are made in heaps that live as long as the rig.
             unsafe {
@@ -2402,7 +2401,6 @@ void work() {
                     heap_pairs,
                     tables,
                     targets,
-                    depth_written,
                     depth_tested,
                     stamps,
                     back,
