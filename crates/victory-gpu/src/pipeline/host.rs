@@ -235,6 +235,8 @@ impl GraphicsState {
 
     /// Everything the state holds, as text: part of a pipeline's name in
     /// the library and of the key a title pipeline is started early by.
+    /// Use the effective host blend so old integer-blending pipelines do not
+    /// share a library name with their corrected descriptions (upstream PR715).
     pub(crate) fn describe(&self) -> String {
         let inputs: Vec<String> = self
             .inputs
@@ -254,7 +256,7 @@ impl GraphicsState {
         };
         format!(
             "{:?} {} {:?} {:?}{bounds} {inputs:?} {} {} {:?} {} {:?}",
-            self.blend,
+            host_blend(&self.blend, &self.targets),
             self.sample_mask,
             self.rasterizer,
             self.depth,
@@ -1174,7 +1176,7 @@ mod tests {
             pRootSignature: unsafe { std::mem::transmute_copy(&root) },
             VS: code(&vs),
             PS: code(&ps),
-            BlendState: g.blend,
+            BlendState: host_blend(&g.blend, &g.targets),
             SampleMask: g.sample_mask,
             RasterizerState: g.rasterizer,
             DepthStencilState: g.depth,
@@ -1430,5 +1432,44 @@ mod tests {
         let mut t = targets(&[DXGI_FORMAT_R8G8B8A8_UNORM]);
         t.RTFormats[1] = DXGI_FORMAT_R8_UINT;
         assert_eq!(host_blend(&blending(false), &t), blending(false));
+    }
+
+    #[test]
+    fn pipeline_name_follows_effective_blend() {
+        let mut a = GraphicsState {
+            blend: blending(true),
+            targets: targets(&[DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8_UINT]),
+            ..Default::default()
+        };
+        let mut b = GraphicsState {
+            blend: a.blend,
+            targets: a.targets,
+            ..Default::default()
+        };
+        b.blend.RenderTarget[1].BlendEnable = false.into();
+        assert_ne!(a.blend, b.blend);
+        assert_eq!(a.describe(), b.describe());
+        a.blend.RenderTarget[0].BlendEnable = false.into();
+        assert_ne!(a.describe(), b.describe());
+    }
+
+    #[test]
+    fn signed_first_target_preserves_shared_float_blend_and_write_masks() {
+        let mut b = blending(false);
+        b.AlphaToCoverageEnable = true.into();
+        b.RenderTarget[0].RenderTargetWriteMask = 5;
+        // Ignored while blending is shared; must not become slot 1's state.
+        b.RenderTarget[1].BlendEnable = false.into();
+        b.RenderTarget[1].RenderTargetWriteMask = 0;
+        let t = targets(&[DXGI_FORMAT_R16_SINT, DXGI_FORMAT_R16G16B16A16_FLOAT]);
+        let h = host_blend(&b, &t);
+        assert!(h.IndependentBlendEnable.as_bool());
+        assert_eq!(h.AlphaToCoverageEnable, b.AlphaToCoverageEnable);
+        assert!(!h.RenderTarget[0].BlendEnable.as_bool());
+        assert_eq!(h.RenderTarget[1], b.RenderTarget[0]);
+        let mut expected = b.RenderTarget[0];
+        expected.BlendEnable = false.into();
+        assert_eq!(h.RenderTarget[0], expected);
+        assert_eq!(host_blend(&h, &t), h, "normalization is idempotent");
     }
 }
