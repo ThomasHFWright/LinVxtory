@@ -40,7 +40,18 @@ These failures remain visible; they are not counted as passes.
 
 ## Runtime trial
 
-Normal rendering validation is pending. Use separate cache/data/prefix folders,
+The first normal-rendering trial reached world submissions, then hit an NVIDIA
+Xid 13/MMU fault at approximately 137 seconds. The observer stopped the run.
+No scene geometry was verified; this is not working Linux gameplay.
+
+A follow-up fixes the range guard shortcut described in
+[issue 698](https://github.com/fxceless/victory-fork/issues/698#issuecomment-7159281878):
+a range bypasses memory queries only when every block is known. The regression
+fails with the old first-block check and passes with full coverage; all 13
+write-watch, alias and mapping tests pass. Its title-runtime effect is not yet
+verified.
+
+ Use separate cache/data/prefix folders,
 read-only input and an offline sandbox. Set native `d3d12,d3d12core,dxgi` DLL
 overrides and Windows paths for `VICTORY_DXC` / `VICTORY_DXIL`. The local baseline
 turns off `VK_NV_raw_access_chains` and opts into the title-watchdog hook with an

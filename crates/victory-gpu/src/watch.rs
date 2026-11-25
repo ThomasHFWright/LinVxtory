@@ -120,7 +120,7 @@ pub(crate) fn ask_ahead(ranges: &[(usize, usize)]) {
     // triippywhale d0581a55). `VICTORY_VIEW_ASK=1` asks as before.
     #[cfg(feature = "diagnostics")]
     let all = pieces.len();
-    pieces.retain(|&(first, _)| !known_view(first * PAGE));
+    pieces.retain(|&(first, last)| !known_view(first * PAGE, last * PAGE));
     #[cfg(feature = "diagnostics")]
     AHEAD_VIEWS.fetch_add((all - pieces.len()) as u64, std::sync::atomic::Ordering::Relaxed);
     j.asked += 1;
@@ -235,7 +235,7 @@ pub(crate) fn ask_once(ranges: &[(usize, usize)]) {
         // only fail there, one failed kernel call for each such copy at
         // every submission, and `writes` answers it from the guards
         // (after triippywhale cc368c7c).
-        if known_view(start) {
+        if known_view(start, end) {
             #[cfg(feature = "diagnostics")]
             AHEAD_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
@@ -408,7 +408,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // View memory the guards already hold cannot be write-watched: the
     // kernel asking would only fail. Copies of it are flushed many times a
     // frame, each time paying that failed call before the guards answer.
-    let known_view = guarded && known_view(first * PAGE);
+    let known_view = guarded && known_view(first * PAGE, last * PAGE);
     // SAFETY: the answer buffer holds `count` entries.
     let failed = known_view
         || unsafe {
@@ -505,11 +505,11 @@ impl Tracked {
 /// Guarded blocks of view memory.
 const BLOCK: usize = PAGE;
 
-/// Whether the block holding `start` is view memory the guards already
-/// hold (read-only by our hand, or noted absent): asking the kernel's write
-/// watch about it can only fail. `VICTORY_VIEW_ASK=1` (or
+/// Whether every block touched by `[start, end)` is view memory the guards
+/// already know (read-only by our hand, or noted absent): only then may the
+/// entire range bypass the kernel's write watch. `VICTORY_VIEW_ASK=1` (or
 /// `VICTORY_GUARD_ASK=1`) asks the kernel anyway, as before.
-fn known_view(start: usize) -> bool {
+fn known_view(start: usize, end: usize) -> bool {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let ask = *ASK.get_or_init(|| {
         ["VICTORY_VIEW_ASK", "VICTORY_GUARD_ASK"]
@@ -520,8 +520,7 @@ fn known_view(start: usize) -> bool {
         return false;
     }
     let g = guards();
-    let first = start / BLOCK;
-    g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+    g.knows_range(start, end, view_known())
 }
 
 struct Guards {
@@ -540,6 +539,20 @@ struct Guards {
     /// runtime last mapped or unmapped them. They are view memory whether
     /// their guard stands now or a write has opened it.
     viewed: BTreeSet<usize>,
+}
+
+impl Guards {
+    fn knows_range(&self, start: usize, end: usize, include_viewed: bool) -> bool {
+        if start >= end {
+            return false;
+        }
+        // A known first block says nothing about later blocks in this copy.
+        (start / BLOCK..end.div_ceil(BLOCK)).all(|block| {
+            self.protected.contains(&block)
+                || self.absent.contains(&block)
+                || (include_viewed && self.viewed.contains(&block))
+        })
+    }
 }
 
 /// Whether a block once guarded stays known as view memory while its
@@ -575,8 +588,8 @@ fn guards() -> std::sync::MutexGuard<'static, Guards> {
 /// they were last guarded (all of a block's pages), guarding them again
 /// before the caller copies them. `None` if the memory is not a view.
 fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
-    // A range whose first block the guards hold already (read-only by our
-    // hand, or noted absent) is a view: no question to Windows. The
+    // A range whose every block the guards know (read-only by our hand,
+    // or noted absent) is a view: no question to Windows. The
     // question walks the page tables to the end of the pages that share the
     // first one's state, and a guarded view is one long run of read-only
     // pages: 0.6 ms for the title's 174 MB heap, 16 times a frame, and most
@@ -585,8 +598,7 @@ fn guard(start: usize, end: usize) -> Option<Vec<usize>> {
     static ASK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
         let g = guards();
-        let first = start / BLOCK;
-        g.protected.contains(&first) || g.absent.contains(&first) || (view_known() && g.viewed.contains(&first))
+        g.knows_range(start, end, view_known())
     };
     if !known && !is_view(start, end) {
         return None;
@@ -1116,6 +1128,28 @@ mod tests {
         MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
     };
     const MEM_WRITE_WATCH: u32 = 0x20_0000;
+
+    #[test]
+    fn guarded_range_requires_every_block_including_an_unaligned_tail() {
+        let mut g = Guards {
+            protected: BTreeSet::from([2, 4]),
+            clean: BTreeSet::new(),
+            absent: BTreeSet::new(),
+            aliased: BTreeSet::new(),
+            viewed: BTreeSet::new(),
+        };
+        assert!(!g.knows_range(2 * BLOCK, 5 * BLOCK, false), "middle block is unknown");
+        assert!(g.knows_range(2 * BLOCK + 1, 3 * BLOCK, false));
+        assert!(!g.knows_range(2 * BLOCK + 1, 3 * BLOCK + 1, false), "tail crosses a block");
+        g.absent.insert(3);
+        assert!(g.knows_range(2 * BLOCK, 5 * BLOCK, false));
+        g.absent.remove(&3);
+        g.viewed.insert(3);
+        assert!(!g.knows_range(2 * BLOCK, 5 * BLOCK, false));
+        assert!(g.knows_range(2 * BLOCK, 5 * BLOCK, true));
+        assert!(!g.knows_range(2 * BLOCK, 2 * BLOCK, true));
+        assert!(!g.knows_range(3 * BLOCK, 2 * BLOCK, true));
+    }
 
     #[test]
     fn written_pages_are_reported_to_every_asker() {
