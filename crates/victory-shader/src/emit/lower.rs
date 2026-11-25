@@ -25,6 +25,10 @@ use crate::structure::{Atom, Bool, LaneExit, Structured};
 #[path = "intersect.rs"]
 pub(super) mod intersect;
 
+#[cfg(test)]
+#[path = "descriptor_kind_tests.rs"]
+mod descriptor_kind_tests;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -207,7 +211,7 @@ struct Lower<'a> {
     exports: HashMap<Site, &'a Export>,
     interps: HashMap<Site, &'a Interp>,
     handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
-    /// Element strides read from the host's table by heap slot
+    /// Tagged stride/kind entries read from the host's table by heap slot
     /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
     strides: HashMap<(usize, Site, u8), V>,
     /// Blocks splitting the edge from one IR block to another.
@@ -5516,40 +5520,49 @@ impl<'a> Lower<'a> {
         // BatchCullPreSkinnedMeshlets, BatchCullBatchCSMeshlets) reads its
         // batch records, mesh headers and instance transforms this way, so
         // it passed no meshlet and every indirect mesh draw ran empty.
-        // The host's table of strides by heap slot tells a buffer view
-        // (not 0) from anything else, which is still read as a constant
-        // buffer; only the load that fits the slot runs.
+        // The table distinguishes SRV/UAV buffers, explicit CBVs, and
+        // invalid/nonbuffer slots. Create each handle only in its kind's
+        // branch: a texture/null slot must not be dereferenced as a CBV.
         let picked = match kind {
-            None => self.slot_stride(src)?,
+            None => self.slot_info(src)?,
             Some(_) => None,
         };
-        if let Some(stride) = picked {
+        if let Some(info) = picked {
             let zero = self.s.m.i32(0);
+            let stride = self.buffer_stride(info);
             let is_buffer = self.s.m.cmp(self.cur, pred::NE, stride, zero);
-            let at = self.begin_guarded(Some(is_buffer));
-            let h = self.handle(site, src, false, (11, 0))?;
-            let mut raw = Vec::new();
-            for k in 0..count {
-                let b = self.cur;
-                let off = self.s.m.i32(4 * k);
-                let a = self.s.m.bin(b, Bin::Add, addr, off);
-                let mask = self.s.m.i8(1);
-                let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
-                let r = self.s.op(
-                    b,
-                    "rawBufferLoad.f32",
-                    Attr::ReadOnly,
-                    self.s.t.res_ret,
-                    139,
-                    &[h, a, u, mask, al],
-                );
-                let x = self.s.m.extract(b, r, 0);
-                let x = self.as_int(x);
-                raw.push((x, zero));
+            let flag = self.s.m.i32(super::shader::SLOT_STRIDE_UAV);
+            let uav = self.s.m.bin(self.cur, Bin::And, info, flag);
+            let mut raw = vec![zero; count as usize];
+            for (kind, props) in [(zero, 11), (flag, 0x100b)] {
+                let matches = self.s.m.cmp(self.cur, pred::EQ, uav, kind);
+                let guard = self.s.m.bin(self.cur, Bin::And, is_buffer, matches);
+                let at = self.begin_guarded(Some(guard));
+                let h = self.handle(site, src, false, (props, 0))?;
+                let mut values = Vec::new();
+                for (k, &previous) in raw.iter().enumerate() {
+                    let b = self.cur;
+                    let off = self.s.m.i32(4 * k as u32);
+                    let a = self.s.m.bin(b, Bin::Add, addr, off);
+                    let mask = self.s.m.i8(1);
+                    let (u, al) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+                    let r = self.s.op(
+                        b,
+                        "rawBufferLoad.f32",
+                        Attr::ReadOnly,
+                        self.s.t.res_ret,
+                        139,
+                        &[h, a, u, mask, al],
+                    );
+                    let x = self.s.m.extract(b, r, 0);
+                    let x = self.as_int(x);
+                    values.push((x, previous));
+                }
+                raw = self.end_guarded(at, &values);
             }
-            let raw = self.end_guarded(at, &raw);
-            let other = self.s.m.cmp(self.cur, pred::EQ, stride, zero);
-            let at = self.begin_guarded(Some(other));
+            let cbv = self.s.m.i32(super::shader::SLOT_STRIDE_CBV);
+            let is_cbv = self.s.m.cmp(self.cur, pred::EQ, info, cbv);
+            let at = self.begin_guarded(Some(is_cbv));
             let h = self.handle(site, src, false, (13, 0x1_0000))?;
             let mut both = Vec::new();
             for (k, &r) in raw.iter().enumerate() {
@@ -6403,11 +6416,24 @@ impl<'a> Lower<'a> {
         Ok(phi)
     }
 
-    /// The bytes per element of the buffer view `src` names, if the program
-    /// picks it from the view heap at an index it computes (root type
-    /// `ResourceHeap`): read from the host's table by heap slot in the
-    /// current block.
+    /// Decode a table entry for byte arithmetic. CBVs and invalid slots
+    /// have no buffer stride; the UAV flag is never part of an offset.
+    fn buffer_stride(&mut self, info: V) -> V {
+        let cbv = self.s.m.i32(super::shader::SLOT_STRIDE_CBV);
+        let mask = self.s.m.i32(!super::shader::SLOT_STRIDE_UAV);
+        let zero = self.s.m.i32(0);
+        let is_cbv = self.s.m.cmp(self.cur, pred::EQ, info, cbv);
+        let stride = self.s.m.bin(self.cur, Bin::And, info, mask);
+        self.s.m.select(self.cur, is_cbv, zero, stride)
+    }
+
+    /// Untagged bytes per element for vector buffer address arithmetic.
     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+        Ok(self.slot_info(src)?.map(|info| self.buffer_stride(info)))
+    }
+
+    /// The host's stride/kind entry for a computed ResourceHeap index.
+    fn slot_info(&mut self, src: &Source) -> Result<Option<V>, Why> {
         let Source::Loaded { load, first } = src else {
             return Ok(None);
         };

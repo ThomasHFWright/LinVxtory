@@ -228,7 +228,55 @@ pub(crate) struct Module {
     tags: HashMap<u32, Tag>,
 }
 
+#[cfg(test)]
+pub(crate) struct TestCall {
+    pub name: String,
+    /// Integer constants (or integer aggregate fields); empty for other values.
+    pub args: Vec<Vec<u32>>,
+}
+
 impl Module {
+    /// Inspect calls reachable after folding the emitter's actual predicates.
+    /// Keep dead-code removal off so unused resource reads remain observable.
+    #[cfg(test)]
+    pub(crate) fn folded_calls(&mut self) -> Vec<TestCall> {
+        self.optimise(opt::FOLD);
+        let reached = self.reached();
+        self.blocks
+            .iter()
+            .enumerate()
+            .filter(|(b, _)| reached[*b])
+            .flat_map(|(_, b)| &b.body)
+            .filter_map(|&i| {
+                let Op::Call(f, args) = &self.insts[i as usize].op else {
+                    return None;
+                };
+                let args = args
+                    .iter()
+                    .map(|v| {
+                        let V::Const(c) = v else { return Vec::new() };
+                        match &self.consts[*c as usize].1 {
+                            Const::Int(n) => vec![*n as u32],
+                            Const::Aggregate(fields) => fields
+                                .iter()
+                                .map(|&c| {
+                                    let Const::Int(n) = self.consts[c as usize].1 else {
+                                        panic!("integer fields")
+                                    };
+                                    n as u32
+                                })
+                                .collect(),
+                            _ => Vec::new(),
+                        }
+                    })
+                    .collect();
+                Some(TestCall {
+                    name: self.funcs[*f as usize].name.clone(),
+                    args,
+                })
+            })
+            .collect()
+    }
     fn ty(&mut self, def: TypeDef) -> Ty {
         if let Some(&t) = self.type_ids.get(&def) {
             return Ty(t);

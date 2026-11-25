@@ -17,7 +17,9 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 /// reads buffers through descriptors it picks from the view heap at an
 /// index it computes (SM 6.6 dynamic resources): a raw buffer of
 /// [`SLOT_STRIDES_COUNT`] dwords the host keeps, dword `i` the bytes per
-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
+/// element of the buffer view at heap slot `i`, with [`SLOT_STRIDE_UAV`]
+/// set for UAVs. Zero means invalid/nonbuffer; [`SLOT_STRIDE_CBV`] means
+/// an explicit constant-buffer view. Strip the kind before byte arithmetic.
 /// The console's descriptor holds that stride and its hardware multiplies
 /// the element index by it; the program's code does not say it, and the
 /// used-resource list only names what tables hold. A shader that has this
@@ -26,6 +28,12 @@ pub const ROOT_CBV_SPACE: u32 = 1;
 pub const SLOT_STRIDES: u8 = 255;
 /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
 pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
+/// [`SLOT_STRIDES`] marker for an explicit CBV, never a byte stride.
+pub const SLOT_STRIDE_CBV: u32 = u32::MAX;
+/// [`SLOT_STRIDES`] flag for a buffer UAV. Buffer strides fit below this
+/// bit (host structured strides are at most 2048 bytes). The CBV marker
+/// must be excluded before interpreting either the flag or the stride.
+pub const SLOT_STRIDE_UAV: u32 = 1 << 31;
 
 /// Title memory by address (`resource::MEMORY`): console code reads and
 /// writes through raw 40-bit addresses it takes from root constants,

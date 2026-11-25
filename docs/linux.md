@@ -64,3 +64,22 @@ its per-stage shader loop bounds; no uniform loop-limit override is used.
 
 Only source and aggregate results are published. Game files, generated shaders,
 logs, screenshots, caches and runtime binaries remain local.
+
+## Descriptor-kind follow-up
+
+Heap-indexed scalar buffer loads now distinguish explicit CBVs, buffer SRVs,
+and buffer UAVs. Null/texture entries return zero without creating an invalid
+buffer handle; kind flags are stripped before vector stride arithmetic.
+This addresses the scalar-load classification concern in issue 698.
+
+The synthetic emitter test passes with the fix and fails when the previous
+invalid-slot-as-CBV condition is restored. The host regression checks actual
+mapped entries through buffer/CBV/texture/null rewrites. Affected Wine suites:
+**387 passed, 5 known failures, 8 ignored** (GPU 172/4/5; shader 215/1/3).
+Build and Clippy pass. Gameplay validation is pending.
+
+A diagnostic baseline with vkd3d descriptor checks and NVIDIA checkpoints still
+faulted. Breadcrumbs narrowed the likely crash region to a compute dispatch;
+no descriptor-QA mismatch was reported. A separate `VICTORY_HEAP_SYNC_TABLES=1`
+trial also faulted and showed no normal world geometry. Neither diagnostic
+experiment establishes a gameplay fix.

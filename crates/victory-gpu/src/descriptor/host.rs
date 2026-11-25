@@ -54,7 +54,8 @@ pub(crate) struct HostHeap {
     /// the place the search starts from is seen by neither.)
     too_long: std::sync::atomic::AtomicU32,
     /// View heaps: the bytes per element of the buffer view at each title
-    /// slot, for shaders that pick a buffer by an index they compute
+    /// slot, tagged with the descriptor kind, for shaders that pick a
+    /// buffer by an index they compute
     /// (`victory_shader::emit::SLOT_STRIDES`): an upload buffer of
     /// `SLOT_STRIDES_COUNT` dwords, its GPU address and its mapping.
     strides: Option<(ID3D12Resource, u64, usize)>,
@@ -741,7 +742,7 @@ fn view_stride(view: &View) -> Option<u32> {
     let (words, unordered): (&[u32; 10], bool) = match view {
         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
         View::Unordered(_, _, Some(d)) if d[1] == BUFFER => (d, true),
-        View::Placed(unordered, resource, d) if resource[0] == BUFFER => {
+        View::Placed(unordered, resource, d) if resource[0] == BUFFER && d[1] == BUFFER => {
             (d[..10].try_into().ok()?, *unordered)
         }
         _ => return None,
@@ -765,6 +766,34 @@ fn view_stride(view: &View) -> Option<u32> {
     } else {
         crate::resource::element(format.0 as u32).map_or(0, |(bytes, _)| bytes as u32)
     })
+}
+
+/// Update the shader's stride/kind entry even when a slot stops being a buffer.
+/// Returns the untagged stride for the host's buffer tracking.
+///
+/// # Safety
+/// If present and `index` is inside `SLOT_STRIDES_COUNT`, `data` must point
+/// to a live, writable mapping with at least `index + 1` dwords.
+unsafe fn note_slot_stride(data: Option<usize>, index: u32, view: Option<&View>) -> Option<u32> {
+    use victory_shader::emit::{SLOT_STRIDE_CBV, SLOT_STRIDE_UAV, SLOT_STRIDES_COUNT};
+    let stride = view.and_then(view_stride);
+    // Reserved kind bits cannot come from a malformed structure stride.
+    let bytes = stride.filter(|&s| s < SLOT_STRIDE_UAV - 1).unwrap_or(0);
+    let entry = match view {
+        Some(View::Constant(..)) => SLOT_STRIDE_CBV,
+        Some(View::Unordered(..) | View::Placed(true, ..)) if bytes > 0 => {
+            bytes | SLOT_STRIDE_UAV
+        }
+        _ => bytes,
+    };
+    if let Some(data) = data
+        && index < SLOT_STRIDES_COUNT
+    {
+        // SAFETY: the caller supplies the live mapping. Synchronization with
+        // in-flight shaders is the existing stride table's separate concern.
+        unsafe { (data as *mut u32).add(index as usize).write_volatile(entry) };
+    }
+    stride
 }
 
 /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
@@ -1108,8 +1137,7 @@ impl HostHeap {
         self.count
     }
 
-    /// The GPU address of the table of element strides by title slot (view
-    /// heaps).
+    /// The GPU address of the tagged stride/kind table by title slot (view heaps).
     pub(crate) fn strides_gpu(&self) -> Option<u64> {
         self.strides.as_ref().map(|s| s.1)
     }
@@ -1595,14 +1623,8 @@ impl HostHeap {
                 textures.remove(slot);
             }
         }
-        let stride = view.and_then(view_stride);
-        if let Some((_, _, data)) = &self.strides
-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
-        {
-            // SAFETY: inside the mapping; shaders read it while we write (a
-            // dword, either value is one the slot had).
-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
-        }
+        // SAFETY: the upload mapping has SLOT_STRIDES_COUNT dwords.
+        let stride = unsafe { note_slot_stride(self.strides.as_ref().map(|s| s.2), index, view) };
         let mut buffers = self.buffers.lock().unwrap_or_else(|e| e.into_inner());
         let was = if stride.is_some() {
             buffers.insert(index);
@@ -3111,6 +3133,70 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Exercise the same classification and mapped write as note_buffer,
+    /// without constructing a host device or silently skipping on Linux.
+    #[test]
+    fn slot_stride_records_kind_and_rewrites_old_entries() {
+        use victory_shader::emit::{SLOT_STRIDE_CBV, SLOT_STRIDE_UAV, SLOT_STRIDES_COUNT};
+        let buffer = |unordered, stride, raw, format: DXGI_FORMAT| {
+            // Host descriptor words, including explicit zero padding.
+            let mut words = [0u32; 10];
+            words[0] = format.0 as u32;
+            words[1] = 1; // buffer dimension for both SRV and UAV
+            if unordered {
+                words[4] = 16; // NumElements
+                words[5] = stride;
+                words[8] = u32::from(raw); // D3D12_BUFFER_UAV_FLAG_RAW
+                View::Unordered(0, 0, Some(words))
+            } else {
+                words[6] = 16; // NumElements
+                words[7] = stride;
+                words[8] = u32::from(raw); // D3D12_BUFFER_SRV_FLAG_RAW
+                View::Shader(0, Some(words))
+            }
+        };
+        let mut slot = 0u32;
+        let mut write = |view: Option<&View>, expected, stride| {
+            // SAFETY: slot is live and writable; only index zero is used.
+            let actual = unsafe { note_slot_stride(Some(std::ptr::from_mut(&mut slot) as usize), 0, view) };
+            assert_eq!(actual, stride);
+            assert_eq!(slot, expected);
+        };
+        for unordered in [false, true] {
+            let flag = if unordered { SLOT_STRIDE_UAV } else { 0 };
+            for (stride, raw, format, bytes) in [
+                (0, true, DXGI_FORMAT_R32_TYPELESS, 1),
+                (48, false, DXGI_FORMAT_UNKNOWN, 48),
+                (0, false, DXGI_FORMAT_R32G32B32A32_FLOAT, 16),
+            ] {
+                let view = buffer(unordered, stride, raw, format);
+                write(Some(&view), bytes | flag, Some(bytes));
+                let words = match view {
+                    View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) => d,
+                    _ => unreachable!(),
+                };
+                let mut resource = [0; 14];
+                resource[0] = 1;
+                let mut desc = [0; 16];
+                desc[..10].copy_from_slice(&words);
+                write(Some(&View::Placed(unordered, resource, desc)), bytes | flag, Some(bytes));
+                write(Some(&View::Constant(0x1000, 256)), SLOT_STRIDE_CBV, None);
+                let mut texture = [0; 10];
+                texture[1] = D3D12_SRV_DIMENSION_TEXTURE2D.0 as u32;
+                write(Some(&View::Shader(0, Some(texture))), 0, None);
+                write(Some(&View::Constant(0x1000, 256)), SLOT_STRIDE_CBV, None);
+                write(None, 0, None);
+            }
+            write(Some(&buffer(unordered, 0, false, DXGI_FORMAT_UNKNOWN)), 0, Some(0));
+            write(Some(&buffer(unordered, u32::MAX, false, DXGI_FORMAT_UNKNOWN)), 0, Some(u32::MAX));
+        }
+        write(Some(&View::Shader(0, None)), 0, None);
+        write(Some(&View::Unordered(0, 0, None)), 0, None);
+        write(Some(&View::Sampler([0; 13])), 0, None);
+        // SAFETY: out-of-range indices never touch the mapping.
+        unsafe { note_slot_stride(Some(0), SLOT_STRIDES_COUNT, Some(&View::Constant(0x1000, 256))) };
+    }
 
     /// A null texture UAV keeps the title's dimension (3D for the world's
     /// wind field), and is 2D when the title names none.
