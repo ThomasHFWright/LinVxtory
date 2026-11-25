@@ -76,7 +76,8 @@ The synthetic emitter test passes with the fix and fails when the previous
 invalid-slot-as-CBV condition is restored. The host regression checks actual
 mapped entries through buffer/CBV/texture/null rewrites. Affected Wine suites:
 **387 passed, 5 known failures, 8 ignored** (GPU 172/4/5; shader 215/1/3).
-Build and Clippy pass. Gameplay validation is pending.
+Build and Clippy pass. The classifier-only trial still hit a context-switch
+timeout after approximately 228 seconds, without verified world geometry.
 
 A diagnostic baseline with vkd3d descriptor checks and NVIDIA checkpoints still
 faulted. Breadcrumbs narrowed the likely crash region to a compute dispatch;
@@ -89,3 +90,13 @@ by NuraadGit is applied to both host creation paths. Two explicitly invoked
 actual-path tests pass under Wine; the D3D12 info queue is unavailable there,
 so this proves creation/device survival, not native debug-layer validation.
 Gameplay impact is not yet established.
+
+Copied-descriptor synchronization now invalidates cached fingerprints across API
+writes and unmake, applies the captured record, and only skips a table texture
+when the same descriptor is installed and was actually read. This follows the
+stale-table concern in [issue 698](https://github.com/fxceless/victory-fork/issues/698#issuecomment-7159281878).
+Three actual-path regressions cover both individual and page-batched copying:
+all three fail on the previous implementation and pass with the fix. The full
+descriptor suite passes **32 tests**, with the two CBV device tests invoked
+separately. The combined trial still hit an MMU fault at world entry, approximately 136
+seconds after launch. It did not establish normal gameplay.

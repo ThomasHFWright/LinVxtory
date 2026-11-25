@@ -40,6 +40,10 @@ The executable remains `victory.exe`.
   [victory-fork PR20](https://github.com/fxceless/victory-fork/pull/20).
 - **ruvenesh:** the opt-in title-watchdog hook from
   [VIctory PR454](https://github.com/Marvisak/VIctory/pull/454).
+- **NuraadGit:** the constant-buffer size limit fix from
+  [victory-fork PR24](https://github.com/fxceless/victory-fork/pull/24).
+- **jtrudeau1530:** reports of Linux memory-range and descriptor synchronization
+  issues that informed independently implemented fixes here.
 
 Original commit authorship and the **GPL-3.0-or-later** license are retained.
 Linux integration and local validation here are AI-assisted with OpenAI Codex.

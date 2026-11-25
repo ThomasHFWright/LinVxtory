@@ -2004,10 +2004,10 @@ impl HostHeap {
             let _ = self.note_buffer(index, None, false);
             return None;
         };
-        if !is_texture_view(&view) || (!for_draw && made[index as usize] != key) {
-            if let Some(stamp) = self.tabled.get(index as usize) {
-                stamp.store(0, std::sync::atomic::Ordering::Relaxed);
-            }
+        if (!is_texture_view(&view) || (!for_draw && made[index as usize] != key))
+            && let Some(stamp) = self.tabled.get(index as usize)
+        {
+            stamp.store(0, std::sync::atomic::Ordering::Relaxed);
         }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
