@@ -236,6 +236,113 @@ pub(crate) struct TestCall {
 }
 
 impl Module {
+    /// Execute the small integer-only synthetic loop regressions on the CPU.
+    /// Unsupported operations fail; this is not a shader emulator or a parser.
+    #[cfg(test)]
+    pub(crate) fn trace_integer_calls(&self, entry: usize, thread: u32) -> Vec<TestCall> {
+        // The fixtures have wave-uniform branches; execute each wave's first
+        // lane. Lane-first reads below are exact only under this restriction.
+        assert!(thread.is_multiple_of(32));
+        let mut values = HashMap::<u32, u32>::new();
+        let get = |v: V, values: &HashMap<u32, u32>| -> u32 {
+            match v {
+                V::Const(c) => match self.consts[c as usize].1 {
+                    Const::Int(n) => n as u32,
+                    _ => panic!("noninteger test constant"),
+                },
+                V::Inst(i) => *values.get(&i).expect("defined test value"),
+                _ => panic!("noninteger test value"),
+            }
+        };
+        let mut calls = Vec::new();
+        let (mut block, mut previous) = (entry, usize::MAX);
+        for _ in 0..100_000 {
+            let b = &self.blocks[block];
+            // Phi assignments are simultaneous, including on a self backedge.
+            let phis: Vec<_> = b
+                .phis
+                .iter()
+                .map(|&i| {
+                    let Op::Phi(args) = &self.insts[i as usize].op else {
+                        panic!("phi")
+                    };
+                    let &(v, _) = args
+                        .iter()
+                        .find(|(_, p)| *p == previous)
+                        .expect("phi predecessor");
+                    (i, get(v, &values))
+                })
+                .collect();
+            values.extend(phis);
+            for &i in &b.body {
+                let val = |v| get(v, &values);
+                let x = match &self.insts[i as usize].op {
+                    Op::Bin(op, a, b) => {
+                        let (a, b) = (val(*a), val(*b));
+                        match op {
+                            Bin::Add => a.wrapping_add(b),
+                            Bin::Sub => a.wrapping_sub(b),
+                            Bin::Shl => a << b,
+                            Bin::LShr => a >> b,
+                            Bin::URem => a % b,
+                            Bin::And => a & b,
+                            Bin::Or => a | b,
+                            Bin::Xor => a ^ b,
+                            _ => panic!("unsupported test binary {op:?}"),
+                        }
+                    }
+                    Op::Cmp(p, a, b) => {
+                        let (a, b) = (val(*a), val(*b));
+                        u32::from(match *p {
+                            pred::EQ => a == b,
+                            pred::NE => a != b,
+                            pred::IULT => a < b,
+                            pred::IUGE => a >= b,
+                            _ => panic!("unsupported test comparison {p}"),
+                        })
+                    }
+                    Op::Select(c, a, b) => val(if val(*c) != 0 { *a } else { *b }),
+                    Op::Cast(Cast::ZExt, v) => val(*v),
+                    Op::Call(f, args) => {
+                        let name = &self.funcs[*f as usize].name;
+                        match name.as_str() {
+                            "dx.op.flattenedThreadIdInGroup.i32" => thread,
+                            "dx.op.waveGetLaneIndex" => 0,
+                            "dx.op.waveReadLaneFirst.i32" => val(args[1]),
+                            "dx.op.threadIdInGroup.i32" => {
+                                assert_eq!(val(args[1]), 0);
+                                thread
+                            }
+                            "dx.op.barrier" | "test.result" => {
+                                calls.push(TestCall {
+                                    name: name.clone(),
+                                    args: args.iter().map(|&v| vec![val(v)]).collect(),
+                                });
+                                0
+                            }
+                            _ => panic!("unsupported test call {name}"),
+                        }
+                    }
+                    op => panic!("unsupported test instruction {op:?}"),
+                };
+                values.insert(i, x);
+            }
+            previous = block;
+            block = match b.term.expect("test terminator") {
+                Term::Br(t) => t,
+                Term::CondBr(c, t, f) => {
+                    if get(c, &values) != 0 {
+                        t
+                    } else {
+                        f
+                    }
+                }
+                Term::Ret => return calls,
+            };
+        }
+        panic!("synthetic loop exceeded CPU step budget");
+    }
+
     /// Inspect calls reachable after folding the emitter's actual predicates.
     /// Keep dead-code removal off so unused resource reads remain observable.
     #[cfg(test)]

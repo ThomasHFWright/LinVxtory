@@ -29,6 +29,10 @@ pub(super) mod intersect;
 #[path = "descriptor_kind_tests.rs"]
 mod descriptor_kind_tests;
 
+#[cfg(test)]
+#[path = "loop_cap_tests.rs"]
+mod loop_cap_tests;
+
 type Why = &'static str;
 
 /// How an interpolation evaluates an input channel.
@@ -297,6 +301,9 @@ struct Lower<'a> {
     /// Loop headers' iteration counters (see [`LOOP_LIMIT`]): the phi by
     /// IR block, and its incoming (value, DXIL block) pairs.
     counters: HashMap<usize, (V, Vec<(V, usize)>)>,
+    /// Header-tested loops with a single genuine follow. Their unconditional
+    /// backedges count, then revisit the header to leave with current SSA values.
+    cap_follows: HashMap<usize, usize>,
     /// The block a loop stopped by [`LOOP_LIMIT`] leaves the program from.
     abort: Option<usize>,
 }
@@ -305,8 +312,9 @@ struct Lower<'a> {
 /// [`super::loop_limit`] says otherwise. The console runs a loop as long as
 /// its data says; data the host has not mirrored yet (a null view reads
 /// zeros) can make that four billion iterations, which hangs the host GPU
-/// until the driver resets it. A lane that reaches the limit leaves the
-/// program as killed (a pixel discards).
+/// until the driver resets it. A proven header exit or a conditional latch
+/// continues after the loop; otherwise the capped lane leaves the program
+/// as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
 
@@ -1592,6 +1600,7 @@ impl<'a> Lower<'a> {
             section_out: HashSet::new(),
             code_table: None,
             counters: HashMap::new(),
+            cap_follows: HashMap::new(),
             abort: None,
         }
     }
@@ -2194,7 +2203,7 @@ impl<'a> Lower<'a> {
         self.s.m.bin(c, Bin::Or, first, sum)
     }
 
-    fn run(mut self) -> Result<Lowered, Stop> {
+    fn emit_body(&mut self) -> Result<(), Stop> {
         let p = self.x.p;
         let order = crate::ir::reverse_postorder(&p.blocks);
         for (n, &b) in order.iter().enumerate() {
@@ -2219,6 +2228,7 @@ impl<'a> Lower<'a> {
                 self.counters.insert(b, (phi, Vec::new()));
             }
         }
+        self.find_cap_follows(&order);
         self.cur = self.s.entry;
         self.find_sections();
         self.inputs()?;
@@ -2276,6 +2286,11 @@ impl<'a> Lower<'a> {
             self.exit(b)?;
         }
         self.fill_phis()?;
+        Ok(())
+    }
+
+    fn run(mut self) -> Result<Lowered, Stop> {
+        self.emit_body()?;
         let user_data = self.user_reads.values().copied().collect();
         self.s.samplers = self.samplers.len() as u32;
         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
@@ -10988,6 +11003,66 @@ impl<'a> Lower<'a> {
         }
     }
 
+    /// Only a header's real exit can be forced without inventing an SSA edge
+    /// or using values from a previous iteration. Keep the old bounded fallback
+    /// for loops with no header exit or several follows. This does not prove
+    /// convergence of barriers *inside* a loop.
+    fn find_cap_follows(&mut self, order: &[usize]) {
+        let p = self.x.p;
+        let idom = crate::ir::idoms(&p.blocks, order, &self.rpo);
+        let dominates = |h: usize, mut b: usize| {
+            while b != h {
+                let d = idom[b];
+                if d == b || d == usize::MAX {
+                    return false;
+                }
+                b = d;
+            }
+            true
+        };
+        for &h in self.counters.keys() {
+            let LaneExit::Branch {
+                taken, not_taken, ..
+            } = self.x.st.exits[h]
+            else {
+                continue;
+            };
+            let latches: Vec<_> = p.blocks[h]
+                .preds
+                .iter()
+                .copied()
+                .filter(|&b| dominates(h, b))
+                .collect();
+            if !latches
+                .iter()
+                .any(|&b| matches!(self.x.st.exits[b], LaneExit::Jump(t) if t == h))
+            {
+                continue; // Conditional latches already have their own exit.
+            }
+            let mut inside = HashSet::from([h]);
+            let mut work = latches;
+            while let Some(b) = work.pop() {
+                if inside.insert(b) {
+                    work.extend(p.blocks[b].preds.iter().copied());
+                }
+            }
+            let follow = match (inside.contains(&taken), inside.contains(&not_taken)) {
+                (true, false) => not_taken,
+                (false, true) => taken,
+                _ => continue,
+            };
+            if inside.iter().all(|&b| {
+                p.blocks[b]
+                    .exit
+                    .successors()
+                    .iter()
+                    .all(|t| inside.contains(t) || *t == follow)
+            }) {
+                self.cap_follows.insert(h, follow);
+            }
+        }
+    }
+
     fn exit(&mut self, b: usize) -> Result<(), Stop> {
         let offset = self.x.p.blocks[b]
             .insts
@@ -10996,8 +11071,14 @@ impl<'a> Lower<'a> {
         let term = match self.x.st.exits[b] {
             LaneExit::Jump(t) if self.counters.contains_key(&t) && self.rpo[t] <= self.rpo[b] => {
                 let ok = self.count_iteration(t, pred::IULT);
-                let abort = self.abort_block();
-                Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                if self.cap_follows.contains_key(&t) {
+                    // The next header visit tests the cap and takes its real
+                    // exit, preserving loop-carried values and later barriers.
+                    Term::Br(self.block[t].expect("reachable"))
+                } else {
+                    let abort = self.abort_block();
+                    Term::CondBr(ok, self.block[t].expect("reachable"), abort)
+                }
             }
             LaneExit::Jump(t) => {
                 self.enter_loop(b, t, self.cur);
@@ -11011,7 +11092,9 @@ impl<'a> Lower<'a> {
                 // A negated condition branches the other way round.
                 let (cond, taken, not_taken) = match self.x.st.bools.node(when) {
                     _ if self.x.st.wide.contains(&b) => {
-                        let c = self.wave_wide(b, when).map_err(|w| unsupported(offset, w))?;
+                        let c = self
+                            .wave_wide(b, when)
+                            .map_err(|w| unsupported(offset, w))?;
                         (c, taken, not_taken)
                     }
                     Some((atom, Bool::TRUE, Bool::FALSE)) => {
@@ -11032,15 +11115,36 @@ impl<'a> Lower<'a> {
                     |l: &Self, to: usize| l.counters.contains_key(&to) && l.rpo[to] <= l.rpo[b];
                 // (No `xor` of a compare: a loop exit testing one hung the
                 // AMD driver.)
-                let cond = if back(self, taken) {
+                let mut cond = if back(self, taken) {
                     let ok = self.count_iteration(taken, pred::IULT);
-                    self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    if self.cap_follows.contains_key(&taken) {
+                        cond
+                    } else {
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    }
                 } else if back(self, not_taken) {
                     let stop = self.count_iteration(not_taken, pred::IUGE);
-                    self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    if self.cap_follows.contains_key(&not_taken) {
+                        cond
+                    } else {
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    }
                 } else {
                     cond
                 };
+                if let Some(&follow) = self.cap_follows.get(&b) {
+                    let count = self.counters[&b].0;
+                    let limit = self.iteration_limit();
+                    cond = if taken == follow {
+                        let stop = self.s.m.cmp(self.cur, pred::IUGE, count, limit);
+                        self.s.m.tag(stop, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::Or, cond, stop)
+                    } else {
+                        let ok = self.s.m.cmp(self.cur, pred::IULT, count, limit);
+                        self.s.m.tag(ok, Tag::Counter);
+                        self.s.m.bin(self.cur, Bin::And, cond, ok)
+                    };
+                }
                 // Critical edges get a block of their own, so loops have
                 // dedicated exits and preheaders as DXC emits them.
                 let (t, f) = (self.edge(b, taken), self.edge(b, not_taken));
@@ -11092,6 +11196,18 @@ impl<'a> Lower<'a> {
         let next = self.s.m.bin(c, Bin::Add, phi, one);
         self.s.m.tag(phi, Tag::Counter);
         self.s.m.tag(next, Tag::Counter);
+        let limit = self.iteration_limit();
+        self.counters
+            .get_mut(&to)
+            .expect("header")
+            .1
+            .push((next, c));
+        let over = self.s.m.cmp(c, p, next, limit);
+        self.s.m.tag(over, Tag::Counter);
+        over
+    }
+
+    fn iteration_limit(&mut self) -> V {
         // Per stage unless the switch names one: a loop that never meets its
         // exit (a count read from a buffer the host has not got yet, say)
         // runs to the limit in every lane. A million iterations a pixel
@@ -11109,15 +11225,7 @@ impl<'a> Lower<'a> {
             LOOP_LIMIT => 1 << 12,
             named => named,
         };
-        let limit = self.s.m.i32(limit);
-        self.counters
-            .get_mut(&to)
-            .expect("header")
-            .1
-            .push((next, c));
-        let over = self.s.m.cmp(c, p, next, limit);
-        self.s.m.tag(over, Tag::Counter);
-        over
+        self.s.m.i32(limit)
     }
 
     /// The block a lane stopped by [`LOOP_LIMIT`] leaves through.

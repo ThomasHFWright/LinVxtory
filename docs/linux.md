@@ -100,3 +100,26 @@ all three fail on the previous implementation and pass with the fix. The full
 descriptor suite passes **32 tests**, with the two CBV device tests invoked
 separately. The combined trial still hit an MMU fault at world entry, approximately 136
 seconds after launch. It did not establish normal gameplay.
+
+
+## Bounded loop exits
+
+For a loop with a real header exit and one follow block, reaching the iteration
+limit now uses that exit instead of returning from the entire shader. This keeps
+current loop-carried values and allows later group barriers to execute. Loops
+without a proven exit retain the bounded fallback; this does not establish
+convergence for barriers inside loops or prove the title reaches a loop cap.
+
+Six synthetic emitter regressions cover both branch orientations, conditional
+and mixed latches, nested counter resets, and fallback cases. The old code fails
+the follow-barrier regression; the fix passes. The Windows cases also validate
+the production serialized DXIL. The full shader suite under Wine reports
+**221 passed, 1 known failure, 3 ignored**: the existing stub-digest expectation
+still fails. Build, Clippy and asset policy pass. Gameplay impact is pending a
+separate trial.
+
+Runtime comparisons using the older vkd3d descriptor backend and disabling
+VRAM buffer copies also hit MMU faults (approximately 141 and 131 seconds).
+Neither produced verified normal world geometry. Three compute DXIL containers
+from the earlier crash regions pass Microsoft's validator; this does not prove
+correct SPIR-V translation or runtime behavior.
