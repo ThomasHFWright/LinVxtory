@@ -33,6 +33,8 @@ pub mod dxgi;
 mod dxc;
 pub mod fence;
 pub mod frame;
+#[cfg(any(windows, test))]
+mod fresh_table;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]

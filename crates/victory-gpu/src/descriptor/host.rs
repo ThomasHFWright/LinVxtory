@@ -3743,8 +3743,8 @@ mod tests {
         let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
         // R16G16B16A16_FLOAT: a buffer of halves a program moves as they are.
         assert_eq!(
-            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
-            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
+            half_view(&View::Unordered(7, 9, Some(words(10, BUFFER)))),
+            Some(View::Unordered(7, 9, Some(words(12, BUFFER))))
         );
         assert_eq!(
             half_view(&View::Shader(7, Some(words(54, BUFFER)))),

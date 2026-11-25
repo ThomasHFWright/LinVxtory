@@ -2548,18 +2548,6 @@ impl State {
             .filter(|u| u.kind == ResourceType::Cbv)
             .map(|u| u.slot)
             .collect();
-        // The view shown in place of the title's at dword `at` of the table
-        // in root parameter `slot`, if the shader moves halves there and
-        // the title's view is a 16-bit float or signed buffer view.
-        let halved = |state: &Self, slot: u8, at: u32| -> Option<View> {
-            if !half.contains(&(slot, at)) {
-                return None;
-            }
-            let Some(&Root::Table(table)) = state.roots_ref(compute).get(usize::from(slot)) else {
-                return None;
-            };
-            crate::descriptor::host::half_view(&crate::descriptor::view(table + u64::from(at) * 4)?)
-        };
         for &(slot, at) in half {
             let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
                 continue;
@@ -2639,24 +2627,12 @@ impl State {
                     index.byte_offset.wrapping_add(constant << index.shift) / 32
                 })
                 .collect();
-            // The descriptors the shader moves halves through are made too,
-            // and the table reaches them: they may lie past the range starts
-            // the entries give (a range of several views names only its
-            // first; review on #927).
-            selected.extend(
-                half.iter()
-                    .filter(|&&(s, _)| s == slot)
-                    .map(|&(_, at)| at / 8),
+            let n = crate::fresh_table::span(
+                slot,
+                entries.iter().map(|u| u.table_offset_dwords),
+                &mut selected,
+                half,
             );
-            selected.sort_unstable();
-            selected.dedup();
-            let n = entries
-                .iter()
-                .map(|u| u.table_offset_dwords / 8)
-                .chain(selected.last().copied())
-                .max()
-                .unwrap_or(0)
-                + 1;
             let last = table.checked_add(u64::from(n - 1) * 32);
             if n > crate::descriptor::host::DYNAMIC
                 || last.and_then(|handle| heap.index(handle)).is_none()
@@ -2664,37 +2640,26 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table, its record words, and the resident SRV ranges.
-            let key = {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                for k in 0..n {
-                    let at = table + u64::from(k) * 32;
-                    // SAFETY: a descriptor slot in title memory.
-                    unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
-                    let view = crate::descriptor::view(at);
-                    let placed = view
-                        .as_ref()
-                        .and_then(crate::descriptor::host::placed_texture);
-                    let first_shown = match placed.as_ref().or(view.as_ref()) {
-                        Some(View::Shader(resource, _)) => {
-                            crate::resource::first_shown(*resource as This).unwrap_or(0)
-                        }
-                        _ => 0,
-                    };
-                    // None and zero both leave the title's view unchanged.
-                    // A new range gets new slots; never remake a table that
-                    // an earlier recorded draw may still reference. Snapshot
-                    // before make_at/readable: uploads can change residency
-                    // again, which the next lookup must see. This does not
-                    // make descriptor creation and upload atomic.
-                    first_shown.hash(&mut h);
-                    // (Another table than the same slots made for a shader
-                    // that reads them in the title's formats.)
-                    half.contains(&(slot, k * 8)).hash(&mut h);
-                }
-                (table, n, h.finish())
-            };
+            // Snapshot before make_at/readable: uploads can change residency
+            // again, which the next lookup must see. This does not make
+            // descriptor creation and upload atomic. A different range or
+            // half-view format needs new slots while earlier draws are live.
+            let key = crate::fresh_table::key(table, slot, n, half, |k| {
+                let at = table + u64::from(k) * 32;
+                // SAFETY: a descriptor slot in title memory.
+                let record = unsafe { (at as *const [u32; 3]).read_unaligned() };
+                let view = crate::descriptor::view(at);
+                let placed = view
+                    .as_ref()
+                    .and_then(crate::descriptor::host::placed_texture);
+                let first_shown = match placed.as_ref().or(view.as_ref()) {
+                    Some(View::Shader(resource, _)) => {
+                        crate::resource::first_shown(*resource as This).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
+                (record, first_shown)
+            });
             if let Some(&first) = self.fresh_tables.get(&key) {
                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
                     let handle = table + u64::from(u.table_offset_dwords) * 4;
@@ -2743,10 +2708,12 @@ impl State {
                         host.constant_at(index, gpu, size);
                     }
                     Some(view) => {
-                        match halved(self, slot, k * 8) {
-                            Some(shown) => host.make_at(index, &shown),
-                            None => host.make_at(index, &view),
-                        }
+                        // Derive the companion from this same metadata
+                        // snapshot; readable must prepare the resource made.
+                        let shown = half.contains(&(slot, k * 8))
+                            .then(|| crate::descriptor::host::half_view(&view))
+                            .flatten();
+                        host.make_at(index, shown.as_ref().unwrap_or(&view));
                         let kind = used.map(|u| u.kind).or_else(|| {
                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
                         });

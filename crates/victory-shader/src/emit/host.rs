@@ -1237,7 +1237,11 @@ impl Host {
                         );
                         keep.push(tex);
                     }
-                    View::RawUav(_) | View::RawUavData(_) | View::NullRawUav | View::HalfUav(_) | View::HalfUintUav(_) => {
+                    View::RawUav(_)
+                    | View::RawUavData(_)
+                    | View::NullRawUav
+                    | View::HalfUav(_)
+                    | View::HalfUintUav(_) => {
                         // (dwords, format, elements, flags)
                         let (n, format, elements, flags) = match *v {
                             View::HalfUav(e) => (
