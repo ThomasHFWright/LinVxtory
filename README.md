@@ -17,17 +17,19 @@ Our initial test system is CachyOS with an NVIDIA RTX 5090. We focus on:
 - Recording reproducible results, including crashes and remaining limitations.
 
 A loading screen, draw counter or debug-coloured scene does not count as working
-normal gameplay. Performance work comes after visible, functioning scenes.
+normal gameplay. With normal world visuals now verified, our priorities are
+performance, controllable gameplay, then more complete textures and models.
 
 ## Current Linux status
 
-**Normal in-world visuals now render on Linux; interactive gameplay is not yet
-verified.** A local integration of the code-table fix in
-[PR1006](https://github.com/fxceless/victory-fork/pull/1006) produced textured
-characters, floor geometry and lighting on an RTX 5090. Two runs lasted 9 minutes
-44 seconds and 8 minutes 55 seconds without the previous NVIDIA Xid fault; both
-ended with the same title assertion. Rendering remains incomplete and very slow. See
-[Linux validation](docs/linux.md) for the exact scope, runtime and checks.
+**Normal in-world visuals render on Linux; interactive gameplay is not yet
+verified.** The latest integration adds guarded buffer copying, bounded texture
+staging, half-data preservation and selected audio fixes. A synthetic CPU-copy
+benchmark is 10–26x faster; this is not an FPS claim. The combined trial reached
+world scenes, ran for 7 minutes 12 seconds without an NVIDIA Xid, then hit the
+same title assertion. Rendering remains incomplete and very slow.
+See [selected improvements and tests](docs/linux-improvements.md) and
+[Linux validation](docs/linux.md) for the exact scope and limitations.
 
 The active branch is `linux-edge`, initially based on fxceless/victory-fork
 [`0b0074e`](https://github.com/fxceless/victory-fork/commit/0b0074e0b2765e574c622e9a3de566f20f04135b)
@@ -51,6 +53,18 @@ The executable remains `victory.exe`.
   [victory-fork PR33](https://github.com/fxceless/victory-fork/pull/33).
 - **desplmfao:** the original code-table trimming fix; **OctoAlgo:** its Proton
   investigation and port in [victory-fork PR1006](https://github.com/fxceless/victory-fork/pull/1006).
+- **gmankab:** bounded staging allocations in
+  [PR989](https://github.com/fxceless/victory-fork/pull/989).
+- **UwUCammie:** guarded buffer write-back from
+  [PR1032](https://github.com/fxceless/victory-fork/pull/1032), adapted here with
+  explicit opt-in and additional fault/fallback tests.
+- **tippythetaidum:** typed half-data preservation from
+  [PR927](https://github.com/fxceless/victory-fork/pull/927), including its latest
+  fixed-slot, span and ordinary-format-load corrections.
+- **AnoHunted, tedin7, TG0000, Maraco91, divyeshganta, heromike405-arch and AscilCH:**
+  audio decoder, ring-buffer and parser fixes selected from
+  [PR959](https://github.com/fxceless/victory-fork/pull/959) and
+  [PR627](https://github.com/fxceless/victory-fork/pull/627).
 - **jtrudeau1530:** reports of Linux memory-range and descriptor synchronization
   issues that informed independently implemented fixes here.
 

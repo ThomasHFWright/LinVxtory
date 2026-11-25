@@ -26,7 +26,7 @@ size clamp is already in the base; it was not duplicated. Other Linux changes ar
 
 ## Changes and retained behavior
 
-- The complete latest half-data path is retained: exact fixed descriptor
+- The latest half-data path is integrated: exact fixed descriptor
   offsets, interior half-view table spans, ordinary format loads consumed only
   as halves, integer buffer operations, companion UINT buffer views, and
   `HostShader::half_views` cache serialization.
@@ -56,13 +56,15 @@ size clamp is already in the base; it was not duplicated. Other Linux changes ar
 - Existing inline lowering tests move unchanged, apart from wrapper/indent,
   into `emit/lower_tests.rs`, still `lower::tests`. This move is included in
   the first conflict-resolved port so the new commits stay under the file-size
-  limit. Final `lower.rs` is 506,816 bytes, below 524,288; upstream `halves.rs`
+  limit. `lower.rs` remains below 524,288 bytes; `halves.rs`
   remains a separate child module. Source fingerprinting recursively includes
   these files; shader-cache serialization changes also affect its cache key.
 
 ## Static inspection performed
 
-`git diff --check` is clean. Text comparison confirms:
+`git diff --check` is clean. The original half-port comparison against its
+integration base confirmed the following (other selected PRs subsequently
+change `host.rs` and `texture.rs`):
 
 - `host.rs`, `resource.rs`, `list.rs`, `texture.rs`, `capture.rs`, `queue.rs` and
   `host/subresource.rs` exactly match the base: per-list first/last states,
@@ -80,12 +82,13 @@ size clamp is already in the base; it was not duplicated. Other Linux changes ar
   half metadata. HostShader constructors and cache serialization were reviewed.
 - Changed/new source files are below 512 KiB; no conflict markers or specific
   title names were found in added text. No proprietary fixtures or generated
-  assets were introduced. The repository policy executable was not run.
+  assets were introduced. The repository policy executable passes.
 
-## Regressions added, not executed
+## Integration regressions
 
 The four device-independent tests in `fresh_table.rs` are compiled on native
-test builds as well as Windows builds. They check:
+test builds as well as Windows builds and pass in the validated GPU suite.
+They check:
 
 1. Alternating normal/half views and resident mip changes get separate cached
    tables, while repeated equivalent selections reuse their earlier entries.
@@ -104,13 +107,34 @@ interior-slot trigger would fail the fresh-table assertion by inspection; that
 negative control has not been executed. Both fixture variants now require a
 D3D12 host instead of silently returning when none exists.
 
+## Conservative access analysis
+
+Final review identified two cases that must not select a UINT companion:
+
+- A fixed slot read as both d16 and an ordinary whole float. Both descriptor
+  annotations and emitted operations now use the same half-only eligibility.
+- A value read as a half and then preserved in inactive lanes of a later
+  masked write. The analysis follows the new value to its later uses, including
+  in-place conversions that also read the register explicitly.
+
+Six native emitter regressions cover the corrections and retained pure paths.
+Restoring the earlier lowering/analysis makes four fail, while the pure-path
+and dead-rewrite controls still pass.
+
+Pure fixed-slot d16 loads/stores retain integer operations. Mixed accesses and
+potential dynamic aliases use the legacy float path. This prevents incompatible
+UINT/float binding, but does not preserve exact integer or NaN payloads in those
+fallback cases. A dynamic selection can exclude fixed slots in the same table;
+narrowing that exclusion requires an alias-range proof. Exact mixed-format
+support requires format-aware lowering or separate descriptor indices.
+
 ## Linux validation
 
 Validated on CachyOS / RTX 5090 / GE-Proton 11-14 with the runtime fixes described
 in [linux-runtime.md](linux-runtime.md):
 
-- Native shader suite: 179 passed, 2 ignored.
-- Windows shader suite: 228 passed, 1 pre-existing stub-pipeline failure, 3 ignored.
+- Native shader suite: 185 passed, 2 ignored.
+- Windows shader suite: 234 passed, 1 pre-existing stub-pipeline failure, 3 ignored.
 - GPU suite: 211 passed, the same 4 pre-existing failures, 8 ignored (including
   the manual guarded-copy benchmark).
 - Exhaustive unsigned-view readback: all 65,536 half bit patterns preserved;
@@ -120,8 +144,9 @@ in [linux-runtime.md](linux-runtime.md):
 
 The upstream readback test's compiler arguments were adapted to this fork's
 portable compiler interface. The alternating cache-key check is synthetic; it
-is not an exhaustive concurrent descriptor/residency test. The separate
-negative mutations described above were not executed. See [Linux results](linux.md)
+is not an exhaustive concurrent descriptor/residency test. Cache/residency
+negative mutations were not executed; the access-analysis negative control
+was executed and failed as expected. See [Linux results](linux.md)
 for title-run observations and remaining limitations.
 
 This port retains upstream limits: dynamically selected descriptors and

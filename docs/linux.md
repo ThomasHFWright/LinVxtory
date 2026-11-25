@@ -4,7 +4,55 @@ LinVictory follows current fxceless/victory-fork rendering work, pinned initiall
 to `0b0074e0b2765e574c622e9a3de566f20f04135b`. Older debug-rendering experiments
 are archived; they are not the active source base.
 
-## Latest local result — 2026-11-25
+## Performance and model-data integration — 2026-11-25
+
+The selected staging, guarded-copy, half-data and audio changes are documented
+with source pins and test results in [Linux improvements](linux-improvements.md).
+Normal world rendering remains incomplete and controllable gameplay is unverified.
+The earlier known-working source and binaries are preserved.
+
+Five offline trials reached world visuals without an NVIDIA Xid,
+then ended at the same title breakpoint. The following medians select telemetry
+samples with at least 500 draws per frame:
+
+| Trial | Duration | Samples | Frame time | Texture preparation | Copy-back |
+|---|---:|---:|---:|---:|---:|
+| Staging fix, expensive diagnostics off | 478.80 s | 55 | 2504 ms | 625 ms | 222 ms |
+| Same binary, texture no-wait enabled | 458.84 s | 48 | 2374 ms | 184 ms | 309 ms |
+| Guarded reads and writes also enabled | 421.64 s | 45 | 1826 ms | 275 ms | 189 ms |
+| Combined half-data and audio integration (`7e26bab`) | 518.31 s | 58 | 1741 ms | 245 ms | 199 ms |
+| Final shader-access corrections (`eb8d790`) | 432.27 s | 43 | 1491 ms | 225 ms | 173 ms |
+
+These are descriptive measurements, not a controlled FPS comparison: scenes,
+draw/copy volumes, cache warmup and memory pressure differ. The separate
+synthetic copy benchmark measures CPU throughput only. Guarded writes were
+actually used in the title; the guarded-copy trial reported no fallbacks.
+Both guarded writes and texture no-wait remain opt-in.
+
+The combined trial rendered outdoor scenery and characters with substantial
+missing or corrupt geometry. It ended after 8 minutes 38 seconds at the same
+breakpoint, with no recorded native allocation failure or OOM event. Its seven
+starting profile files matched the saved pre-run manifest; the title advanced
+its save version during the run. No controllable gameplay was demonstrated.
+The combined trial includes both audio and half-data changes, so it cannot
+isolate either one's effect. These results do not show that audio fixes remove
+the progression blocker.
+
+The final corrected build was rebuilt and retested under Proton before a second
+combined trial. It reached textured clothing, lighting and outdoor scenery, with
+missing faces and substantial geometry artifacts. It ended after 7 minutes
+12 seconds at the same breakpoint, again without an NVIDIA Xid or recorded
+native allocation failure. The same seven-file starting profile was copied into
+a separate writable directory and remained unchanged; existing saves were
+preserved. Caches were warmed, so this still is not a controlled performance
+comparison. Guarded writes were active, with occasional fallbacks. No OOM or
+memory-limit events were recorded; host memory pressure remained substantial.
+
+The recurring breakpoint follows an empty fixed-size object free-list branch;
+its pool identity and root cause are still unproved. The audio import is a
+progression experiment, not an established remedy. No assertion is bypassed.
+
+## Earlier visual breakthrough — 2026-11-25
 
 Normal in-world visuals are verified: textured characters, floor geometry and
 lighting. Interactive gameplay is not yet verified; some character detail is
