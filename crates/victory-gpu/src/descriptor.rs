@@ -1218,10 +1218,19 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_fresh_table_holds_the_half_views_past_its_range_starts() {
+        check_interior_half_view(10); // R16G16B16A16_FLOAT needs a UINT companion.
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn an_interior_uint_half_view_is_prepared_without_a_cbv() {
+        check_interior_half_view(57); // R16_UINT already has the right format.
+    }
+
+    #[cfg(windows)]
+    fn check_interior_half_view(format: u32) {
         use victory_shader::{ResourceType, RootType, UsedResource};
-        let Some(device) = crate::host::host() else {
-            return; // no host GPU
-        };
+        let device = crate::host::host().expect("a D3D12 host is required for the binder regression");
         let list = device.new_list().expect("a host list");
         let desc = HeapDesc {
             kind: VIEWS_KIND,
@@ -1238,16 +1247,18 @@ mod tests {
         let title = heap(h);
         let host_heap = title.host().expect("a host view heap");
         let (first, second) = (title.handle(0).unwrap(), title.handle(1).unwrap());
-        // An R16G16B16A16_FLOAT buffer view of memory in the second slot.
+        // The only declared range starts at zero; its half view is at dword 8.
         let memory = [0u64; 64];
         let address = memory.as_ptr() as u64;
         let resource = [1, 0, 0, 0, 512, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
         let mut words = [0u32; 16];
-        words[..10].copy_from_slice(&[10, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
+        words[..10].copy_from_slice(&[format, 1, 5768, 0, 0, 0, 64, 0, 0, 0]);
         words[10] = address as u32;
         words[11] = (address >> 32) as u32;
         create_placed_srv(std::ptr::null(), &resource, &words, second);
-        assert!(view(second).as_ref().and_then(host::half_view).is_some());
+        let original = view(second).expect("an interior buffer view");
+        assert_eq!(host::half_view(&original).is_some(), format == 10);
+        assert_eq!(host::half_inexact(&original), None);
         let mut state = crate::draw::State::default();
         state.set_heaps(&[h]);
         state.set_table(true, 1, first);
@@ -1261,11 +1272,30 @@ mod tests {
             user_data: 4,
             slot: 1,
         };
-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
+        let entries = [range]; // SRV only: no CBV may force a fresh table.
+        assert!(state.tables(&list, &entries, &[], &[], true).is_empty());
+        let made = state.tables(&list, &entries, &[], &[(1, 8)], true);
         let [(1, offset)] = made[..] else {
             panic!("one fresh table for root parameter 1, not {made:?}");
         };
         assert_ne!(offset, u32::MAX, "the table found no dynamic slots");
+        assert_eq!(
+            state.tables(&list, &entries, &[], &[(1, 8)], true),
+            made,
+            "the second bind must reuse the same fresh table"
+        );
+        if format == 57 {
+            let named = [range, UsedResource {
+                table_offset_dwords: 8,
+                lower_bound: 1,
+                ..range
+            }];
+            assert!(
+                state.tables(&list, &named, &[], &[(1, 8)], true).is_empty(),
+                "an explicitly named UINT view must keep ordinary preparation"
+            );
+        }
+        assert_eq!(view(second), Some(original), "preparation changed the original view");
         let next = host_heap.dynamic(1).expect("a dynamic slot");
         host_heap.release(next, 1);
         drop(state);

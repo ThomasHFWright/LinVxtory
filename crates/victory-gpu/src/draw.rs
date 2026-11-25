@@ -2533,6 +2533,8 @@ impl State {
     /// afresh as well, with that view in the unsigned format of the same
     /// layout (`descriptor::host::half_view`): the title's own slot keeps
     /// the title's format for the shaders that read it as floats.
+    /// Interior half slots also require a fresh table so they are prepared
+    /// even when their existing format is already unsigned.
     pub(crate) fn tables(
         &mut self,
         list: &HostList,
@@ -2555,11 +2557,19 @@ impl State {
             let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
                 continue;
             };
-            if crate::descriptor::host::half_view(&view).is_some() {
+            // An interior half slot needs preparation even when its UINT
+            // format already matches. Ordinary tables visit range starts;
+            // fresh tables visit every selected half slot on misses and hits.
+            let interior = !used
+                .iter()
+                .filter(tables)
+                .any(|u| u.slot == slot && u.table_offset_dwords == at);
+            if interior || crate::descriptor::host::half_view(&view).is_some() {
                 if !fresh.contains(&slot) {
                     fresh.push(slot);
                 }
-            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
+            }
+            if let Some(format) = crate::descriptor::host::half_inexact(&view) {
                 once!(
                     format,
                     "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"

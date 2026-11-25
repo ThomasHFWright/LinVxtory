@@ -43,6 +43,13 @@ or performance PR was imported.
   preparation, instead of upstream's extra metadata lookup. Resource identity,
   counter, range and all descriptor words except the remapped format survive.
   The unsigned-view test now uses a nonzero counter identity too.
+- Follow-up cross-review found that an interior half slot already using UINT
+  did not trigger a fresh table and was missed by ordinary range-start
+  preparation. `State::tables` now also selects a fresh table for half metadata
+  without an exact used-resource entry. The existing selected-slot path prepares
+  it on misses and hits, without changing shader specialization or conversion
+  warnings. Explicitly named UINT slots retain ordinary preparation. This adds
+  dynamic-table work only for previously uncovered interior half slots.
 - Both original and upstream descriptor tests survive the insertion conflict.
   Shader test support keeps `RawUavData` and `NullRawUav`, alongside the new
   `HalfUintUav`. The diagnostic view-trace scope remains around table binding.
@@ -91,9 +98,14 @@ test builds as well as Windows builds. They check:
 4. Indexed descriptors and declared ranges can extend the table beyond half views.
 
 They would catch omission of half-selection or residency hashing, and omission
-of half slots from the span. No mutation control has been run. The upstream
-device-backed span test remains; it can return early without a host device and
-must not be counted as GPU evidence in that case.
+of half slots from the span. No mutation control has been run. The device-backed
+span fixture now also covers `an_interior_uint_half_view_is_prepared_without_a_cbv`:
+one SRV range at dword 0, half slot at dword 8, R16_UINT, no CBV. It asserts a
+fresh two-slot span, reuse on the second bind, unchanged original metadata, and
+ordinary preparation when the UINT slot is explicitly named. Removing the
+interior-slot trigger would fail the fresh-table assertion by inspection; that
+negative control has not been executed. Both fixture variants now require a
+D3D12 host instead of silently returning when none exists.
 
 ## Main-owned validation gates
 
@@ -107,6 +119,7 @@ directory and offline dependency resolution when authorized:
 3. Targeted `entries_round_trip_and_reject_damage`,
    `half_places_are_the_descriptors_the_program_loads`,
    `a_fresh_table_holds_the_half_views_past_its_range_starts`,
+   `an_interior_uint_half_view_is_prepared_without_a_cbv`,
    `a_format_load_read_as_halves_loads_the_integer`, unsigned-view mapping and
    exhaustive half-pattern readbacks. Keep null-CBV, copied-descriptor,
    cross-page and mixed-mip state regressions in the integration check.
