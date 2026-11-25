@@ -246,3 +246,6 @@ fn guarded_write_retries_the_prefix_after_a_concurrent_mapping_change() {
         }
     }
 }
+
+#[path = "guarded_write_bench.rs"]
+mod benchmark;
