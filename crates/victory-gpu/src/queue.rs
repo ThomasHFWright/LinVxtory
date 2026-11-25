@@ -137,8 +137,7 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool 
     // The state the lists recorded so far leave the texture in: what our
     // copy finds it in when it runs behind them (looked at, not changed).
     const COPY_SOURCE: u32 = 0x800;
-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
-    crate::resource::host_transition(resource, state);
+    let state = crate::resource::host_subresource_state(resource, 0).unwrap_or(COPY_SOURCE);
     let texture = texture.clone();
     let sent = hold(this, || {
         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
@@ -1126,10 +1125,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane) -> HRESU
         && let Some(host) = crate::host::host()
     {
         const COPY_SOURCE: u32 = 0x800;
-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
-            .map_or(COPY_SOURCE, |(_, before)| before);
+        let state = crate::resource::host_subresource_state(resource, 0).unwrap_or(COPY_SOURCE);
         let shown = host.present(texture, state, frame);
-        crate::resource::host_transition(resource, state);
         #[cfg(feature = "diagnostics")]
         blinks(frame, resource, state, shown);
         #[cfg(not(feature = "diagnostics"))]

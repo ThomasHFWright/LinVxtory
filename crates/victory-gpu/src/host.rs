@@ -18,6 +18,8 @@ use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObj
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{Interface, PCWSTR, w};
 
+pub(crate) mod subresource;
+
 /// Resource states without the console's own bits (compression hints from
 /// bit 25 up), which the host rejects.
 pub(crate) fn pc_state(state: u32) -> u32 {
@@ -880,7 +882,7 @@ type Note = (String, Option<(u64, u64)>);
 
 type States = std::collections::HashMap<
     usize,
-    (u32, u32, std::sync::Arc<crate::resource::HostTexture>),
+    (subresource::ListState, std::sync::Arc<crate::resource::HostTexture>),
 >;
 
 /// What a list does with a depth texture that has a colour twin
@@ -5893,27 +5895,41 @@ impl HostList {
         crate::copystat::add(crate::copystat::C::ResetNs, started.elapsed().as_nanos() as u64);
     }
 
-    /// Moves a title texture's host copy to `wanted` (a host state) in this
-    /// list: the host texture and the state it leaves, if that is a change.
-    /// The list's first use of a texture records nothing: its prelude brings
-    /// the texture there at submission.
+    /// Whole-resource request; mixed prior states need individual barriers.
     pub(crate) fn transition(
         &self,
         resource: crate::object::This,
         wanted: u32,
-    ) -> Option<(&'static ID3D12Resource, u32)> {
-        let texture = crate::resource::host_resource(resource)?;
-        let copy = crate::resource::host_copy(resource)?;
-        let wanted = legal_state(texture, wanted);
+    ) -> Vec<D3D12_RESOURCE_BARRIER> {
+        self.transition_subresource(resource, subresource::ALL, wanted)
+    }
+
+    /// First use of each subresource is resolved by the submission prelude.
+    pub(crate) fn transition_subresource(
+        &self,
+        resource: crate::object::This,
+        index: u32,
+        wanted: u32,
+    ) -> Vec<D3D12_RESOURCE_BARRIER> {
+        let Some(copy) = crate::resource::host_copy(resource) else { return Vec::new() };
+        self.track_state(&copy, index, wanted)
+    }
+
+    fn track_state(
+        &self,
+        copy: &std::sync::Arc<crate::resource::HostTexture>,
+        index: u32,
+        wanted: u32,
+    ) -> Vec<D3D12_RESOURCE_BARRIER> {
+        let wanted = legal_state(&copy.texture, wanted);
         let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        match states.entry(std::sync::Arc::as_ptr(&copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some((texture, before))
+        let (tracked, _) = states.entry(std::sync::Arc::as_ptr(copy) as usize)
+            .or_insert_with(|| (subresource::ListState::new(copy.subresource_count() as usize), copy.clone()));
+        match tracked.transition(index, wanted) {
+            Ok(changes) => texture_barriers(&copy.texture, changes),
+            Err(()) => {
+                tracing::warn!(index, count = copy.subresource_count(), "texture transition subresource out of range");
+                Vec::new()
             }
         }
     }
@@ -5923,27 +5939,10 @@ impl HostList {
     /// records the barrier: for textures that are not a title resource's
     /// host copy (colour twins) and for the copies between the two.
     fn settle(&self, copy: &std::sync::Arc<crate::resource::HostTexture>, wanted: u32) {
-        let wanted = legal_state(&copy.texture, wanted);
-        let mut states = self.states.lock().unwrap_or_else(|e| e.into_inner());
-        let before = match states.entry(std::sync::Arc::as_ptr(copy) as usize) {
-            std::collections::hash_map::Entry::Vacant(v) => {
-                v.insert((wanted, wanted, copy.clone()));
-                None
-            }
-            std::collections::hash_map::Entry::Occupied(mut o) => {
-                let before = std::mem::replace(&mut o.get_mut().1, wanted);
-                (before != wanted).then_some(before)
-            }
-        };
-        drop(states);
-        if let Some(before) = before {
-            let barrier = transition(
-                &copy.texture,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATES(wanted as i32),
-            );
+        let barriers = self.track_state(copy, subresource::ALL, wanted);
+        if !barriers.is_empty() {
             // SAFETY: an open list and a live texture.
-            unsafe { self.list.ResourceBarrier(&[barrier]) };
+            unsafe { self.list.ResourceBarrier(&barriers) };
         }
     }
 
@@ -6119,7 +6118,6 @@ impl HostList {
     fn prelude(&self) -> Option<ID3D12CommandList> {
         const COPY_DEST: u32 = 0x400;
         const COPY_SOURCE: u32 = 0x800;
-        let host_state = |state: u32| D3D12_RESOURCE_STATES(state as i32);
         let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
         // The copies (depth texture, twin, whether into the twin); the
         // sides are then as this list leaves them.
@@ -6142,10 +6140,12 @@ impl HostList {
         // A copy runs with its textures in the copy states: each moves
         // there from its real state, and from there to the state the list
         // starts with (back to its real state if the list does not use it).
-        let mut to_copy = Vec::new();
+        let mut copy_barriers = Vec::new();
         let mut barriers = Vec::new();
-        let mut copying = std::collections::HashMap::new();
+        let mut copying: std::collections::HashMap<usize, (std::sync::Arc<crate::resource::HostTexture>, Vec<u32>)> =
+            std::collections::HashMap::new();
         for (depth, twin, colour) in &syncs {
+            let mut before_copy = Vec::new();
             let (from, to) = if *colour {
                 (depth, &twin.colour)
             } else {
@@ -6153,30 +6153,28 @@ impl HostList {
             };
             for (texture, state) in [(from, COPY_SOURCE), (to, COPY_DEST)] {
                 let key = std::sync::Arc::as_ptr(texture) as usize;
-                let real = texture.state.load(Ordering::Relaxed);
-                copying.insert(key, state);
-                if real != state {
-                    to_copy.push(transition(
-                        &texture.texture,
-                        host_state(real),
-                        host_state(state),
-                    ));
-                    if !states.contains_key(&key) {
-                        barriers.push(transition(
-                            &texture.texture,
-                            host_state(state),
-                            host_state(real),
-                        ));
-                    }
-                }
+                let (_, current) = copying.entry(key).or_insert_with(|| {
+                    (texture.clone(), texture.state.lock().unwrap_or_else(|e| e.into_inner()).clone())
+                });
+                let wanted = vec![state; current.len()];
+                before_copy.extend(texture_barriers(&texture.texture, subresource::between(current, &wanted)));
+                *current = wanted;
             }
+            // Transitions belong immediately before their copy. A texture
+            // can participate in more than one twin synchronization.
+            copy_barriers.push(before_copy);
         }
-        barriers.extend(states.iter().filter_map(|(key, (first, last, copy))| {
-            let real = copy.state.swap(*last, Ordering::Relaxed);
-            let real = copying.get(key).copied().unwrap_or(real);
-            (real != *first)
-                .then(|| transition(&copy.texture, host_state(real), host_state(*first)))
-        }));
+        for (key, (tracked, copy)) in states.iter() {
+            let copied = copying.remove(key).map(|(_, current)| current);
+            let mut real = copy.state.lock().unwrap_or_else(|e| e.into_inner());
+            barriers.extend(texture_barriers(&copy.texture, tracked.prepare(&mut real, copied.as_deref())));
+        }
+        // Copies not otherwise used by this list return to their exact
+        // previous states, including mixed mip and plane states.
+        for (_, (copy, current)) in copying {
+            let real = copy.state.lock().unwrap_or_else(|e| e.into_inner());
+            barriers.extend(texture_barriers(&copy.texture, subresource::between(&current, &real)));
+        }
         if barriers.is_empty() && syncs.is_empty() {
             return None;
         }
@@ -6192,10 +6190,10 @@ impl HostList {
         let recorded = unsafe {
             allocator.Reset().and_then(|()| {
                 list.Reset(allocator, None)?;
-                if !to_copy.is_empty() {
-                    list.ResourceBarrier(&to_copy);
-                }
-                for (depth, twin, colour) in &syncs {
+                for ((depth, twin, colour), before_copy) in syncs.iter().zip(&copy_barriers) {
+                    if !before_copy.is_empty() {
+                        list.ResourceBarrier(before_copy);
+                    }
                     record_twin_copy(list, &depth.texture, twin, *colour);
                 }
                 if !barriers.is_empty() {
@@ -7593,8 +7591,8 @@ impl Meter {
 }
 
 impl Host {
-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
-    /// as frame `frame` (saved if captures are on). `None` if nothing was
+    /// Shows subresource 0 of `texture`, which is in `state` and stays in
+    /// it, as frame `frame` (saved if captures are on). `None` if nothing was
     /// shown; else, in diagnostics builds, whether the frame was black.
     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
         let showing = std::time::Instant::now();
@@ -7679,15 +7677,21 @@ impl Host {
             };
             copy.reset();
             let list = &copy.list;
-            list.ResourceBarrier(&[
-                transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
-                transition(
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[subresource_transition(texture, 0, state, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
+            }
+            list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_PRESENT,
                     D3D12_RESOURCE_STATE_COPY_DEST,
-                ),
-            ]);
-            list.CopyResource(&back, texture);
+            )]);
+            let part = |texture: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
+                // Borrowed pointers; the locations do not release them.
+                pResource: std::mem::transmute_copy(texture),
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
+            };
+            list.CopyTextureRegion(&part(&back), 0, 0, 0, &part(texture), None);
             #[cfg(feature = "diagnostics")]
             let capture = crate::capture::wanted(frame)
                 .then(|| crate::capture::read_back(&self.device, list, texture))
@@ -7696,14 +7700,14 @@ impl Host {
             let probe = if slot.is_some() { None } else { crate::capture::probe(&self.device, list, texture) };
             #[cfg(not(feature = "diagnostics"))]
             let _ = frame;
-            list.ResourceBarrier(&[
-                transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-                transition(
+            if state != D3D12_RESOURCE_STATE_COPY_SOURCE {
+                list.ResourceBarrier(&[subresource_transition(texture, 0, D3D12_RESOURCE_STATE_COPY_SOURCE, state)]);
+            }
+            list.ResourceBarrier(&[transition(
                     &back,
                     D3D12_RESOURCE_STATE_COPY_DEST,
                     D3D12_RESOURCE_STATE_PRESENT,
-                ),
-            ]);
+            )]);
             copy.close();
             match slot {
                 Some(i) => {
@@ -8076,6 +8080,21 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    subresource_transition(resource, subresource::ALL, before, after)
+}
+
+fn texture_barriers(resource: &ID3D12Resource, changes: Vec<subresource::Change>) -> Vec<D3D12_RESOURCE_BARRIER> {
+    changes.into_iter().map(|c| {
+        subresource_transition(resource, c.index, D3D12_RESOURCE_STATES(c.before as i32), D3D12_RESOURCE_STATES(c.after as i32))
+    }).collect()
+}
+
+pub(crate) fn subresource_transition(
+    resource: &ID3D12Resource,
+    index: u32,
+    before: D3D12_RESOURCE_STATES,
+    after: D3D12_RESOURCE_STATES,
+) -> D3D12_RESOURCE_BARRIER {
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
@@ -8083,7 +8102,7 @@ pub(crate) fn transition(
             Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
                 // SAFETY: a borrowed pointer; the barrier never releases it.
                 pResource: unsafe { std::mem::transmute_copy(resource) },
-                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                Subresource: index,
                 StateBefore: before,
                 StateAfter: after,
             }),

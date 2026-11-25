@@ -180,7 +180,6 @@ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
 /// as [`upload`] does. False if the copy cannot be made: the caller fills
 /// the texture from title memory, as before.
 pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
-    const TARGET_OR_UNORDERED: u32 = 0x4 | 0x8;
     const COPY_DEST: u32 = 0x400;
     const COPY_SOURCE: u32 = 0x800;
     let (Some(to), Some(from)) = (
@@ -280,18 +279,12 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
     // The source's first use in the list records nothing (its prelude
     // brings it to the state); a use in another way since the last copy
     // shows as a change of state.
-    let before = list.transition(source, COPY_SOURCE).map(|(texture, before)| {
-        let state = crate::host::legal_state(texture, COPY_SOURCE);
-        let barrier = crate::host::transition(
-            texture,
-            D3D12_RESOURCE_STATES(before as i32),
-            D3D12_RESOURCE_STATES(state as i32),
-        );
+    let before = list.transition(source, COPY_SOURCE);
+    if !before.is_empty() {
         // SAFETY: an open list and a live texture.
-        unsafe { list.list.ResourceBarrier(&[barrier]) };
-        before
-    });
-    if !first && before.is_none() {
+        unsafe { list.list.ResourceBarrier(&before) };
+    }
+    if !first && before.is_empty() {
         return true;
     }
     card_writes(list, placed, to, None);
@@ -338,13 +331,13 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
             .ResourceBarrier(&[crate::host::transition(&through.buffer, read, common)]);
     }
     list.keep(&through.buffer);
-    // A draw that also writes the source (a view of it handled before
-    // this one) needs it in that state again; the next read of the alias
-    // then copies once more, as it must after a write.
-    if let Some(before) = before
-        && before & TARGET_OR_UNORDERED != 0
-    {
-        crate::list::ensure_state(list, source, before);
+    // Earlier views in this draw still need their exact states, including
+    // SRVs on one mip and UAVs on another. First uses with no prior state
+    // remain COPY_SOURCE; they will be resolved by the submission prelude.
+    for barrier in &before {
+        // SAFETY: transition() returns only transition barriers.
+        let prior = unsafe { &barrier.Anonymous.Transition };
+        crate::list::ensure_subresource_state(list, source, prior.Subresource, prior.StateBefore.0 as u32);
     }
     true
 }

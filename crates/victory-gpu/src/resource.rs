@@ -1121,7 +1121,8 @@ struct Resource {
 #[cfg(windows)]
 pub(crate) struct HostTexture {
     pub(crate) texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource,
-    pub(crate) state: std::sync::atomic::AtomicU32,
+    /// Submission-ordered states in D3D12 mip/array/plane index order.
+    pub(crate) state: std::sync::Mutex<Vec<u32>>,
     /// The bytes the host gives it.
     bytes: u64,
     /// Whether its contents come from title memory ([`fills`]): counted in
@@ -1944,14 +1945,52 @@ fn host_bytes(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) ->
 
 #[cfg(windows)]
 impl HostTexture {
+    pub(crate) fn subresource_count(&self) -> u32 {
+        self.state.lock().unwrap_or_else(|e| e.into_inner()).len() as u32
+    }
+
+    fn initial_states(
+        texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource,
+        state: u32,
+    ) -> std::sync::Mutex<Vec<u32>> {
+        use windows::Win32::Graphics::Direct3D12::*;
+        // SAFETY: a live resource and output structures of the documented sizes.
+        let desc = unsafe { texture.GetDesc() };
+        let mut device: Option<ID3D12Device> = None;
+        let mut info = D3D12_FEATURE_DATA_FORMAT_INFO { Format: desc.Format, PlaneCount: 0 };
+        let queried = unsafe {
+            texture.GetDevice(&mut device).is_ok() && device.as_ref().is_some_and(|device| {
+                device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_INFO,
+                    (&raw mut info).cast(),
+                    size_of_val(&info) as u32,
+                ).is_ok()
+            })
+        };
+        let planes = if queried && info.PlaneCount > 0 {
+            u32::from(info.PlaneCount)
+        } else {
+            // Compatibility fallback for the colour and depth/stencil
+            // textures supported here. Planar video formats need the query.
+            let planes = if matches!(desc.Format.0, 19..=22 | 44..=47) { 2 } else { 1 };
+            tracing::warn!(format = desc.Format.0, planes, "format plane query failed; using colour/depth fallback");
+            planes
+        };
+        let count = crate::host::subresource::count(
+            u32::from(desc.MipLevels), u32::from(desc.DepthOrArraySize),
+            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D, planes,
+        );
+        std::sync::Mutex::new(vec![state; count])
+    }
+
     fn new(texture: windows::Win32::Graphics::Direct3D12::ID3D12Resource, state: u32) -> HostTexture {
         use std::sync::atomic::Ordering::Relaxed;
         let bytes = host_bytes(&texture);
         HOST_TEXTURES[0].fetch_add(1, Relaxed);
         HOST_TEXTURES[1].fetch_add(bytes, Relaxed);
         HostTexture {
+            state: Self::initial_states(&texture, state),
             texture,
-            state: std::sync::atomic::AtomicU32::new(state),
             bytes,
             filled: false,
             tiled: None,
@@ -1967,8 +2006,8 @@ impl HostTexture {
     ) -> HostTexture {
         HOST_TEXTURES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         HostTexture {
+            state: Self::initial_states(&texture, state),
             texture,
-            state: std::sync::atomic::AtomicU32::new(state),
             bytes: 0,
             filled: false,
             tiled: Some(tiled),
@@ -1996,16 +2035,16 @@ pub(crate) fn placed_textures() -> u64 {
     PLACED_TEXTURES.lock().unwrap_or_else(|e| e.into_inner()).len() as u64
 }
 
-/// Moves the host texture to `wanted` (a host texture state); the host
-/// resource and the state it leaves, if that is a change.
+/// The submitted state of one subresource, without creating a host copy,
+/// changing states, or counting the query as a resource use.
 #[cfg(windows)]
-pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
-    use windows::core::Interface;
-    let (host, _) = hosted(this, true)?;
-    let before = host
-        .state
-        .swap(wanted, std::sync::atomic::Ordering::Relaxed);
-    (before != wanted).then(|| (host.texture.as_raw(), before))
+pub(crate) fn host_subresource_state(this: This, index: u32) -> Option<u32> {
+    if this.is_null() {
+        return None;
+    }
+    let host = resource(this).host.made.lock().unwrap_or_else(|e| e.into_inner())
+        .as_ref()?.0.clone();
+    host.state.lock().unwrap_or_else(|e| e.into_inner()).get(index as usize).copied()
 }
 
 /// The host GPU's copy of a title resource, if it has one: made now if
@@ -3198,7 +3237,7 @@ mod tests {
         let readback = readback.unwrap();
         let host_image = host_resource(image).unwrap();
         let back = host.new_list().unwrap();
-        let (_, before) = host_transition(image, 0x800).unwrap();
+        crate::list::ensure_subresource_state(&back, image, 0, 0x800);
         // The upload list holds the texture until it is reset.
         assert!(std::sync::Arc::strong_count(&host_copy(image).unwrap()) > 2);
         use windows::core::Interface;
@@ -3214,11 +3253,6 @@ mod tests {
         };
         // SAFETY: an open list, live resources, locations in the host layout.
         unsafe {
-            back.list.ResourceBarrier(&[crate::host::transition(
-                host_image,
-                D3D12_RESOURCE_STATES(before as i32),
-                D3D12_RESOURCE_STATE_COPY_SOURCE,
-            )]);
             back.list.CopyTextureRegion(
                 (&raw const out_to).cast(),
                 0,
@@ -3429,7 +3463,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_stencil_planes_twin_reaches_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Graphics::Direct3D12::*;
         use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
         let Some(host) = crate::host::host() else {
@@ -3574,7 +3607,9 @@ mod tests {
         host.execute(&[&list]);
 
         // The stencil plane read back from the state the list left it in.
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let states = host_copy(depth).unwrap().state.lock().unwrap().clone();
+        assert!(states.iter().all(|&state| state == states[0]));
+        let state = states[0];
         let state = D3D12_RESOURCE_STATES(state as i32);
         let back = host.new_list().unwrap();
         // SAFETY: an open list and live resources; a whole subresource.
@@ -3618,7 +3653,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_depth_planes_twin_is_drawn_into_the_plane() {
-        use std::sync::atomic::Ordering::Relaxed;
         use windows::Win32::Foundation::RECT;
         use windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY;
         use windows::Win32::Graphics::Direct3D12::*;
@@ -3858,7 +3892,9 @@ float4 lit() : SV_Target { return 1.0; }
                 host.device.CreateGraphicsPipelineState(&desc).unwrap();
             (signature, pipeline)
         };
-        let state = host_copy(depth).unwrap().state.load(Relaxed);
+        let states = host_copy(depth).unwrap().state.lock().unwrap().clone();
+        assert!(states.iter().all(|&state| state == states[0]));
+        let state = states[0];
         let state = D3D12_RESOURCE_STATES(state as i32);
         let colour = host.rtv(Some(&target), None);
         let depth_view = host.dsv(

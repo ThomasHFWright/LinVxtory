@@ -13,6 +13,31 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use super::{VIEW_TAG, View, view_at};
 use crate::host::host;
 
+#[cfg(feature = "diagnostics")]
+thread_local! {
+    static TRACE_VIEWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) struct TraceViews(bool);
+
+#[cfg(feature = "diagnostics")]
+impl Drop for TraceViews {
+    fn drop(&mut self) {
+        TRACE_VIEWS.set(self.0);
+    }
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn trace_views(enabled: bool) -> TraceViews {
+    TraceViews(TRACE_VIEWS.replace(enabled))
+}
+
+#[cfg(feature = "diagnostics")]
+pub(crate) fn tracing_views() -> bool {
+    TRACE_VIEWS.get()
+}
+
 pub(crate) struct HostHeap {
     pub(crate) heap: ID3D12DescriptorHeap,
     cpu: usize,
@@ -2094,6 +2119,62 @@ impl HostHeap {
         }
     }
 
+    /// Bounded bookkeeping snapshot, including dynamic slots. Retained
+    /// resource metadata is not the installed view or proof of nullness;
+    /// descriptor writes may race this inspection. Never makes a resource.
+    #[cfg(feature = "diagnostics")]
+    pub(crate) fn inspect_slot(&self, index: u32) -> String {
+        // SAFETY: the heap is live; querying its capacity changes nothing.
+        let capacity = unsafe { self.heap.GetDesc() }.NumDescriptors;
+        if index >= capacity {
+            return format!(
+                "slot={index} capacity={capacity} class=out-of-range logical_key=untracked \
+                 logical_view=untracked retained_metadata=unavailable null_descriptor=unknown"
+            );
+        }
+        let class = if index < self.count {
+            "title"
+        } else if index - self.count < self.dynamic {
+            "dynamic"
+        } else {
+            "padding"
+        };
+        let (key, resource) = {
+            // Same lock order as mirror/keep. Clone before releasing the
+            // locks so replacement cannot free the resource we describe.
+            let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+            let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+            (made.get(index as usize).copied(), kept.get(index as usize).cloned().flatten())
+        };
+        let logical = match key {
+            None => "logical_key=untracked logical_view=untracked".to_owned(),
+            Some(0) => "logical_key=0 logical_view=unmade".to_owned(),
+            Some(key) => {
+                let hint = view_at(key as u32, (key >> 32) as u32)
+                    .map(|view| format!("{view:?}").chars().take(120).collect::<String>())
+                    .unwrap_or_else(|| "stale".to_owned());
+                format!("logical_key={key:#x} logical_view={hint}")
+            }
+        };
+        let retained = match resource {
+            Some(resource) => {
+                // SAFETY: our cloned reference keeps this resource live.
+                let d = unsafe { resource.GetDesc() };
+                format!(
+                    "identity={:p} dimension={} format={} dims={}x{}x{} mips={} samples={}/{} flags={:#x}",
+                    windows::core::Interface::as_raw(&resource),
+                    d.Dimension.0, d.Format.0, d.Width, d.Height, d.DepthOrArraySize,
+                    d.MipLevels, d.SampleDesc.Count, d.SampleDesc.Quality, d.Flags.0
+                )
+            }
+            None => "none (no retained resource)".to_owned(),
+        };
+        format!(
+            "slot={index} capacity={capacity} class={class} {logical} \
+             retained_metadata=[{retained}] null_descriptor=unknown"
+        )
+    }
+
     /// The view host slot `index` was made from, in a few words, with the
     /// title and host addresses of a buffer view (diagnostics). "null" for
     /// a slot never made or left null.
@@ -2141,6 +2222,274 @@ fn uav_desc(words: &[u32; 10]) -> D3D12_UNORDERED_ACCESS_VIEW_DESC {
         std::ptr::from_ref(&words)
             .cast::<D3D12_UNORDERED_ACCESS_VIEW_DESC>()
             .read_unaligned()
+    }
+}
+
+fn shown_levels(
+    resource: crate::object::This,
+    texture: &ID3D12Resource,
+    desc: &mut Option<D3D12_SHADER_RESOURCE_VIEW_DESC>,
+) {
+    // Levels on demand (`crate::tiles`): a texture made level by
+    // level is shown from the first level that is the title's
+    // and has memory, if the title's view starts before it (a
+    // level without memory reads zeros: a black texture). The
+    // title's own view mostly starts there already.
+    if let Some(first) = crate::resource::first_shown(resource)
+        && first > 0
+    {
+        // SAFETY: a live resource.
+        let own = unsafe { texture.GetDesc() };
+        // The texture's own view (the title gave none): all of it.
+        let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
+            Format: own.Format,
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Shader4ComponentMapping: 5768,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: 0,
+                    MipLevels: u32::MAX,
+                    PlaneSlice: 0,
+                    ResourceMinLODClamp: 0.0,
+                },
+            },
+        };
+        crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+    }
+}
+
+/// The subresources named by a texture view, including the installed SRV's
+/// resident mip restriction. None retains the default whole-resource path.
+pub(crate) fn view_subresources(view: &View) -> Option<Vec<u32>> {
+    let (resource, unordered, words) = match view {
+        View::Shader(resource, desc) => (*resource, false, desc),
+        View::Unordered(resource, _, desc) => (*resource, true, desc),
+        _ => return None,
+    };
+    let texture = crate::resource::host_resource(resource as crate::object::This)?;
+    // SAFETY: a live texture; union members below are selected by dimension.
+    let own = unsafe { texture.GetDesc() };
+    let view = if unordered {
+        TextureView::Unordered(words.as_ref().map(uav_desc))
+    } else {
+        let mut desc = words.as_ref().map(srv_desc);
+        shown_levels(resource as crate::object::This, texture, &mut desc);
+        TextureView::Shader(desc)
+    };
+    texture_view_subresources(&own, view)
+}
+
+enum TextureView {
+    Shader(Option<D3D12_SHADER_RESOURCE_VIEW_DESC>),
+    Unordered(Option<D3D12_UNORDERED_ACCESS_VIEW_DESC>),
+}
+
+fn texture_view_subresources(own: &D3D12_RESOURCE_DESC, view: TextureView) -> Option<Vec<u32>> {
+    let mips = u32::from(own.MipLevels);
+    let slices = if own.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+        1
+    } else {
+        u32::from(own.DepthOrArraySize)
+    };
+    let (mip, levels, slice, count, plane) = if let TextureView::Unordered(desc) = view {
+        let Some(desc) = desc else {
+            // A default UAV exposes mip zero of every array slice, not
+            // the whole mip chain. A 3D texture has one subresource per mip.
+            return Some(subresource_range(mips, slices, 0, 1, 0, slices, 0));
+        };
+        unsafe {
+            match desc.ViewDimension {
+                D3D12_UAV_DIMENSION_TEXTURE1D => (desc.Anonymous.Texture1D.MipSlice, 1, 0, 1, 0),
+                D3D12_UAV_DIMENSION_TEXTURE1DARRAY => {
+                    let v = desc.Anonymous.Texture1DArray;
+                    (v.MipSlice, 1, v.FirstArraySlice, v.ArraySize, 0)
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2D => {
+                    let v = desc.Anonymous.Texture2D;
+                    (v.MipSlice, 1, 0, 1, v.PlaneSlice)
+                }
+                D3D12_UAV_DIMENSION_TEXTURE2DARRAY => {
+                    let v = desc.Anonymous.Texture2DArray;
+                    (v.MipSlice, 1, v.FirstArraySlice, v.ArraySize, v.PlaneSlice)
+                }
+                D3D12_UAV_DIMENSION_TEXTURE3D => (desc.Anonymous.Texture3D.MipSlice, 1, 0, 1, 0),
+                _ => return None,
+            }
+        }
+    } else {
+        let TextureView::Shader(Some(desc)) = view else {
+            return None;
+        };
+        unsafe {
+            match desc.ViewDimension {
+                D3D12_SRV_DIMENSION_TEXTURE1D => {
+                    let v = desc.Anonymous.Texture1D;
+                    (v.MostDetailedMip, v.MipLevels, 0, 1, 0)
+                }
+                D3D12_SRV_DIMENSION_TEXTURE1DARRAY => {
+                    let v = desc.Anonymous.Texture1DArray;
+                    (
+                        v.MostDetailedMip,
+                        v.MipLevels,
+                        v.FirstArraySlice,
+                        v.ArraySize,
+                        0,
+                    )
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2D => {
+                    let v = desc.Anonymous.Texture2D;
+                    (v.MostDetailedMip, v.MipLevels, 0, 1, v.PlaneSlice)
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DARRAY => {
+                    let v = desc.Anonymous.Texture2DArray;
+                    (
+                        v.MostDetailedMip,
+                        v.MipLevels,
+                        v.FirstArraySlice,
+                        v.ArraySize,
+                        v.PlaneSlice,
+                    )
+                }
+                D3D12_SRV_DIMENSION_TEXTURE2DMS => (0, 1, 0, 1, 0),
+                D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY => {
+                    let v = desc.Anonymous.Texture2DMSArray;
+                    (0, 1, v.FirstArraySlice, v.ArraySize, 0)
+                }
+                D3D12_SRV_DIMENSION_TEXTURE3D => {
+                    let v = desc.Anonymous.Texture3D;
+                    (v.MostDetailedMip, v.MipLevels, 0, 1, 0)
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBE => {
+                    let v = desc.Anonymous.TextureCube;
+                    (v.MostDetailedMip, v.MipLevels, 0, 6, 0)
+                }
+                D3D12_SRV_DIMENSION_TEXTURECUBEARRAY => {
+                    let v = desc.Anonymous.TextureCubeArray;
+                    (
+                        v.MostDetailedMip,
+                        v.MipLevels,
+                        v.First2DArrayFace,
+                        v.NumCubes.saturating_mul(6),
+                        0,
+                    )
+                }
+                _ => return None,
+            }
+        }
+    };
+    Some(subresource_range(
+        mips, slices, mip, levels, slice, count, plane,
+    ))
+}
+
+fn subresource_range(
+    mips: u32,
+    slices: u32,
+    mip: u32,
+    levels: u32,
+    slice: u32,
+    count: u32,
+    plane: u32,
+) -> Vec<u32> {
+    let mut result = Vec::new();
+    for array in slice..slice.saturating_add(count).min(slices) {
+        for level in mip..mip.saturating_add(levels).min(mips) {
+            if let Some(index) = plane
+                .checked_mul(slices)
+                .and_then(|v| v.checked_add(array))
+                .and_then(|v| v.checked_mul(mips))
+                .and_then(|v| v.checked_add(level))
+            {
+                result.push(index);
+            }
+        }
+    }
+    result
+}
+
+#[cfg(test)]
+mod subresource_tests {
+    use super::*;
+
+    fn texture(mips: u16, slices: u16) -> D3D12_RESOURCE_DESC {
+        D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+            MipLevels: mips,
+            DepthOrArraySize: slices,
+            ..Default::default()
+        }
+    }
+
+    fn srv(first: u32, levels: u32) -> TextureView {
+        TextureView::Shader(Some(D3D12_SHADER_RESOURCE_VIEW_DESC {
+            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_SRV {
+                    MostDetailedMip: first,
+                    MipLevels: levels,
+                    ..Default::default()
+                },
+            },
+            ..Default::default()
+        }))
+    }
+
+    fn uav(mip: u32) -> TextureView {
+        TextureView::Unordered(Some(D3D12_UNORDERED_ACCESS_VIEW_DESC {
+            ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
+            Anonymous: D3D12_UNORDERED_ACCESS_VIEW_DESC_0 {
+                Texture2D: D3D12_TEX2D_UAV {
+                    MipSlice: mip,
+                    PlaneSlice: 0,
+                },
+            },
+            ..Default::default()
+        }))
+    }
+
+    #[test]
+    fn decoded_mip_chain_views_keep_each_pass_disjoint() {
+        let own = texture(7, 1);
+        for first in [0, 3] {
+            let reads = texture_view_subresources(&own, srv(first, 1)).unwrap();
+            assert_eq!(reads, [first]);
+            for output in first + 1..=first + 3 {
+                let writes = texture_view_subresources(&own, uav(output)).unwrap();
+                assert_eq!(writes, [output]);
+                assert!(writes.iter().all(|index| !reads.contains(index)));
+            }
+        }
+    }
+
+    #[test]
+    fn default_uav_leaves_other_mips_available_for_reads() {
+        let own = texture(4, 2);
+        let writes = texture_view_subresources(&own, TextureView::Unordered(None)).unwrap();
+        assert_eq!(writes, [0, 4]);
+        let reads = texture_view_subresources(&own, srv(1, 1)).unwrap();
+        assert!(reads.iter().all(|index| !writes.contains(index)));
+        let volume = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE3D,
+            ..texture(4, 16)
+        };
+        assert_eq!(
+            texture_view_subresources(&volume, TextureView::Unordered(None)).unwrap(),
+            [0]
+        );
+    }
+
+    #[test]
+    fn mip_views_are_disjoint() {
+        assert_eq!(subresource_range(5, 1, 0, 1, 0, 1, 0), [0]);
+        assert_eq!(subresource_range(5, 1, 2, 1, 0, 1, 0), [2]);
+        assert_eq!(subresource_range(5, 1, 3, u32::MAX, 0, 1, 0), [3, 4]);
+    }
+
+    #[test]
+    fn array_and_plane_offsets_use_resource_dimensions() {
+        assert_eq!(subresource_range(4, 3, 1, 2, 1, 2, 1), [17, 18, 21, 22]);
+        assert!(subresource_range(4, 3, 4, u32::MAX, 0, 1, 0).is_empty());
+        assert!(subresource_range(4, 3, 0, 1, 3, 1, 0).is_empty());
     }
 }
 
@@ -2817,31 +3166,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
                 if !fits(texture, desc.as_mut().map(|d| &mut d.Format), false) {
                     return None;
                 }
-                // Levels on demand (`crate::tiles`): a texture made level by
-                // level is shown from the first level that is the title's
-                // and has memory, if the title's view starts before it (a
-                // level without memory reads zeros: a black texture). The
-                // title's own view mostly starts there already.
-                if let Some(first) = crate::resource::first_shown(resource)
-                    && first > 0
-                {
-                    // SAFETY: a live resource.
-                    let own = unsafe { texture.GetDesc() };
-                    // The texture's own view (the title gave none): all of it.
-                    let whole = D3D12_SHADER_RESOURCE_VIEW_DESC {
-                        Format: own.Format,
-                        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
-                        Shader4ComponentMapping: 5768,
-                        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
-                            Texture2D: D3D12_TEX2D_SRV {
-                                MostDetailedMip: 0,
-                                MipLevels: u32::MAX,
-                                PlaneSlice: 0,
-                                ResourceMinLODClamp: 0.0,
-                            },
-                        },
-                    };
-                    crate::tiles::show_from(desc.get_or_insert(whole), first, u32::from(own.MipLevels));
+                shown_levels(resource, texture, &mut desc);
+                #[cfg(feature = "diagnostics")]
+                if tracing_views() {
+                    // SAFETY: the dimension selects the matching union member.
+                    let mip = desc.as_ref().filter(|d| d.ViewDimension == D3D12_SRV_DIMENSION_TEXTURE2D)
+                        .map(|d| unsafe { d.Anonymous.Texture2D });
+                    tracing::info!(?resource, slot = at.ptr, format = ?desc.as_ref().map(|d| d.Format.0),
+                        dimension = ?desc.as_ref().map(|d| d.ViewDimension.0), ?mip,
+                        "shader binding snapshot: installed SRV");
                 }
                 // SAFETY: a live texture and a slot of our heap.
                 unsafe {
@@ -2903,6 +3236,15 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
             };
             if !fits(texture, desc.as_mut().map(|d| &mut d.Format), true) {
                 return None;
+            }
+            #[cfg(feature = "diagnostics")]
+            if tracing_views() {
+                // SAFETY: the dimension selects the matching union member.
+                let mip = desc.as_ref().filter(|d| d.ViewDimension == D3D12_UAV_DIMENSION_TEXTURE2D)
+                    .map(|d| unsafe { d.Anonymous.Texture2D });
+                tracing::info!(?resource, slot = at.ptr, format = ?desc.as_ref().map(|d| d.Format.0),
+                    dimension = ?desc.as_ref().map(|d| d.ViewDimension.0), ?mip,
+                    "shader binding snapshot: installed UAV");
             }
             // SAFETY: a live texture and a slot of our heap.
             unsafe {

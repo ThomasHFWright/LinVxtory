@@ -1002,6 +1002,8 @@ impl State {
         for stage in &p.stages {
             let t = stage.translated();
             STORES.set(t.stores);
+            #[cfg(feature = "diagnostics")]
+            let _trace = crate::descriptor::host::trace_views(trace_shader_selected(stage));
             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
@@ -1038,6 +1040,8 @@ impl State {
                         None => self.user_value(compute, u.slot, u.root, u.dword),
                     };
                 }
+                #[cfg(feature = "diagnostics")]
+                self.trace_shader_bind(stage, param, &values);
                 // SAFETY: an open list; `values` covers the parameter.
                 unsafe {
                     if compute {
@@ -2097,6 +2101,42 @@ impl State {
     /// (diagnostics): the pipeline, then per stage the user data it gets
     /// (with the view at that heap index, if one is), the host addresses
     /// of its root views and the views its tables name.
+    /// Opt-in bounded observation of actual remapped root values. Slots below
+    /// are static table references, not a claim about arbitrary shader indexing.
+    #[cfg(feature = "diagnostics")]
+    fn trace_shader_bind(&self, stage: &crate::pipeline::host::Stage, param: u32, values: &[u32]) {
+        static SEEN: AtomicU64 = AtomicU64::new(0);
+        if !trace_shader_selected(stage) {
+            return;
+        }
+        let frame = crate::frame::current();
+        let ordinal = SEEN.fetch_add(1, Ordering::Relaxed);
+        if ordinal >= 1024 {
+            return;
+        }
+        let t = stage.translated();
+        tracing::info!(frame, ordinal, shader = %stage.shader.hash, param,
+            roots = ?values, mapping = ?t.host.user_data, heaps = ?self.heaps,
+            "shader binding snapshot: actual remapped constants");
+        let Some(heap) = (self.heaps[0] != 0)
+            .then(|| crate::descriptor::heap(self.heaps[0] as This).host()).flatten()
+        else { return; };
+        for used in t.used.iter().filter(|u| u.root == RootType::Table && u.kind != ResourceType::Sampler) {
+            let Some(base) = t.host.user_data.iter()
+                .find(|u| u.root == RootType::Table && u.slot == used.slot && u.dword == 0)
+                .and_then(|u| values.get(u.index as usize)).copied()
+            else { continue; };
+            let byte = base.wrapping_add(used.table_offset_dwords.wrapping_mul(4));
+            let raw_index = byte >> 5;
+            let limit = victory_shader::emit::view_heap_limit();
+            let index = if limit == 0 { raw_index } else { raw_index.min(limit) };
+            tracing::info!(frame, ordinal, root = used.slot, expected = ?used.kind,
+                base, aligned = base.is_multiple_of(32), raw_index, index,
+                retained = %heap.inspect_slot(index),
+                "shader binding snapshot: static table slot");
+        }
+    }
+
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
@@ -2571,7 +2611,7 @@ impl State {
                 once!(slot, n, "fresh descriptor table exceeds the available span");
                 continue;
             }
-            // The table and what its entries hold (record words).
+            // The table, its record words, and the resident SRV ranges.
             let key = {
                 use std::hash::{Hash, Hasher};
                 let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -2579,6 +2619,23 @@ impl State {
                     let at = table + u64::from(k) * 32;
                     // SAFETY: a descriptor slot in title memory.
                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
+                    let view = crate::descriptor::view(at);
+                    let placed = view
+                        .as_ref()
+                        .and_then(crate::descriptor::host::placed_texture);
+                    let first_shown = match placed.as_ref().or(view.as_ref()) {
+                        Some(View::Shader(resource, _)) => {
+                            crate::resource::first_shown(*resource as This).unwrap_or(0)
+                        }
+                        _ => 0,
+                    };
+                    // None and zero both leave the title's view unchanged.
+                    // A new range gets new slots; never remake a table that
+                    // an earlier recorded draw may still reference. Snapshot
+                    // before make_at/readable: uploads can change residency
+                    // again, which the next lookup must see. This does not
+                    // make descriptor creation and upload atomic.
+                    first_shown.hash(&mut h);
                 }
                 (table, n, h.finish())
             };
@@ -3187,7 +3244,41 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
     }
 }
 
+#[cfg(feature = "diagnostics")]
+fn trace_shader_selected(stage: &crate::pipeline::host::Stage) -> bool {
+    static FILTER: std::sync::OnceLock<Option<(String, u64)>> = std::sync::OnceLock::new();
+    let Some((hash, first_frame)) = FILTER.get_or_init(|| {
+        let hash = std::env::var("VICTORY_TRACE_SHADER").ok()?;
+        if hash.len() != 16 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        let frame = std::env::var("VICTORY_TRACE_SHADER_AFTER_FRAME")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+        Some((hash.to_ascii_lowercase(), frame))
+    }) else {
+        return false;
+    };
+    let frame = crate::frame::current();
+    stage.shader.hash == *hash && frame >= *first_frame
+}
+
+fn ensure_view_state(list: &HostList, resource: This, view: &View, state: u32) {
+    if let Some(subresources) = crate::descriptor::host::view_subresources(view) {
+        for subresource in subresources {
+            crate::list::ensure_subresource_state(list, resource, subresource, state);
+        }
+    } else {
+        crate::list::ensure_state(list, resource, state);
+    }
+}
+
 fn readable(list: &HostList, kind: ResourceType, view: &View) {
+    #[cfg(feature = "diagnostics")]
+    if crate::descriptor::host::tracing_views() {
+        tracing::info!(?kind, ?view, "shader binding snapshot: preparing view state");
+    }
     const UNORDERED_ACCESS: u32 = 0x8;
     let placed = crate::descriptor::host::placed_texture(view);
     let view = placed.as_ref().unwrap_or(view);
@@ -3233,7 +3324,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             } else {
                 SHADER_RESOURCE
             };
-            crate::list::ensure_state(list, *resource as This, state);
+            ensure_view_state(list, *resource as This, view, state);
             #[cfg(feature = "diagnostics")]
             if let Some(t) = crate::resource::host_resource(*resource as This) {
                 // SAFETY: a live resource.
@@ -3252,7 +3343,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View) {
             crate::capture::note_target(*resource as This);
             // Unordered access to a depth texture is its colour twin's.
             if !list.twin_use(*resource as This, true, true) {
-                crate::list::ensure_state(list, *resource as This, UNORDERED_ACCESS);
+                ensure_view_state(list, *resource as This, view, UNORDERED_ACCESS);
             }
         }
         _ => {}
