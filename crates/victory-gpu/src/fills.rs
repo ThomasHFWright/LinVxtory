@@ -87,7 +87,7 @@ fn run(fills: &[Fill], bytes: usize, threads: usize, copy: impl Fn(Fill) + Sync)
     };
     std::thread::scope(|scope| {
         for _ in 1..threads {
-            scope.spawn(&work);
+            scope.spawn(work);
         }
         work();
     });
