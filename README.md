@@ -1,14 +1,55 @@
 # LinVictory
 
-Linux/Proton development based on the latest rendering work in
-[fxceless/victory-fork](https://github.com/fxceless/victory-fork).
-Current rendering base: `0b0074e` (2026-11-25 12:43 UTC).
-The active branch is `linux-edge`; `linux-main` is an archived older experiment.
+LinVictory is a Linux/Proton development fork of
+[fxceless/victory-fork](https://github.com/fxceless/victory-fork), which builds on
+[VIctory](https://github.com/Marvisak/VIctory) by Marvisak and its contributors.
+Those projects provide the loader, runtime, graphics backend, shader translator
+and rendering work. Our contribution is Linux compatibility, targeted fixes and
+validation on Linux hardware.
 
-This branch adds Wine runtime shader compilation support and an opt-in title
-watchdog hook. **Linux gameplay is not yet verified.** The Windows results below
-are upstream's. See [Linux validation](docs/linux.md) for our setup and results.
-The executable stays `victory.exe`; original history, credits and license remain.
+## Our focus
+
+**Get normal world rendering and gameplay working on Linux under Wine/Proton.**
+Our initial test system is CachyOS with an NVIDIA RTX 5090. We focus on:
+
+- Bringing current upstream rendering improvements to Linux.
+- Fixing compiler, memory and GPU compatibility problems with focused regression tests.
+- Recording reproducible results, including crashes and remaining limitations.
+
+A loading screen, draw counter or debug-coloured scene does not count as working
+normal gameplay. Performance work comes after visible, functioning scenes.
+
+## Current Linux status
+
+**Linux gameplay is not yet verified.** The current build boots and reaches world
+loading, but our first run on this base hit an NVIDIA GPU memory fault before
+we verified scene geometry. See [Linux validation](docs/linux.md) for the tested
+runtime, passing checks and known failures.
+
+The active branch is `linux-edge`, initially based on fxceless/victory-fork
+[`0b0074e`](https://github.com/fxceless/victory-fork/commit/0b0074e0b2765e574c622e9a3de566f20f04135b)
+(2026-11-25 12:43 UTC). `linux-main` preserves an older baseline experiment.
+The executable remains `victory.exe`.
+
+## Attribution
+
+- **Marvisak and the VIctory contributors:** the original compatibility layer.
+- **fxceless and victory-fork contributors:** the current rendering base and
+  improvements. Their detailed credits and Windows findings are retained below.
+- **errusso:** the Wine/DXC fallback from
+  [victory-fork PR20](https://github.com/fxceless/victory-fork/pull/20).
+- **ruvenesh:** the opt-in title-watchdog hook from
+  [VIctory PR454](https://github.com/Marvisak/VIctory/pull/454).
+
+Original commit authorship and the **GPL-3.0-or-later** license are retained.
+Linux integration and local validation here are AI-assisted with OpenAI Codex.
+No game files, generated game data or runtime binaries are distributed here.
+
+## Upstream README — fxceless/victory-fork
+
+The material below is retained from the upstream rendering project. Its Windows
+results and first-person development notes describe **that project**, not verified
+LinVictory Linux behavior.
 
 ---
 
