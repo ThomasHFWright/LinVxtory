@@ -928,10 +928,9 @@ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
 
 /// Device method.
 pub(crate) extern "system" fn create_cbv(_: This, desc: *const [u32; 4], handle: u64) {
-    if let Some([lo, hi, size, _]) = words(desc) {
-        let address = u64::from(lo) | u64::from(hi) << 32;
-        record(handle, View::Constant(address, size));
-    }
+    let [lo, hi, size, _] = words(desc).unwrap_or([0; 4]);
+    let address = u64::from(lo) | u64::from(hi) << 32;
+    record(handle, View::Constant(address, size));
 }
 
 /// Device method.
@@ -1320,6 +1319,37 @@ mod tests {
         assert_eq!(view(s3), view(s1));
         assert_eq!(view(at(0) + 8), None);
         heap[0] = 0;
+    }
+
+    #[test]
+    fn null_cbv_description_overwrites_existing_views() {
+        let null = std::ptr::null();
+        let mut slot = [0u64; 4];
+        let at = slot.as_mut_ptr() as u64;
+
+        create_cbv(null, &[0x1000, 1, 256, 0], at);
+        assert_eq!(view(at), Some(View::Constant(0x1_0000_1000, 256)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
+
+        create_srv(null, null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Shader(0, None)));
+        create_cbv(null, std::ptr::null(), at);
+        assert_eq!(view(at), Some(View::Constant(0, 0)));
+    }
+
+    #[test]
+    fn cbv_descriptions_preserve_address_and_size() {
+        let mut slot = [0u64; 4];
+        let at = slot.as_mut_ptr() as u64;
+        for (desc, expected) in [
+            ([0x1000, 1, 256, 0], View::Constant(0x1_0000_1000, 256)),
+            ([0x1000, 1, 0, 0], View::Constant(0x1_0000_1000, 0)),
+            ([0, 0, 256, 0], View::Constant(0, 256)),
+        ] {
+            create_cbv(std::ptr::null(), &desc, at);
+            assert_eq!(view(at), Some(expected));
+        }
     }
 
     /// Constant buffer views are named whole in their records: any address
