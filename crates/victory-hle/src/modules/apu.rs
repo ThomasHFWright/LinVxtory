@@ -675,4 +675,59 @@ mod tests {
             assert_eq!(XApuDisconnect(handle), S_OK);
         }
     }
+
+    #[test]
+    fn short_stereo_output_preserves_capacity_tail_and_byte_canaries() {
+        let tone: Vec<f32> = (0..960 * 2)
+            .map(|i| ((i / 2) as f32 * 0.1).sin() * 0.25)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut packet = [0u8; 1500];
+        let n = encoder.encode(&tone, 960, &mut packet).unwrap();
+        for options in [0, DEINTERLEAVED_OUTPUT] {
+            for capacity in [0usize, 7, 13, 17 * 8 + 3] {
+                let written = capacity / 8 * 8;
+                let mut aligned = Vec::new();
+                for offset in [0usize, 1] {
+                    let mut decoder = OpusDecoder::new(48_000, 2).unwrap();
+                    // u32 storage guarantees that offset 1 is misaligned for f32.
+                    let mut storage = vec![0xa5a5_a5a5u32; (capacity + 17).div_ceil(4)];
+                    let output = storage.as_mut_ptr().cast::<u8>().wrapping_add(offset);
+                    let command = Process {
+                        id: id(PROCESS, 0),
+                        pitch_ramp: 0.0,
+                        target_pitch: 1.0,
+                        first_frame: 0,
+                        frame_count: 960,
+                        input_length: n as u32,
+                        input: packet.as_ptr(),
+                        output_length: capacity as u32,
+                        output,
+                    };
+                    // SAFETY: ApuResult contains only scalar fields and raw pointers.
+                    let mut result: ApuResult = unsafe { std::mem::zeroed() };
+                    process(&mut decoder, options, &command, &mut result);
+                    assert_eq!(
+                        (result.error, result.frames, result.output_length),
+                        (S_OK, (capacity / 8) as u32, written as u32)
+                    );
+                    // SAFETY: storage remains live; processing has ended.
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), storage.len() * 4)
+                    };
+                    assert!(
+                        bytes[..offset]
+                            .iter()
+                            .chain(&bytes[offset + written..])
+                            .all(|&b| b == 0xa5)
+                    );
+                    if offset == 0 {
+                        aligned = bytes[..written].to_vec();
+                    } else {
+                        assert_eq!(&bytes[offset..offset + written], aligned.as_slice());
+                    }
+                }
+            }
+        }
+    }
 }

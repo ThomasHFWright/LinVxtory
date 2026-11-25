@@ -1093,6 +1093,61 @@ mod tests {
         assert!(ring[0x200..].iter().all(|&b| b == 0x55));
     }
 
+    #[test]
+    fn xma_max_indices_wrap_in_three_blocks_and_zero_size_writes_nothing() {
+        let _serial = lock(&CONTEXT_TESTS);
+        let (mut output, mut output_apu) = (std::ptr::null_mut(), 0);
+        // Keep block 31 mapped too: a bad index must fail the logical-ring
+        // canary check, not disappear behind heap_bytes' allocation bound.
+        let bytes = 32 * BLOCK_BYTES;
+        assert_eq!(
+            ApuAlloc(&mut output, &mut output_apu, bytes as u32, 0x100, 2),
+            S_OK
+        );
+        for size in [0u32, 3] {
+            // SAFETY: the whole private allocation is writable.
+            unsafe { output.cast::<u8>().write_bytes(0x55, bytes) };
+            let mut words = [0u32; 16];
+            let context = Context(words.as_mut_ptr());
+            context.set(0, size << 22 | 31 << 27);
+            context.set(1, 1 << 31 | 3 << 27);
+            context.set(7, output_apu);
+            context.set(9, 31);
+            let mut voice = Voice {
+                decoder: None,
+                pcm: std::iter::repeat_n(0x1234, 8 * SAMPLES_PER_BLOCK).collect(),
+                skip: 0,
+                // Bound even a broken full-ring comparison: no more PCM
+                // can be decoded after these eight synthetic blocks.
+                ended: true,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            };
+            pump(context, &mut voice);
+            // SAFETY: the allocation remains live and the direct pump ended.
+            let data = unsafe { std::slice::from_raw_parts(output.cast::<u8>(), bytes) };
+            let written = size as usize * BLOCK_BYTES;
+            assert!(
+                data[written..].iter().all(|&b| b == 0x55),
+                "past the declared ring"
+            );
+            assert!(data[..written].chunks_exact(2).all(|b| b == [0x34, 0x12]));
+            assert_eq!(voice.pcm.len(), (8 - size as usize) * SAMPLES_PER_BLOCK);
+            assert_eq!(context.field(0, 27, 5), if size == 0 { 31 } else { 1 });
+            assert_eq!(context.field(1, 31, 1), u32::from(size == 0));
+        }
+        ApuFree(output);
+    }
+
     /// A write block past the end of the ring (6 on a ring of four) is block
     /// 2 of it: blocks 2, 3 and 0 are filled, up to the read block (1). It
     /// used to write block 6 first, past the ring's end.
@@ -1274,52 +1329,63 @@ mod tests {
 
         // Frames start at bits 32, 63 and 94 of each packet.
         let (first, second, third) = (32, 63, 94);
-        let (end_subframe, skip_subframes) = (1, 2);
-        let mut words = [0u32; 16];
-        let context = Context(words.as_mut_ptr());
-        // Two packets, one loop, input 0 valid; 48 kHz mono.
-        context.set(0, 2 | 1 << 12 | 1 << 20 | 4 << 22);
-        context.set(
-            1,
-            1 << 31 | 3 << 27 | end_subframe << 12 | skip_subframes << 17,
-        );
-        context.set(2, first);
-        context.set(3, first);
-        context.set(4, second);
-        context.set(5, input_apu);
-        let mut voice = Voice {
-            decoder: None,
-            pcm: VecDeque::new(),
-            skip: 0,
-            ended: false,
-            trace: Trace {
-                since: Instant::now(),
-                produced: 0,
-                taken: 0,
-                takes: 0,
-                partial_takes: 0,
-                frames: 0,
-                bad_frames: 0,
-                peak: 0,
-                ended_ms: None,
-            },
-        };
-        let mut step = |expect_next: u32| {
-            let before = voice.pcm.len();
-            assert!(decode(context, &mut voice));
-            assert_eq!(context.field(2, 0, 26), expect_next);
-            voice.pcm.len() - before
-        };
-        let subframe = xma::SUBFRAME_SAMPLES;
-        // Before the loop: the first frame whole.
-        assert_eq!(step(second), 4 * subframe);
-        // The loop's last frame: its first two subframes, then back.
-        assert_eq!(step(first), 2 * subframe, "the loop's last frame");
-        assert_eq!(context.field(0, 12, 8), 0, "one loop, taken");
-        // The loop's first frame again: without its first two subframes.
-        assert_eq!(step(second), 2 * subframe, "the loop's first frame");
-        // No loops left: both frames whole, and on to the third.
-        assert_eq!(step(third), 4 * subframe);
+        // Decode bookkeeping only: pump's empty-PCM block timing is separate.
+        for skip_subframes in [2u32, 6] {
+            let end_subframe = 1;
+            let mut words = [0u32; 16];
+            let context = Context(words.as_mut_ptr());
+            // Two packets, one loop, input 0 valid; 48 kHz mono.
+            context.set(0, 2 | 1 << 12 | 1 << 20 | 4 << 22);
+            context.set(
+                1,
+                1 << 31 | 3 << 27 | end_subframe << 12 | skip_subframes << 17,
+            );
+            context.set(2, first);
+            context.set(3, first);
+            context.set(4, second);
+            context.set(5, input_apu);
+            let mut voice = Voice {
+                decoder: None,
+                pcm: VecDeque::new(),
+                skip: 0,
+                ended: false,
+                trace: Trace {
+                    since: Instant::now(),
+                    produced: 0,
+                    taken: 0,
+                    takes: 0,
+                    partial_takes: 0,
+                    frames: 0,
+                    bad_frames: 0,
+                    peak: 0,
+                    ended_ms: None,
+                },
+            };
+            let mut step = |expect_next: u32| {
+                let before = voice.pcm.len();
+                assert!(decode(context, &mut voice));
+                assert_eq!(context.field(2, 0, 26), expect_next);
+                voice.pcm.len() - before
+            };
+            let subframe = xma::SUBFRAME_SAMPLES;
+            // Before the loop: the first frame whole.
+            assert_eq!(step(second), 4 * subframe);
+            // The loop's last frame: its first two subframes, then back.
+            assert_eq!(step(first), 2 * subframe, "the loop's last frame");
+            assert_eq!(context.field(0, 12, 8), 0, "one loop, taken");
+            // The loop's first frame again: without its first two subframes.
+            assert_eq!(
+                step(second),
+                4u32.saturating_sub(skip_subframes) as usize * subframe,
+                "the loop's first frame"
+            );
+            // No loops left: any remaining skip applies to the second frame.
+            assert_eq!(
+                step(third),
+                (4 - skip_subframes.saturating_sub(4)) as usize * subframe,
+                "a skip may span into the second frame"
+            );
+        }
         ApuFree(input);
     }
 

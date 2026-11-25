@@ -1510,6 +1510,55 @@ mod tests {
         assert_eq!(c.next, None);
     }
 
+    #[test]
+    fn frame_byte_gather_matches_scalar_bits_across_interleaving_and_truncation() {
+        for alignment in 0..8 {
+            for length in [1031usize, 1032] {
+                let start = PACKET_BITS - 32 + alignment;
+                let mut data = vec![0xee; 3 * PACKET_BYTES];
+                set_bits(
+                    &mut data,
+                    0,
+                    32,
+                    (1 << 26) | (((start - HEADER_BITS) as u32) << 11) | 1,
+                );
+                set_bits(&mut data, 2 * PACKET_BITS, 32, 0x7fff << 11);
+                let mut at = start;
+                for i in 0..length {
+                    if at.is_multiple_of(PACKET_BITS) {
+                        at += PACKET_BITS + HEADER_BITS; // skip the unrelated middle packet
+                    }
+                    let bit = if i < LENGTH_BITS as usize {
+                        ((length >> (LENGTH_BITS as usize - 1 - i)) & 1) as u32
+                    } else {
+                        ((i * 7 + i / 8 + 3) & 1) as u32
+                    };
+                    set_bits(&mut data, at, 1, bit);
+                    at += 1;
+                }
+                let mut scalar = Cursor {
+                    data: &data,
+                    pos: start,
+                };
+                let mut expected = vec![0u8; length.div_ceil(8)];
+                for i in 0..length {
+                    expected[i / 8] |= (scalar.bit().unwrap() as u8) << (7 - i % 8);
+                }
+                let frame = read_frame(&data, start).unwrap();
+                assert_eq!(frame.bits, length);
+                assert_eq!(
+                    frame.data, expected,
+                    "alignment {alignment}, length {length}"
+                );
+                assert_eq!(frame.next, None);
+                assert!(
+                    read_frame(&data[..at.div_ceil(8) - 1], start).is_none(),
+                    "missing final payload byte"
+                );
+            }
+        }
+    }
+
     /// Deterministic noise: xorshift64, as in BCPack's noise test.
     struct Noise(u64);
 
