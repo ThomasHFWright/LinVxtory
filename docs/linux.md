@@ -48,10 +48,14 @@ A follow-up fixes the range guard shortcut described in
 [issue 698](https://github.com/fxceless/victory-fork/issues/698#issuecomment-7159281878):
 a range bypasses memory queries only when every block is known. The regression
 fails with the old first-block check and passes with full coverage; all 13
-write-watch, alias and mapping tests pass. Its title-runtime effect is not yet
-verified.
+write-watch, alias and mapping tests pass. The follow-up title run reached the
+opening title card but hit another NVIDIA Xid 13/MMU fault at approximately
+115 seconds. The observer stopped it; normal scene geometry remains unverified.
+This fixes a reproduced range-check bug but does not resolve the GPU fault.
+The retry reused its own warmed cache, so elapsed times are not a controlled
+performance comparison.
 
- Use separate cache/data/prefix folders,
+Use separate cache/data/prefix folders,
 read-only input and an offline sandbox. Set native `d3d12,d3d12core,dxgi` DLL
 overrides and Windows paths for `VICTORY_DXC` / `VICTORY_DXIL`. The local baseline
 turns off `VK_NV_raw_access_chains` and opts into the title-watchdog hook with an
