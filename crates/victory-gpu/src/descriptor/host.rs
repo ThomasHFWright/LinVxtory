@@ -3867,8 +3867,8 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
             };
             let code = crate::host::compile(
                 &source,
-                windows::core::s!("main"),
-                windows::core::s!("cs_5_1"),
+                "main",
+                "cs_5_1",
             )
             .expect("the test's shader");
             let (from, filled) = host.shared_buffer(BYTES).expect("a buffer");
