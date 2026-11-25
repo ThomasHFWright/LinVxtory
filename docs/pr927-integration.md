@@ -1,9 +1,7 @@
-# Local PR927 integration candidate
+# PR927 half-data integration
 
-Prepared 2026-11-25 on `local/half-view-integration`, based exactly on
-`984fc7c7f0af2ab186ed266fc272d381e56e55e6`. This isolated candidate is for review
-after performance work. It has **not been built, tested, run or published**.
-The active checkout, shared status and runtime were not edited.
+Integrated on `linux-edge` on 2026-11-25. This record covers provenance,
+binding changes, synthetic validation and known limits.
 
 ## Provenance
 
@@ -17,15 +15,14 @@ Their commit messages describe upstream findings, not local validation.
 
 | Upstream commit | Local port |
 |---|---|
-| `5dc9e63f04cac3e508d8a5e9cb6edd72a23ca175` | `c493d6569984a4e0b329b50ad2a6c1db388f272a` |
-| `befaf3b5aa91966d2569985eeba808d4d8017026` | `3de5f26edbbe029bcbf3e046cd9e2108ebee8bc0` |
-| `b6bf65167f4407684bccfe201b30d084102d8862` | `fd7ddb94e7484f41e92064bcec0b199f3ffe72a9` |
-| `b9c378134968f93739a9f5864052f293ed67bf4c` | `3bd82ed02e5c5b291eb2d292847d4163e5b05da5` |
+| `5dc9e63f04cac3e508d8a5e9cb6edd72a23ca175` | `97d729bbce07eb227a677a56b65ea539f9575bef` |
+| `befaf3b5aa91966d2569985eeba808d4d8017026` | `eb4a6a3b65ebb8c5acddebff153f75ed005ce9a7` |
+| `b6bf65167f4407684bccfe201b30d084102d8862` | `fb7c55904947e6ccef4b13df3a0220a513db2a9d` |
+| `b9c378134968f93739a9f5864052f293ed67bf4c` | `49d3cad92aa1e3bb7b590d70470ee0e2a089d086` |
 
 Local conflict resolution, helper extraction, additional regressions and this
 record are AI-assisted integration work with OpenAI Codex. Upstream PR24's CBV
-size clamp is already in the base; it was not duplicated. No other rendering
-or performance PR was imported.
+size clamp is already in the base; it was not duplicated. Other Linux changes are documented separately in [linux.md](linux.md).
 
 ## Changes and retained behavior
 
@@ -107,29 +104,29 @@ interior-slot trigger would fail the fresh-table assertion by inspection; that
 negative control has not been executed. Both fixture variants now require a
 D3D12 host instead of silently returning when none exists.
 
-## Main-owned validation gates
+## Linux validation
 
-All gates are pending. Run from this isolated checkout with a separate target
-directory and offline dependency resolution when authorized:
+Validated on CachyOS / RTX 5090 / GE-Proton 11-14 with the runtime fixes described
+in [linux-runtime.md](linux-runtime.md):
 
-1. Native GPU crate `fresh_table::tests` plus native shader regressions. Inspect
-   test counts rather than accepting a zero-test filtered run.
-2. Windows compilation/all-target diagnostics checks and policy. Run shader and
-   GPU suites, retaining the base's known-failure accounting.
-3. Targeted `entries_round_trip_and_reject_damage`,
-   `half_places_are_the_descriptors_the_program_loads`,
-   `a_fresh_table_holds_the_half_views_past_its_range_starts`,
-   `an_interior_uint_half_view_is_prepared_without_a_cbv`,
-   `a_format_load_read_as_halves_loads_the_integer`, unsigned-view mapping and
-   exhaustive half-pattern readbacks. Keep null-CBV, copied-descriptor,
-   cross-page and mixed-mip state regressions in the integration check.
-4. Hardware binder check alternating normal/half shaders on identical tables,
-   including residency change and resource/counter retention. Then a matched
-   visual/performance comparison only after the performance baseline is ready.
+- Native shader suite: 179 passed, 2 ignored.
+- Windows shader suite: 228 passed, 1 pre-existing stub-pipeline failure, 3 ignored.
+- GPU suite: 211 passed, the same 4 pre-existing failures, 8 ignored (including
+  the manual guarded-copy benchmark).
+- Exhaustive unsigned-view readback: all 65,536 half bit patterns preserved;
+  the float-conversion control preserved one.
+- Fixed-slot/span, interior UINT preparation, cache serialization, alternating
+  half-view/residency keys, null-CBV and subresource regressions passed.
+
+The upstream readback test's compiler arguments were adapted to this fork's
+portable compiler interface. The alternating cache-key check is synthetic; it
+is not an exhaustive concurrent descriptor/residency test. The separate
+negative mutations described above were not executed. See [Linux results](linux.md)
+for title-run observations and remaining limitations.
 
 This port retains upstream limits: dynamically selected descriptors and
 non-table accesses do not gain the fixed-slot half path; unsupported normalized
 or wider conversion formats remain inexact. Descriptor snapshotting and
 residency upload are still not atomic. The cache still uses a 64-bit contents
-hash. No new claim of Linux correctness, facial improvement, stability or
-performance follows from this unexecuted integration.
+hash. Passing these regressions establishes the tested data and binding behavior,
+not complete facial rendering, stability or gameplay performance.

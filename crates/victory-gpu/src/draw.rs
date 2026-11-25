@@ -2564,10 +2564,10 @@ impl State {
                 .iter()
                 .filter(tables)
                 .any(|u| u.slot == slot && u.table_offset_dwords == at);
-            if interior || crate::descriptor::host::half_view(&view).is_some() {
-                if !fresh.contains(&slot) {
-                    fresh.push(slot);
-                }
+            if (interior || crate::descriptor::host::half_view(&view).is_some())
+                && !fresh.contains(&slot)
+            {
+                fresh.push(slot);
             }
             if let Some(format) = crate::descriptor::host::half_inexact(&view) {
                 once!(
