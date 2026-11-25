@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_COMMITMENT_LIMIT, HANDLE, INVALID_HANDLE_VALUE,
+    CloseHandle, ERROR_COMMITMENT_LIMIT, GetLastError, HANDLE, INVALID_HANDLE_VALUE, SetLastError,
 };
 use windows_sys::Win32::System::Memory::{
     CreateFileMappingW, MEM_ADDRESS_REQUIREMENTS, MEM_COMMIT, MEM_EXTENDED_PARAMETER,
@@ -91,6 +91,7 @@ pub extern "system" fn XMemVirtualAlloc(
     flags: u64,
     protect: u32,
 ) -> *mut c_void {
+    let (requested_kind, requested_protect) = (kind, protect);
     let (lowest, highest) = address_range(flags);
     let mut requirements = MEM_ADDRESS_REQUIREMENTS {
         LowestStartingAddress: lowest as *mut c_void,
@@ -153,6 +154,32 @@ pub extern "system" fn XMemVirtualAlloc(
             constrained.into(),
         )
     };
+    if at.is_null() {
+        // Capture the native error before tracing can change this thread's
+        // last error; restore it even when the sparse warning is suppressed.
+        report_allocation_failure(|error| {
+            static FAILED: AtomicUsize = AtomicUsize::new(0);
+            let failure = FAILED.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+            if failure <= 8 || failure.is_power_of_two() {
+                tracing::warn!(
+                    failure,
+                    error,
+                    size,
+                    requested_kind = format_args!("{requested_kind:#x}"),
+                    host_kind = format_args!("{kind:#x}"),
+                    flags = format_args!("{flags:#x}"),
+                    requested_protect = format_args!("{requested_protect:#x}"),
+                    host_protect = format_args!("{protect:#x}"),
+                    fixed_base = !constrained,
+                    lowest = ?constrained.then_some(lowest),
+                    highest = ?constrained.then_some(highest),
+                    alignment = ?constrained.then_some(requirements.Alignment),
+                    "XMemVirtualAlloc: VirtualAlloc2 failed"
+                );
+            }
+        });
+        return at;
+    }
     if base.is_null() {
         tracing::debug!(
             size,
@@ -163,6 +190,13 @@ pub extern "system" fn XMemVirtualAlloc(
         );
     }
     at
+}
+
+fn report_allocation_failure(report: impl FnOnce(u32)) {
+    // SAFETY: reads and restores only the current thread's Win32 error.
+    let error = unsafe { GetLastError() };
+    report(error);
+    unsafe { SetLastError(error) };
 }
 
 /// `MEMORY_BASIC_INFORMATION` (the console's first 0x30 bytes are the
@@ -1033,6 +1067,36 @@ pub(crate) fn module() -> HleModule {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn virtual_alloc_failure_preserves_native_error_through_diagnostics() {
+        // A conflicting reservation fails without needing memory pressure.
+        // SAFETY: a private reservation, never dereferenced by this test.
+        let base = unsafe { VirtualAlloc(std::ptr::null(), 64 << 10, MEM_RESERVE, PAGE_NOACCESS) };
+        assert!(!base.is_null());
+        // SAFETY: the OS rejects reserving the already-reserved address.
+        let failed = unsafe {
+            VirtualAlloc2(GetCurrentProcess(), base, 64 << 10, MEM_RESERVE, PAGE_NOACCESS, std::ptr::null_mut(), 0)
+        };
+        let native_error = unsafe { GetLastError() };
+        assert!(failed.is_null());
+        assert_ne!(native_error, 0);
+        // Model a diagnostic sink that overwrites last error, not a no-op
+        // logger that would let a missing restore pass unnoticed.
+        unsafe { SetLastError(native_error) };
+        report_allocation_failure(|reported| {
+            assert_eq!(reported, native_error);
+            unsafe { SetLastError(0) };
+        });
+        assert_eq!(unsafe { GetLastError() }, native_error);
+        unsafe { SetLastError(0) };
+        let failed = XMemVirtualAlloc(base, 64 << 10, MEM_RESERVE, GRAPHICS, PAGE_NOACCESS);
+        let returned_error = unsafe { GetLastError() };
+        // SAFETY: release the reservation after the error has been captured.
+        assert_ne!(unsafe { VirtualFree(base, 0, MEM_RELEASE) }, 0);
+        assert!(failed.is_null());
+        assert_eq!(returned_error, native_error);
+    }
 
     fn query(address: *const c_void) -> BasicInformation {
         // SAFETY: plain data; zero is a valid value.
