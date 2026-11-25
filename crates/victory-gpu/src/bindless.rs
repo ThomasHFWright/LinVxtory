@@ -186,6 +186,30 @@ fn left_kind(view: &View) -> (usize, u64, u64) {
     }
 }
 
+/// Visits each texture once during upfront upload preparation. Heap identity is
+/// its Arc allocation, kept alive by `heaps`; distinct heaps may share textures.
+/// Each heap is sampled under its existing lock, held through `visit` as before.
+/// The sets are local: a later upload pass must see changed descriptors again.
+/// This must not deduplicate the ordered buffer refreshes in `Step::Heap`.
+fn visit_upload_textures(heaps: &[Arc<Viewed>], mut visit: impl FnMut(usize)) -> (usize, usize) {
+    let mut seen_heaps = std::collections::HashSet::new();
+    let mut seen_textures = std::collections::HashSet::new();
+    let mut entries = 0;
+    for viewed in heaps {
+        if !seen_heaps.insert(Arc::as_ptr(viewed)) {
+            continue;
+        }
+        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
+        entries += inner.textures.len();
+        for &resource in inner.textures.keys() {
+            if seen_textures.insert(resource) {
+                visit(resource);
+            }
+        }
+    }
+    (seen_heaps.len(), entries)
+}
+
 /// At submission, before anything else of it: the textures the heaps of its
 /// heap-indexing lists view, and `textures` (staging and host texture of
 /// those its lists read through tables, `crate::texture::upload`), are
@@ -231,38 +255,35 @@ pub(crate) fn uploads(
             work.push((staging.clone(), copy.clone()));
         }
     }
-    let mut done = std::collections::HashSet::new();
-    for viewed in heaps {
-        let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
-        for &r in inner.textures.keys() {
-            if !done.insert(r) {
-                continue;
-            }
-            // Not made (given up, or never read): nothing to bring up.
-            let Some(texture) = crate::resource::made_copy(r as This) else {
-                continue;
-            };
-            // Only what shaders read lately (the eviction pass's stamps):
-            // the heaps view thousands of textures a frame never reads, and
-            // bringing each up whenever its pages change re-uploaded about
-            // 4 GB in 30-46 world frames (runs evict2, noevict1).
-            // shortcut: a texture read again after a gap is brought up after
-            // the submission that read it, which can see bytes one refresh
-            // old (a slot the title rewrites is made fresh anyway); upload on
-            // the mark itself if that shows.
-            if !texture.used_recently() {
-                continue;
-            }
-            // Its contents are the host's since a host copy wrote it.
-            if texture.host_written.load(Relaxed) {
-                continue;
-            }
-            if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
-                && staged.insert(Arc::as_ptr(&staging))
-            {
-                work.push((staging, texture));
-            }
+    let (_walks, _entries) = visit_upload_textures(heaps, |r| {
+        // Not made (given up, or never read): nothing to bring up.
+        let Some(texture) = crate::resource::made_copy(r as This) else {
+            return;
+        };
+        // Only what shaders read lately (the eviction pass's stamps):
+        // the heaps view thousands of textures a frame never reads, and
+        // bringing each up whenever its pages change re-uploaded about
+        // 4 GB in 30-46 world frames (runs evict2, noevict1).
+        // shortcut: a texture read again after a gap is brought up after
+        // the submission that read it, which can see bytes one refresh
+        // old (a slot the title rewrites is made fresh anyway); upload on
+        // the mark itself if that shows.
+        if !texture.used_recently() {
+            return;
         }
+        // Its contents are the host's since a host copy wrote it.
+        if texture.host_written.load(Relaxed) {
+            return;
+        }
+        if let Some(staging) = crate::texture::staging(r as This, &texture.texture)
+            && staged.insert(Arc::as_ptr(&staging))
+        {
+            work.push((staging, texture));
+        }
+    });
+    #[cfg(feature = "diagnostics")]
+    for (counter, count) in UPLOAD_WALKS.iter().zip([heaps.len(), _walks, _entries]) {
+        counter.fetch_add(count as u64, Relaxed);
     }
     let mut recorded = false;
     // The textures copied into stay alive in `work` until recorded.
@@ -327,6 +348,9 @@ pub(crate) fn refresh(viewed: &Viewed, mut add: impl FnMut(&Arc<Shadow>, usize, 
 static HEAP_DRAWS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 #[cfg(feature = "diagnostics")]
 static UPLOADED: AtomicU64 = AtomicU64::new(0);
+// Requested heaps, unique heaps scanned, and texture entries visited.
+#[cfg(feature = "diagnostics")]
+static UPLOAD_WALKS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// A draw or dispatch runs a shader that indexes the heap (and writes
 /// through it).
@@ -364,6 +388,12 @@ pub(crate) fn forget(resource: usize) {
 pub(crate) fn log(frames: f64) {
     let [draws, writes] = [0, 1].map(|i| HEAP_DRAWS[i].swap(0, Relaxed) as f64 / frames);
     let uploaded = UPLOADED.swap(0, Relaxed) as f64 / frames;
+    let [requested, scanned, entries] =
+        [0, 1, 2].map(|i| UPLOAD_WALKS[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!(
+        "upfront texture heap walks per frame: {requested:.1} requested, \
+         {scanned:.1} scanned, {entries:.0} texture entries visited"
+    );
     let heaps = HEAPS.lock().unwrap_or_else(|e| e.into_inner()).clone();
     for viewed in heaps.iter().filter_map(std::sync::Weak::upgrade) {
         let inner = viewed.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -423,6 +453,36 @@ mod tests {
     use super::*;
     use crate::object::{HRESULT, S_OK};
     use windows::Win32::Graphics::Direct3D12::*;
+
+    #[test]
+    fn upfront_texture_walk_deduplicates_heaps_without_skipping_distinct_ones() {
+        let first = Arc::new(Viewed::default());
+        let second = Arc::new(Viewed::default());
+        // Texture identities only: this traversal does not need host resources.
+        first.inner.lock().unwrap().textures.extend([(11, 2), (22, 1)]);
+        second.inner.lock().unwrap().textures.extend([(22, 1), (33, 1)]);
+        let heaps = [first.clone(), first.clone(), second.clone(), first.clone(), second.clone()];
+        let mut visited = Vec::new();
+        assert_eq!(visit_upload_textures(&heaps, |r| visited.push(r)), (2, 4));
+        visited.sort_unstable();
+        assert_eq!(visited, [11, 22, 33], "distinct heaps survive; shared textures visited once");
+
+        // Descriptors changed since the previous submission: no persistent seen set.
+        first.inner.lock().unwrap().textures.insert(44, 1);
+        visited.clear();
+        assert_eq!(visit_upload_textures(&heaps, |r| visited.push(r)), (2, 5));
+        visited.sort_unstable();
+        assert_eq!(visited, [11, 22, 33, 44]);
+
+        // Identical contents still belong to distinct heap objects. Every heap
+        // must be sampled even when resource dedup leaves no new texture to visit.
+        second.inner.lock().unwrap().textures = first.inner.lock().unwrap().textures.clone();
+        visited.clear();
+        assert_eq!(visit_upload_textures(&heaps, |r| visited.push(r)), (2, 6));
+        visited.sort_unstable();
+        assert_eq!(visited, [11, 22, 44]);
+        assert_eq!(visit_upload_textures(&[], |_| panic!("no heap")), (0, 0));
+    }
 
     /// Reads slots 0 (raw buffer) and 2 (texture) of the heap and writes
     /// slot 1 (raw unordered buffer): through a table over the heap's
