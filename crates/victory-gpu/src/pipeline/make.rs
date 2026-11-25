@@ -11,6 +11,8 @@
 //! frame, so the cheap ones (menus, one-off passes such as a colour-grading
 //! bake) are there at once as before; past the budget a draw or dispatch
 //! whose pipeline is not ready is dropped, as an untranslated one is.
+//! Pipelines a draw waits for go ahead of those started early (at the
+//! title's creation, because an earlier run drew them).
 //!
 //! The default budget is half a second per title frame. A pass the title
 //! runs only once and whose pipeline takes longer is lost.
@@ -31,7 +33,7 @@ pub(crate) struct Pending {
     made: OnceLock<Option<HostPipeline>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw or dispatch has requested it yet.
-    key: String,
+    pub(crate) key: String,
     used: AtomicBool,
 }
 
@@ -43,29 +45,54 @@ unsafe impl Sync for Pending {}
 
 impl Pending {
     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
-        let mut key = blake3::Hasher::new();
-        for s in &shaders {
-            key.update(s.stage.as_bytes());
-            key.update(s.hash.as_bytes());
-        }
-        key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+        let key = key(&shaders, graphics.as_deref());
+        #[cfg(feature = "diagnostics")]
+        log("created", &key, || {
+            let state = graphics.as_ref().map(|g| g.describe()).unwrap_or_default();
+            format!("{shaders:?}\t{state}")
+        });
         Pending {
+            key,
             shaders,
             graphics,
             queue_state: AtomicU8::new(NOT_QUEUED),
             made: OnceLock::new(),
-            key: key.finalize().to_hex()[..32].to_owned(),
             used: AtomicBool::new(false),
         }
     }
 
     fn make(&self) {
-        self.made
-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+        self.made.get_or_init(|| {
+            let (started, cpu) = (Instant::now(), super::thread_cpu());
+            let made = HostPipeline::new(&self.shaders, self.graphics.as_deref());
+            #[cfg(feature = "diagnostics")]
+            log_built(&self.key);
+            let (user, kernel) = super::thread_cpu_since(cpu);
+            tracing::debug!(
+                shaders = ?self.shaders,
+                ms = started.elapsed().as_millis() as u64,
+                user_ms = user,
+                kernel_ms = kernel,
+                "pipeline made"
+            );
+            made
+        });
         let (lock, done) = &DONE;
         let _held = lock.lock().unwrap_or_else(|e| e.into_inner());
         done.notify_all();
     }
+}
+
+/// What identifies a title pipeline across runs: its shader containers
+/// and graphics state.
+pub(crate) fn key(shaders: &[Arc<Shader>], graphics: Option<&GraphicsState>) -> String {
+    let mut key = blake3::Hasher::new();
+    for s in shaders {
+        key.update(s.stage.as_bytes());
+        key.update(s.hash.as_bytes());
+    }
+    key.update(graphics.map(|g| g.describe()).unwrap_or_default().as_bytes());
+    key.finalize().to_hex()[..32].to_owned()
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
@@ -88,6 +115,39 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 failed.join(" + ")
             })
         }
+    }
+}
+
+/// Logs the library name of the host pipeline this thread just made or
+/// loaded for `key` (diagnostics).
+#[cfg(feature = "diagnostics")]
+pub(crate) fn log_built(key: &str) {
+    if let Some((name, loaded)) = super::library::LAST.take() {
+        log("built", key, || format!("{name}\t{}", if loaded { "loaded" } else { "made" }));
+    }
+}
+
+/// `VICTORY_PIPELINE_LOG=<file>` (diagnostics): a line per title pipeline
+/// key created (`created`, its shaders, its state as described) and first
+/// drawn or dispatched with (`used`), and its host pipeline's library name
+/// once made or loaded (`built`, also from the pre-build), to compare what
+/// a run creates with what the pre-build makes.
+#[cfg(feature = "diagnostics")]
+fn log(what: &str, key: &str, rest: impl FnOnce() -> String) {
+    use std::collections::HashSet;
+    use std::io::Write;
+    static LOG: Mutex<Option<(std::fs::File, HashSet<String>)>> = Mutex::new(None);
+    static PATH: OnceLock<Option<std::ffi::OsString>> = OnceLock::new();
+    let Some(path) = PATH.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOG")) else {
+        return;
+    };
+    let mut log = LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if log.is_none() {
+        *log = std::fs::File::create(path).ok().map(|f| (f, HashSet::new()));
+    }
+    let Some((file, seen)) = log.as_mut() else { return };
+    if seen.insert(format!("{what} {key}")) {
+        let _ = writeln!(file, "{what}\t{key}\t{}", rest());
     }
 }
 
@@ -122,6 +182,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
     // on the next launch, even if this run never got to use it.
     if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
+        #[cfg(feature = "diagnostics")]
+        log("used", &p.key, String::new);
     }
     if p.made.get().is_none() {
         start(p, REQUESTED);
@@ -131,7 +193,8 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 }
 
 /// Makes `p` on this thread if it is not made yet (waiting for a worker
-/// that is making it); whether it has a host pipeline.
+/// that is making it); whether it has a host pipeline. The builder's
+/// all-or-none gate must bypass the ordinary per-frame wait budget.
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
@@ -140,6 +203,7 @@ pub(crate) fn now(p: &Arc<Pending>) -> bool {
 /// At the title's creation of a pipeline: starts it at once if an earlier
 /// run drew with it (during loading, so the world's first frames find it).
 pub(crate) fn early(p: &Arc<Pending>) {
+    super::library::note_created(&p.key);
     if !p.shaders.is_empty() && super::library::wanted_early(&p.key) {
         super::library::EARLY.fetch_add(1, Ordering::Relaxed);
         start(p, EARLY);
@@ -289,7 +353,13 @@ fn next() -> Arc<Pending> {
         if let Some(p) = queue.pop() {
             return p;
         }
-        queue = AVAILABLE.wait(queue).unwrap_or_else(|e| e.into_inner());
+        let (held, waited) = AVAILABLE.wait_timeout(queue, Duration::from_secs(20)).unwrap_or_else(|e| e.into_inner());
+        queue = held;
+        if waited.timed_out() {
+            drop(queue);
+            super::library::save(false);
+            queue = QUEUE.lock().unwrap_or_else(|e| e.into_inner());
+        }
     }
 }
 

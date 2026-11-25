@@ -23,10 +23,13 @@
 
 #[cfg(windows)]
 mod console_insn;
+#[cfg(windows)]
 mod crash;
 #[cfg(windows)]
 mod hooks;
 pub mod prepare;
+#[cfg(any(windows, test))]
+pub(crate) mod publish;
 pub mod resolve;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod stacks;

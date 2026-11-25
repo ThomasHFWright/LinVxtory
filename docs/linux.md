@@ -1,5 +1,9 @@
 # Linux validation
 
+The runtime results below describe preserved builds before the current
+[Marvisak upstream integration](upstream-integration.md). They do not validate
+the merged renderer or its performance.
+
 LinVictory follows current fxceless/victory-fork rendering work, pinned initially
 to `0b0074e0b2765e574c622e9a3de566f20f04135b`. Older debug-rendering experiments
 are archived; they are not the active source base.

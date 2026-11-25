@@ -173,7 +173,8 @@ fn write(bytes: &mut [u8], at: usize, v: &[u8]) -> Result<(), PrepareError> {
     Ok(())
 }
 
-#[cfg(test)]
+// These fixtures prepare the current executable, which must be PE, not ELF.
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
 

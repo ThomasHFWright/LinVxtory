@@ -17,7 +17,9 @@ pub(crate) fn folder() -> Option<&'static PathBuf> {
 }
 
 /// Frames listed in `VICTORY_CAPTURE_FRAMES` (comma-separated): saved
-/// too, and their draws traced at debug level.
+/// too, and their draws traced at debug level. `VICTORY_CAPTURE_WORLD`
+/// lists frames counted from the first one that ran 500 draws (the world's
+/// first, whose number depends on how fast the title loaded).
 pub(crate) fn listed(n: u64) -> bool {
     static LIST: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let named = LIST
@@ -40,7 +42,9 @@ pub(crate) fn listed(n: u64) -> bool {
     // the reflections hold values: none of the four above has them).
     static ALSO: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
     let also = ALSO.get_or_init(|| {
-        let list = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
+        let explicit = std::env::var("VICTORY_CAPTURE_WORLD").unwrap_or_default();
+        let also = std::env::var("VICTORY_CAPTURE_WORLD_ALSO").unwrap_or_default();
+        let list = format!("{explicit},{also}");
         list.split(',')
             .filter_map(|f| f.trim().parse().ok())
             .collect()
@@ -140,7 +144,8 @@ fn world_every() -> u64 {
 static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 
 /// At the present of `frame`: the draws run on the host so far.
-pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+pub(crate) fn presented(frame: u64) {
+    let drawn = crate::draw::drawn();
     use std::sync::atomic::Ordering::Relaxed;
     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let before = LAST.swap(drawn, Relaxed);
@@ -206,7 +211,7 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: 
     chunk(&mut png, b"IDAT", idat);
     chunk(&mut png, b"IEND", &[]);
     let path = folder.join(format!("{name}.png"));
-    match std::fs::write(&path, png) {
+    match std::fs::create_dir_all(folder).and_then(|()| std::fs::write(&path, png)) {
         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
     }
@@ -352,41 +357,285 @@ pub(crate) fn save_read_back(
 /// structure: floats scaled by their largest value, depth by its range).
 /// The host copies are held: the title may release a target before the
 /// frame is presented.
-static TARGETS: std::sync::Mutex<Vec<(usize, std::sync::Arc<crate::resource::HostTexture>)>> =
-    std::sync::Mutex::new(Vec::new());
+/// Each with the first pipeline that wrote it as an unordered-access view
+/// (`-by-<pipeline>` in the name; `-black` when its colour is all zeros).
+/// `VICTORY_DUMP_WRITERS` (shader hashes) adds, in any frame, the textures
+/// a pipeline with one of them writes, the first frame it runs.
+#[allow(clippy::type_complexity)]
+static TARGETS: std::sync::Mutex<
+    Vec<(usize, std::sync::Arc<crate::resource::HostTexture>, String)>,
+> = std::sync::Mutex::new(Vec::new());
 
-fn dump_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| folder().is_some() && std::env::var_os("VICTORY_DUMP_TARGETS").is_some())
+thread_local! {
+    /// The pipeline whose draw or dispatch this thread is binding.
+    static WRITER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
 }
 
-/// Notes a title texture the frame being built renders to or writes.
-pub(crate) fn note_target(resource: crate::object::This) {
-    if resource.is_null() || !dump_on() || !listed(crate::queue::presented() + 1) {
+/// Names the pipeline whose views this thread binds next (empty: none).
+pub(crate) fn binding(pipeline: &str) {
+    if dump_on() {
+        WRITER.with(|w| pipeline.clone_into(&mut w.borrow_mut()));
+    }
+}
+
+pub(crate) fn dump_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| folder().is_some() && crate::switch::on("VICTORY_DUMP_TARGETS"))
+}
+
+/// `VICTORY_DUMP_WRITERS`' hashes not dumped yet.
+static WRITERS: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
+
+/// Buffers such a pipeline writes: title memory, its bytes when first
+/// bound in the frame, the pipeline. Logged at the present: dwords changed
+/// and dwords not zero.
+#[allow(clippy::type_complexity)]
+static BUFFERS: std::sync::Mutex<Vec<(usize, Vec<u8>, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// Notes a title texture the frame being built renders to or writes (by a
+/// command of `list`, whose submission dumps it again when the frame is
+/// listed).
+pub(crate) fn note_target(list: &crate::host::HostList, resource: crate::object::This) {
+    if resource.is_null() || !dump_on() {
         return;
     }
+    let by = WRITER.with(|w| w.borrow().clone());
+    // Lists are recorded ahead of the frame that submits them.
+    list.note_target(resource as usize, &by);
+    if !listed(crate::queue::presented() + 1) {
+        let mut writers = WRITERS.lock().unwrap_or_else(|e| e.into_inner());
+        let writers = writers.get_or_insert_with(|| {
+            let list = std::env::var("VICTORY_DUMP_WRITERS").unwrap_or_default();
+            list.split(',').map(|h| h.trim().to_owned()).filter(|h| !h.is_empty()).collect()
+        });
+        if by.is_empty() || !writers.iter().any(|h| by.contains(h.as_str())) {
+            return;
+        }
+        if let Some((at, len)) = crate::resource::buffer_bytes(resource) {
+            let mut buffers = BUFFERS.lock().unwrap_or_else(|e| e.into_inner());
+            if !buffers.iter().any(|b| b.0 == at as usize) {
+                let mut before = vec![0u8; (len as usize).min(64 << 20) & !3];
+                if crate::host::read_into(at, &mut before) {
+                    buffers.push((at as usize, before, by));
+                }
+            }
+            return;
+        }
+    }
     let mut targets = TARGETS.lock().unwrap_or_else(|e| e.into_inner());
-    if !targets.iter().any(|&(r, _)| r == resource as usize)
+    if !targets.iter().any(|(r, _, _)| *r == resource as usize)
         && let Some(copy) = crate::resource::host_copy(resource)
     {
-        targets.push((resource as usize, copy));
+        targets.push((resource as usize, copy, by));
     }
+}
+
+/// Whether textures wait to be dumped at this present.
+pub(crate) fn has_targets() -> bool {
+    !TARGETS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
+        || !BUFFERS.lock().unwrap_or_else(|e| e.into_inner()).is_empty()
 }
 
 /// At the present of frame `frame`: saves the noted targets.
 pub(crate) fn dump_targets(frame: u64) {
     let targets = std::mem::take(&mut *TARGETS.lock().unwrap_or_else(|e| e.into_inner()));
+    let buffers = std::mem::take(&mut *BUFFERS.lock().unwrap_or_else(|e| e.into_inner()));
+    // Writers dumped once.
+    if let Some(writers) = WRITERS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        writers.retain(|h| {
+            !targets.iter().any(|t| t.2.contains(h.as_str()))
+                && !buffers.iter().any(|b| b.2.contains(h.as_str()))
+        });
+    }
+    for (at, before, by) in &buffers {
+        let mut after = vec![0u8; before.len()];
+        if !crate::host::read_into(*at as *const u8, &mut after) {
+            continue;
+        }
+        let dwords = |b: &[u8]| -> Vec<u32> {
+            b.chunks(4).map(|c| u32::from_le_bytes(c.try_into().unwrap_or_default())).collect()
+        };
+        let (old, new) = (dwords(before), dwords(&after));
+        let changed = old.iter().zip(&new).filter(|(a, b)| a != b).count();
+        let set = new.iter().filter(|&&x| x != 0).count();
+        tracing::info!(
+            frame,
+            buffer = format_args!("{at:#x}"),
+            dwords = new.len(),
+            changed,
+            set,
+            by = by.as_str(),
+            "a buffer the named pipeline writes, at the present"
+        );
+    }
     let Some(host) = crate::host::host() else { return };
-    for (i, (resource, copy)) in targets.iter().enumerate() {
+    for (i, (resource, copy, by)) in targets.iter().enumerate() {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
         let states = copy.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        dump_one(host, texture, &states, frame, i, *resource as crate::object::This, &d);
+        let target = (i, *resource as crate::object::This, by.as_str());
+        dump_one(host, texture, &states, &format!("frame-{frame}"), target, &d);
+    }
+}
+
+/// After submission `sub` of a listed frame has run: the textures its lists
+/// rendered to or wrote, as `frame-<n>-s<sub>-<i>-...` (what each holds
+/// then, to follow a frame pass by pass).
+pub(crate) fn dump_submission(sub: u64, targets: &[(usize, String)]) {
+    let Some(host) = crate::host::host() else { return };
+    let frame = crate::queue::presented() + 1;
+    peek(&format!("frame-{frame}-s{sub:04}"));
+    for (i, (resource, by)) in targets.iter().enumerate() {
+        let Some(copy) = crate::resource::host_copy(*resource as crate::object::This) else {
+            continue;
+        };
+        let texture = &copy.texture;
+        // SAFETY: a live resource.
+        let d = unsafe { texture.GetDesc() };
+        if d.SampleDesc.Count > 1 || d.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER {
+            continue;
+        }
+        let states = copy.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let target = (i, *resource as crate::object::This, by.as_str());
+        dump_one(host, texture, &states, &format!("frame-{frame}-s{sub:04}"), target, &d);
+        // A depth texture's writable twin (`crate::twin`): what unordered
+        // views wrote, which reaches the depth texture at its next use.
+        for (p, plane) in copy.twin.get().and_then(Option::as_ref).iter().flat_map(|t| t.planes.iter().enumerate()) {
+            // SAFETY: a live resource.
+            let pd = unsafe { plane.texture.GetDesc() };
+            let by = format!("{by}-twin{p}");
+            let target = (i, *resource as crate::object::This, by.as_str());
+            let states = plane.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            dump_one(host, &plane.texture, &states, &format!("frame-{frame}-s{sub:04}"), target, &pd);
+        }
+    }
+}
+
+/// `VICTORY_PEEK=<address>[:<bytes>],...` (hex addresses, 16 bytes by
+/// default): those bytes of title memory, as dwords and floats, after each
+/// submission of a listed frame.
+fn peek(when: &str) {
+    static LIST: std::sync::OnceLock<Vec<(u64, usize)>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_PEEK")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|e| {
+                let (a, n) = e.split_once(':').unwrap_or((e, "16"));
+                let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
+                Some((a, n.trim().parse().ok()?))
+            })
+            .collect()
+    });
+    for &(at, len) in list {
+        let mut bytes = vec![0u8; len.min(256)];
+        if !crate::host::read_into(at as *const u8, &mut bytes) {
+            continue;
+        }
+        let words: Vec<String> = bytes
+            .chunks(4)
+            .map(|c| {
+                let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
+                format!("{w:#x}={}", f32::from_bits(w))
+            })
+            .collect();
+        tracing::info!("peek {when} {at:#x}: {}", words.join(" "));
+    }
+}
+
+/// In a listed frame: copies an indirect execution's records (`args`: the
+/// list's argument buffer and offset, in the indirect-argument state) and
+/// its count (a title buffer's copy) to readback memory,
+/// logged once the list has run: how many records ask for work, and the
+/// first ones.
+pub(crate) fn read_indirect(
+    list: &crate::host::HostList,
+    args: (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, max): (u32, u32, u32),
+    name: String,
+    always: bool,
+) {
+    struct Readback(ID3D12Resource);
+    // SAFETY: D3D12 objects are free-threaded.
+    unsafe impl Send for Readback {}
+    // SAFETY: as above.
+    unsafe impl Sync for Readback {}
+    let Some(host) = crate::host::host() else { return };
+    let len = u64::from(stride) * u64::from(max.max(1));
+    let desc = D3D12_RESOURCE_DESC {
+        Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+        Width: len + 4,
+        Height: 1,
+        DepthOrArraySize: 1,
+        MipLevels: 1,
+        SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+        Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+        ..Default::default()
+    };
+    let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_READBACK, ..Default::default() };
+    let mut buffer: Option<ID3D12Resource> = None;
+    let l = &list.list;
+    use crate::host::transition;
+    let (arg_state, copy) = (D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    // SAFETY: plain creation; an open list and live buffers in the states
+    // named, put back after the copies.
+    unsafe {
+        if host
+            .device
+            .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COPY_DEST, None, &mut buffer)
+            .is_err()
+        {
+            return;
+        }
+        let Some(buffer) = buffer else { return };
+        l.ResourceBarrier(&[transition(args.0, arg_state, copy)]);
+        l.CopyBufferRegion(&buffer, 0, args.0, args.1, len);
+        if let Some((c, at)) = count {
+            // A title buffer's copy: never transitioned, the read promotes it.
+            l.CopyBufferRegion(&buffer, len, c, at, 4);
+        }
+        l.ResourceBarrier(&[transition(args.0, copy, arg_state)]);
+        list.keep(&buffer);
+        let buffer = Readback(buffer);
+        let counted = count.is_some();
+        list.defer_after(move || {
+            // Recorded ahead: logged if the frame running it is listed.
+            let frame = crate::queue::presented() + 1;
+            if !always && !listed(frame) {
+                return;
+            }
+            let mut data = std::ptr::null_mut();
+            if buffer.0.Map(0, None, Some(&mut data)).is_err() {
+                return;
+            }
+            let words = std::slice::from_raw_parts(data.cast::<u32>(), (len as usize + 4) / 4);
+            let n = counted.then(|| words[len as usize / 4]);
+            let records = n.unwrap_or(max).min(max) as usize;
+            let step = stride as usize / 4;
+            let first = |r: usize| &words[r * step..r * step + step.min(4)];
+            // Draws: vertices (or indices) × instances; dispatches: groups.
+            let work = |r: usize| -> u64 {
+                let w = first(r);
+                match kind {
+                    0 | 1 => u64::from(w[0]) * u64::from(w.get(1).copied().unwrap_or(1)),
+                    _ => w.iter().take(3).map(|&x| u64::from(x)).product(),
+                }
+            };
+            let busy = (0..records).filter(|&r| work(r) > 0).count();
+            let total: u64 = (0..records).map(work).sum();
+            let shown: Vec<&[u32]> = (0..records.min(4)).map(first).collect();
+            tracing::info!(
+                target: "victory_gpu::trace",
+                "indirect kind {kind} max {max} count {n:?}: {busy} of {records} records with work, {total} in all; first {shown:?} {name} frame {frame}"
+            );
+            buffer.0.Unmap(0, None);
+        });
     }
 }
 
@@ -394,9 +643,8 @@ fn dump_one(
     host: &crate::host::Host,
     texture: &ID3D12Resource,
     states: &[u32],
-    frame: u64,
-    i: usize,
-    resource: crate::object::This,
+    prefix: &str,
+    (i, resource, by): (usize, crate::object::This, &str),
     d: &D3D12_RESOURCE_DESC,
 ) {
     let Ok(list) = host.new_list() else { return };
@@ -436,7 +684,7 @@ fn dump_one(
     list.close();
     host.execute(&[&list]);
     if let Some((buffer, footprint)) = stencil {
-        stencil_values(&buffer, &footprint, frame, resource);
+        stencil_values(&buffer, &footprint, crate::queue::presented() + 1, resource);
     }
     let Some((buffer, footprint)) = read else { return };
     let f = footprint.Footprint;
@@ -468,11 +716,36 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
-            let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+        // Tiny targets (exposure, averages): their values as they are.
+        if f.Width * f.Height <= 16 {
+            let texel = crate::resource::element(f.Format.0 as u32).map_or(4, |(b, _)| b as usize);
+            let words: Vec<String> = (0..f.Height as usize)
+                .flat_map(|y| rows[y * pitch..][..f.Width as usize * texel].chunks(4))
+                .map(|c| {
+                    let w = u32::from_le_bytes(c.try_into().unwrap_or_default());
+                    format!("{w:#x}={}", f32::from_bits(w))
+                })
+                .collect();
+            tracing::info!(?resource, format = f.Format.0, "tiny target {prefix}-{i:02}: {}", words.join(" "));
+        }
+        // A 24-bit depth plane copies out as 32-bit words (`R32_TYPELESS`):
+        // decode it as depth, not as floats (all denormals, shown black).
+        let format = if matches!(d.Format.0, 44..=47) { d.Format.0 } else { f.Format.0 };
+        if let Some(rgba) = to_rgba(format as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+            let mut name = format!(
+                "{prefix}-{i:02}-{resource:?}-{}x{}-f{}",
                 d.Width, d.Height, d.Format.0
             );
+            // The pipeline's hashes (its name is "[stage hash, ...]").
+            let by: String = by.chars().filter(char::is_ascii_alphanumeric).collect();
+            if !by.is_empty() {
+                name.push_str("-by-");
+                name.push_str(&by);
+            }
+            // Whether anything but zeros is there (a dump is normalized).
+            if rgba.chunks(4).all(|p| p[..3] == [0, 0, 0]) {
+                name.push_str("-black");
+            }
             save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
@@ -576,12 +849,20 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
     type Decode = Box<dyn Fn(&[u8]) -> [f32; 3]>;
     let (n, decode): (usize, Decode) = match format {
         27..=32 => {
+            // The PNG drops alpha: its range and how many texels have each
+            // channel zero are logged.
+            let (mut low, mut high, mut zero) = ([255u8; 4], [0u8; 4], [0usize; 4]);
             for y in 0..h {
                 for x in 0..w {
                     let p = px(x, y, 4);
+                    for c in 0..4 {
+                        (low[c], high[c]) = (low[c].min(p[c]), high[c].max(p[c]));
+                        zero[c] += usize::from(p[c] == 0);
+                    }
                     out.extend([p[0], p[1], p[2], 255]);
                 }
             }
+            tracing::info!(format, ?low, ?high, ?zero, texels = w * h, "target values (8-bit, RGBA)");
             return Some(out);
         }
         // B8G8R8A8 and B8G8R8X8 (89 is R10G10B10_XR_BIAS_A2, below).
@@ -626,17 +907,33 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
         .collect();
     let grey = matches!(format, 19..=22 | 39..=47 | 53..=65);
     let finite = values.iter().flatten().copied().filter(|v| v.is_finite());
-    let (low, high) = if grey {
+    let (low, max) = if grey {
         finite.fold((f32::MAX, f32::MIN), |(l, h), v| (l.min(v), h.max(v)))
     } else {
         (0.0, finite.fold(0.0f32, f32::max))
     };
+    // Colour scaled by the 99th percentile of the non-zero values, so a few
+    // hot pixels do not hide the rest; how many are not zero, and the median.
+    let mut set: Vec<f32> = values
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|v| v.is_finite() && *v != 0.0)
+        .map(f32::abs)
+        .collect();
+    let nonzero = set.len() as f64 / (values.len() * 3).max(1) as f64;
+    let mut at = |q: f64| -> f32 {
+        if set.is_empty() {
+            return 0.0;
+        }
+        let k = ((set.len() - 1) as f64 * q).round() as usize;
+        *set.select_nth_unstable_by(k, f32::total_cmp).1
+    };
+    let (p50, p99) = (at(0.5), at(0.99));
+    let not_finite = values.iter().flatten().filter(|v| !v.is_finite()).count();
+    let high = if grey || p99 == 0.0 { max } else { p99 };
     let range = (high - low).max(1e-20);
-    // How much of the target holds anything: a lit scene and one bright
-    // lamp on black have the same highest value.
-    let above = values.iter().filter(|v| v.iter().any(|c| c.is_finite() && *c > low)).count();
-    let nonzero_percent = above as f32 * 100.0 / values.len().max(1) as f32;
-    tracing::info!(format, low, high, nonzero_percent, "target values");
+    tracing::info!(format, low, high = max, p50, p99, nonzero, not_finite, "target values");
     // Small float colour targets (the 1x1 luminance and exposure targets):
     // every texel's four channels as numbers. The picture has no alpha and
     // eight bits a channel.
@@ -708,8 +1005,6 @@ fn to_rgba(format: u32, w: usize, h: usize, pitch: usize, rows: &[u8]) -> Option
             "target values as words"
         );
     }
-    // Float colours (scene light) go through a cube root: scaled linearly,
-    // a night scene under one lamp of 50 units came out all black.
     let curved = matches!(format, 1..=2 | 9..=10 | 26);
     for v in values {
         let c = v.map(|c| {
@@ -756,20 +1051,29 @@ pub(crate) fn probe(
         Type: D3D12_HEAP_TYPE_READBACK,
         ..Default::default()
     };
-    let mut buffer: Option<ID3D12Resource> = None;
-    // SAFETY: plain creation; an open list; locations naming live resources.
-    unsafe {
-        device
-            .CreateCommittedResource(
-                &heap,
-                D3D12_HEAP_FLAG_NONE,
-                &desc,
-                D3D12_RESOURCE_STATE_COPY_DEST,
-                None,
-                &mut buffer,
-            )
+    // One buffer for every present: each is waited for before the next
+    // (made and released per present, it cost a kernel call per frame).
+    static BUFFER: std::sync::OnceLock<Option<ID3D12Resource>> = std::sync::OnceLock::new();
+    let buffer = BUFFER
+        .get_or_init(|| {
+            let mut buffer: Option<ID3D12Resource> = None;
+            // SAFETY: plain creation.
+            unsafe {
+                device.CreateCommittedResource(
+                    &heap,
+                    D3D12_HEAP_FLAG_NONE,
+                    &desc,
+                    D3D12_RESOURCE_STATE_COPY_DEST,
+                    None,
+                    &mut buffer,
+                )
+            }
             .ok()?;
-        let buffer = buffer?;
+            buffer
+        })
+        .clone()?;
+    // SAFETY: an open list; locations naming live resources.
+    unsafe {
         for i in 0..GRID * GRID {
             let (x, y) = (
                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),

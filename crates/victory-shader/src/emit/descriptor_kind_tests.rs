@@ -61,6 +61,7 @@ fn scalar_heap_descriptor_branches_create_only_matching_handles() {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     };
     let bad = HashMap::new();
     for (info, expected, expected_stride) in [

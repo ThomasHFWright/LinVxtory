@@ -119,6 +119,7 @@ fn lowered_on(
         outputs: Vec::new(),
         prims: Vec::new(),
         mesh_stride: 0,
+        view_marks: false,
     });
     lower::TEST_HOST_WAVE.set(was);
     let lowered = lowered?;
@@ -133,6 +134,13 @@ fn lowered_on(
         root_uavs: lowered.root_uavs,
         root_indexed_views: res.root_indexed_views,
         half_views: lowered.half_views,
+        memory: lowered.memory,
+        memory_writes: lowered.memory_writes,
+        view_addresses: lowered.view_addresses,
+        heap: lowered.heap,
+        heap_writes: lowered.heap_writes,
+        view_marks: lowered.view_marks,
+
     })
 }
 
@@ -282,10 +290,10 @@ fn a_sum_of_halves_where_lanes_have_left_is_the_consoles_tree_bit_for_bit() {
 
 /// One `v_add_f16` whose exact result lies between two halves: 1 + 3/1024 (0x3C03) plus 2
 /// (0x4000) is 3 + 1.5 steps of that range, which the console rounds up to 0x4202. The
-/// host's `f32tof16` may give 0x4201 (toward zero); with `VICTORY_F16_NEAREST=1` the
-/// translation gives the console's whatever the host does.
+/// default MODE rounds to nearest through narrow16, independent of the host's
+/// `f32tof16` rounding.
 #[test]
-fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
+fn a_16_bit_sum_rounds_to_nearest_by_default() {
     let words = [
         0x7E0E_02FF,
         0x0000_3C03, // v_mov_b32 v7, 0x3c03
@@ -299,44 +307,34 @@ fn a_16_bit_sum_rounds_to_nearest_when_asked_to() {
     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
     assert!(p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "v_add_f16"));
     let _one = super::valu_tests::ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    for nearest in [false, true] {
-        let was = lower::TEST_F16_NEAREST.replace(Some(nearest));
-        let shader = lowered(&native, &p, &HashSet::new());
-        lower::TEST_F16_NEAREST.set(was);
-        let shader = shader.expect("lower");
-        if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
-            let mut copy = shader.dxil.clone();
-            v.validate(&mut copy).expect("DXIL validation failed");
-        }
-        let Ok(host) = Host::new(false) else {
-            eprintln!("no SM 6.6 hardware device; not run");
-            return;
-        };
-        let Ok((root, pso)) = host.compute_pipeline(&shader) else {
-            eprintln!("the hardware device does not take this program; not run");
-            return;
-        };
-        let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[View::RawUav(1)],
-                    samplers: &[],
-                    groups: [1, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
-        let got = out[0][0] & 0xFFFF;
-        eprintln!("v_add_f16 0x3c03 + 0x4000 on the hardware device, nearest {nearest}: {got:#x}");
-        if nearest {
-            assert_eq!(got, 0x4202);
-        } else {
-            assert!(got == 0x4201 || got == 0x4202, "{got:#x}");
-        }
+    let shader = lowered(&native, &p, &HashSet::new()).expect("lower");
+    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+        let mut copy = shader.dxil.clone();
+        v.validate(&mut copy).expect("DXIL validation failed");
     }
+    let Ok(host) = Host::new(false) else {
+        eprintln!("no SM 6.6 hardware device; not run");
+        return;
+    };
+    let Ok((root, pso)) = host.compute_pipeline(&shader) else {
+        eprintln!("the hardware device does not take this program; not run");
+        return;
+    };
+    let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
+    let out = host
+        .dispatch(
+            &root,
+            &pso,
+            &Dispatch {
+                roots: vec![(0, Root::Constants(ud))],
+                views: &[View::RawUav(1)],
+                samplers: &[],
+                groups: [1, 1, 1],
+            },
+        )
+        .unwrap_or_else(|e| panic!("dispatch failed: {e}"));
+    let got = out[0][0] & 0xFFFF;
+    assert_eq!(got, 0x4202, "default MODE must round to nearest");
 }
 
 #[test]

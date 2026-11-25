@@ -1,5 +1,8 @@
 # Linux improvements — 2026-11-25
 
+These results describe the pre-merge build (`eb8d790`). See
+[upstream integration](upstream-integration.md) for the current source and checks.
+
 The normal-visuals checkpoint is preserved as `linux-world-visuals-2026-11-25`.
 This integration prioritizes CPU performance, progression and model data.
 Original commit authorship and cherry-pick provenance are retained.
@@ -71,10 +74,11 @@ Guarded writes require **both** `VICTORY_COPY_PLAIN=1` and
 falls back to the existing kernel path. Concurrent remapping can still change
 which allocation receives bytes; fault recovery does not make a copy atomic.
 
-`VICTORY_TEXTURE_NO_WAIT=1` is a separate existing option. It avoids waiting for
+The tested pre-merge build offered `VICTORY_TEXTURE_NO_WAIT=1`. It avoided waiting for
 remapping by reading into scratch; failed reads preserve the previous staging
 contents. Successful reads are not guaranteed to represent one mapping
-instant. It stays opt-in.
+instant. The current upstream integration replaces that path and no longer
+reads this option; these historical timings do not describe the new tracker.
 
 For timing, unset `VICTORY_D3D12_DRED` and `VICTORY_GPU_TIMING`; setting them to
 `0` still enables them because their switches test presence. The validation runs

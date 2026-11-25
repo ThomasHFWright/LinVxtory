@@ -10,14 +10,12 @@
 //! Here the layer subscribes to that log. Each entry of a display driver
 //! is written to our log when the system records it, with our own clock,
 //! so it can be laid beside what the layer did in that moment; it is
-//! counted; and the first one trips a switch ([`tripped`]) that the paths
-//! under suspicion ask before they run (the draw windows of `crate::draw`
-//! turn themselves off for the rest of the run). So a driver error costs a
-//! slower frame from then on, and not the card.
+//! counted and included in host failure reports. The old draw-window
+//! shutdown switch no longer applies to the upstream recording path.
 //!
 //! On by default; `VICTORY_DRIVER_WATCH=0` subscribes to nothing.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
 use windows_sys::Win32::System::EventLog::{
     EVT_HANDLE, EVT_SUBSCRIBE_NOTIFY_ACTION, EvtSubscribe, EvtSubscribeActionDeliver, EvtSubscribeToFutureEvents,
@@ -25,15 +23,6 @@ use windows_sys::Win32::System::EventLog::{
 
 /// Entries of a display driver seen since the start.
 static ERRORS: AtomicU64 = AtomicU64::new(0);
-/// Whether one was seen ([`tripped`]).
-static TRIPPED: AtomicBool = AtomicBool::new(false);
-
-/// Whether the card's driver has reported an error in this run: what could
-/// have caused it stops for the rest of the run.
-pub(crate) fn tripped() -> bool {
-    TRIPPED.load(Relaxed)
-}
-
 /// Driver errors seen since the start.
 pub(crate) fn errors() -> u64 {
     ERRORS.load(Relaxed)
@@ -42,16 +31,7 @@ pub(crate) fn errors() -> u64 {
 /// An entry of a display driver was recorded.
 fn seen() {
     let n = ERRORS.fetch_add(1, Relaxed) + 1;
-    let first = !TRIPPED.swap(true, Relaxed);
-    tracing::error!(
-        n,
-        "the graphics driver reported an error to the system's event log{}",
-        if first {
-            ": from now on the paths under suspicion are off for this run (draw windows clamp each record again)"
-        } else {
-            ""
-        }
-    );
+    tracing::error!(n, "the graphics driver reported an error to the system's event log");
 }
 
 unsafe extern "system" fn on_event(action: EVT_SUBSCRIBE_NOTIFY_ACTION, _context: *const core::ffi::c_void, _event: EVT_HANDLE) -> u32 {
@@ -100,7 +80,7 @@ pub(crate) fn start() {
         } else {
             tracing::info!(
                 "the graphics driver's errors in the system's event log are watched: each is logged here as it is recorded, and \
-                 the first turns the paths under suspicion off (VICTORY_DRIVER_WATCH=0: not watched)"
+                 counted in host failure reports (VICTORY_DRIVER_WATCH=0: not watched)"
             );
         }
     });
@@ -111,15 +91,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_first_error_trips_the_switch_and_every_one_is_counted() {
+    fn every_error_is_counted() {
         // (Other tests do not touch these statics.)
-        assert!(!tripped());
         assert_eq!(errors(), 0);
         seen();
-        assert!(tripped());
+        assert_eq!(errors(), 1);
         seen();
         assert_eq!(errors(), 2);
-        assert!(tripped());
     }
 
     /// End to end, by hand (`--ignored`): an entry written to the

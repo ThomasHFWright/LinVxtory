@@ -83,8 +83,15 @@ pub fn mount_at(letter: char, root: &Path) {
 }
 
 /// `root` as UTF-16, absolute, without trailing separators (a drive root
-/// keeps its own).
+/// keeps its own). An empty root is the current directory, as it is to a
+/// path joined to it: it is the title's folder when the title is run by its
+/// file name alone (`victory run title.exe`).
 fn root_wide(root: &Path) -> Vec<u16> {
+    let root = if root.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        root
+    };
     let root = std::path::absolute(root).unwrap_or_else(|_| root.to_owned());
     let mut wide: Vec<u16> = root.as_os_str().encode_wide().collect();
     while wide.len() > 3 && wide.last().is_some_and(|c| SEPARATORS.contains(c)) {
@@ -531,7 +538,7 @@ pub extern "system" fn ReadFile(
     read: *mut u32,
     overlapped: *mut c_void,
 ) -> i32 {
-    victory_gpu::kernel_will_write(buffer as usize, len as usize);
+    let _writing = victory_gpu::kernel_will_write(buffer as usize, len as usize);
     host!("kernel32.dll", "ReadFile": extern "system" fn(*mut c_void, *mut u8, u32, *mut u32, *mut c_void) -> i32)(
         file, buffer, len, read, overlapped,
     )
@@ -558,7 +565,7 @@ pub extern "C" fn fread(buffer: *mut u8, size: usize, count: usize, stream: File
         let want = (total - done).min(CHUNK);
         let n = read(beside.as_mut_ptr(), 1, want, stream);
         if n > 0 {
-            victory_gpu::kernel_will_write(buffer as usize + done, n);
+            let _writing = victory_gpu::kernel_will_write(buffer as usize + done, n);
             // SAFETY: the caller's buffer holds `size * count` bytes, and
             // `done + n` is at most that.
             unsafe { std::ptr::copy_nonoverlapping(beside.as_ptr(), buffer.add(done), n) };
@@ -865,6 +872,17 @@ mod tests {
             verbatim(&w(r"\\server\share\")[..15], &w("/x/../../y")[..10]),
             w(r"\\?\UNC\server\share\y")[..22].to_vec()
         );
+    }
+
+    /// A title run by its file name alone has an empty folder: the drive
+    /// over it is the current directory, not the current drive's root.
+    #[test]
+    fn an_empty_root_is_the_current_directory() {
+        let letter = mount(Path::new("")).unwrap();
+        let path = format!(r"{letter}:\a.rpf");
+        let host = translate(&w(&path)[..path.len()]).map(|v| text(&v));
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(host, Some(cwd.join("a.rpf").display().to_string()));
     }
 
     #[test]

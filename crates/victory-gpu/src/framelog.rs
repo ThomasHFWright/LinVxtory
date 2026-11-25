@@ -79,16 +79,6 @@ pub enum T {
     DiskReads,
     DiskBytes,
     DiskUs,
-    /// The card's time by kind of list (`crate::cardmeter`), as read a
-    /// second and a half after the lists were recorded: our lists that
-    /// bring copies in the card's memory up to date and hash their pieces,
-    /// our compare lists, and every other list; and how many of each.
-    CardSyncUs,
-    CardSyncLists,
-    CardCheckUs,
-    CardCheckLists,
-    CardListsUs,
-    CardLists,
     /// Looks at which processor a thread is on ([`on_slow_core`]), and how
     /// many found a slow one (an efficiency core of a hybrid processor):
     /// the thread that presents (one look a present), our submit thread
@@ -400,8 +390,7 @@ fn text(f: &Frame) -> String {
         "{:.0} ms | render thread: ran {:.0} ms (user {:.0}, kernel {:.0}); in the present call {:.1} (lines and settling \
          {:.1}, copy and show {:.1}), in submit calls {:.1}, in list calls {:.1}, paced {:.1} | submit thread: at work \
          {:.1} ms (user {:.1}, kernel {:.1}); {:.0} submissions, preparing {:.1}, waiting for the card {:.1}; copies {:.1} \
-         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us); by its own clock, of the lists of a moment ago: our \
-         send-and-hash lists {:.1} ms in {:.0}, our compare lists {:.1} ms in {:.0}, all other lists {:.1} ms in {:.0} | \
+         ms {:.1} MB; copy-back {:.1} ms {:.2} MB | card: idle {:.1} ms ({:.1} behind us) | \
          recording, all threads: {:.1} ms in {:.0} calls; all submit calls {:.1} ms | textures: refresh {:.1} ms ({:.1} waiting for memory to hold \
          still), {:.0} uploads, staging {:.0} made {:.0} reused | remapping: {:.0} calls {:.1} ms ({:.1} waiting for \
          readers) | pipelines: {:.0} made, {:.0} loaded, {:.1} ms waited | disk: {:.0} reads {:.1} MB {:.1} worker ms | \
@@ -429,12 +418,6 @@ fn text(f: &Frame) -> String {
         t(T::CopyBackBytes) / 1e6,
         ms(T::CardIdleUs),
         ms(T::CardIdleBehindUs),
-        ms(T::CardSyncUs),
-        t(T::CardSyncLists),
-        ms(T::CardCheckUs),
-        t(T::CardCheckLists),
-        ms(T::CardListsUs),
-        t(T::CardLists),
         t(T::RecordNs) / 1e6,
         t(T::RecordCalls),
         ms(T::ExecuteUs),
@@ -535,7 +518,6 @@ pub fn frame() {
     if !on() {
         return;
     }
-    crate::cardmeter::collect();
     add(T::RenderLooks, 1);
     if on_slow_core() {
         add(T::RenderSlow, 1);

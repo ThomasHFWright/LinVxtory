@@ -53,7 +53,7 @@ const K64: usize = 64 << 10;
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
 /// `VICTORY_INPLACE_PROBE`: 0 (unset) nothing; 1 the probe on memory of
-/// its own at the first sweep, and the census 30 and 150 seconds later;
+/// its own at the first submission, and the census 30 and 150 seconds later;
 /// 2 also opens one part of the title's own memory for a moment at the
 /// first census.
 pub(crate) fn probe_level() -> u8 {
@@ -61,51 +61,11 @@ pub(crate) fn probe_level() -> u8 {
     *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE_PROBE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
 }
 
-/// `VICTORY_INPLACE`: 0 (unset) off. 1: a window of title memory outside
-/// buffers that lies in private memory committed whole is not copied: a
-/// part of the title's allocation is opened as a host heap and the window
-/// is a buffer placed over it ([`place_for`]). 2: title buffers too,
-/// except the big ones in the card's memory.
-///
-/// What stage 1 covers is private memory (`XMemVirtualAlloc`'s). View
-/// memory (the page pool) is turned down here: its section is made
-/// reserved, which the host refuses, and what a view shows changes when
-/// the title maps pages.
-///
-/// What it assumes, for 2: nothing reads title memory that a submission
-/// not yet run writes through such a buffer. With every submission waited
-/// for (the default) that holds; with `VICTORY_LATE_WAIT` it does not,
-/// since the flights' rules know shader writes only by the ranges copies
-/// declare. Do not combine 2 with late wait.
-///
-/// shortcut: while a window is in place the title cannot decommit, free
-/// or protect its pages (the call fails with error 87; the probe shows
-/// it). The title's heaps are allocated once and kept, and nothing of the
-/// kind was seen; [`title_memory_freeing`] is there for the runtime to
-/// call before such a call once it takes them over.
-pub(crate) fn level() -> u8 {
-    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *LEVEL.get_or_init(|| std::env::var("VICTORY_INPLACE").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0))
-}
-
-/// The most title memory in place at once, in bytes
-/// (`VICTORY_INPLACE_MB`, 4096): opening locks the pages into the PC's
-/// memory, also those the title never touched.
-fn most() -> u64 {
-    static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| std::env::var("VICTORY_INPLACE_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096) << 20)
-}
-
-/// In place now: windows and their bytes, title buffers and their bytes;
-/// then, since the start: asks turned down because the memory is a view
-/// or not private memory committed whole, because the host refused,
-/// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
-
 /// A buffer placed over title memory, and its heap.
-pub(crate) struct Placed {
+#[cfg(test)]
+struct Placed {
     pub(crate) buffer: ID3D12Resource,
-    pub(crate) heap: ID3D12Heap,
+    _heap: ID3D12Heap,
     /// The host GPU address of the title memory's first byte.
     pub(crate) gpu: u64,
     /// Bytes from the buffer's first byte to the title memory's first.
@@ -116,7 +76,8 @@ pub(crate) struct Placed {
 /// as a heap of their own and places one buffer over all of them. `Err`
 /// with nothing if the memory is not private memory committed whole
 /// (nothing was asked of the host), with the host's error if it refused.
-pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
+#[cfg(test)]
+fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<Placed, Option<windows::core::Error>> {
     let at = start & !(K64 as u64 - 1);
     let bytes = (start + len.max(1)).next_multiple_of(K64 as u64) - at;
     if !private_whole(at as usize, bytes as usize) {
@@ -126,88 +87,12 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     let buffer = place(device, &heap, 0, bytes).map_err(Some)?;
     // SAFETY: a live buffer.
     let gpu = unsafe { buffer.GetGPUVirtualAddress() } + (start - at);
-    Ok(Placed { buffer, heap, gpu, bias: start - at })
+    Ok(Placed { buffer, _heap: heap, gpu, bias: start - at })
 }
 
-/// Title memory `[start, start + len)` in place, for a window outside
-/// buffers or a title buffer, if [`level`] asks for it and the memory can
-/// be opened; `None` leaves the caller to make a copy, as before.
-pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
-        return None;
-    }
-    // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
-        STATS[6].fetch_add(1, Ordering::Relaxed);
-        return None;
-    }
-    let host = crate::host::host()?;
-    match place_part(&host.device, start, len) {
-        Ok(placed) => {
-            let at = if window { 0 } else { 2 };
-            STATS[at].fetch_add(1, Ordering::Relaxed);
-            STATS[at + 1].fetch_add(len, Ordering::Relaxed);
-            Some(placed)
-        }
-        Err(None) => {
-            STATS[4].fetch_add(1, Ordering::Relaxed);
-            None
-        }
-        Err(Some(e)) => {
-            if STATS[5].fetch_add(1, Ordering::Relaxed) < 8 {
-                tracing::warn!(start = format_args!("{start:#x}"), len, error = %e, "title memory not opened in place: a copy instead");
-            }
-            None
-        }
-    }
-}
-
-/// What [`place_for`] gave is gone.
-pub(crate) fn gone(window: bool, bytes: u64) {
-    let at = if window { 0 } else { 2 };
-    STATS[at].fetch_sub(1, Ordering::Relaxed);
-    STATS[at + 1].fetch_sub(bytes, Ordering::Relaxed);
-}
-
-/// Title memory `[at, at + len)` is about to show something else, or the
-/// title is about to decommit, free or protect it: what is in place there
-/// is let go (the tables forget it; its heap goes when the last list and
-/// slot that hold it do). Called for memory the runtime maps anew; for
-/// the runtime to call before the title's own `VirtualFree` once it takes
-/// that call over.
+/// Invalidate host buffer copies before title memory is freed or repurposed.
 pub fn title_memory_freeing(at: usize, len: usize) {
-    if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
-        return;
-    }
-    let gone = crate::shadow::in_place_let_go(at as u64, len as u64);
-    STATS[7].fetch_add(gone, Ordering::Relaxed);
-}
-
-/// The line of what is in place, every ten seconds while [`level`] is on.
-fn say() {
-    static LAST: AtomicU64 = AtomicU64::new(0);
-    let now = crate::host::now_ms();
-    let last = LAST.load(Ordering::Relaxed);
-    if now < last + 10_000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return;
-    }
-    let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
-    tracing::info!(
-        "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
-        s[0],
-        s[1] >> 20,
-        s[2],
-        s[3] >> 20,
-        s[4],
-        s[5],
-        s[6],
-        s[7]
-    );
+    crate::watch::retake(at, len);
 }
 
 /// What a heap is opened on.
@@ -333,38 +218,6 @@ pub(crate) fn views_gone(at: usize, len: usize) {
     }
 }
 
-/// The title views that overlap `[start, end)`, as `(address, bytes)`.
-pub(crate) fn views_between(start: usize, end: usize) -> Vec<(usize, usize)> {
-    if start >= end {
-        return Vec::new();
-    }
-    let v = views();
-    let mut out = Vec::new();
-    if let Some((&base, &(bytes, _, _))) = v.views.range(..=start).next_back()
-        && base + bytes > start
-    {
-        out.push((base, bytes));
-    }
-    for (&base, &(bytes, _, _)) in v.views.range(start.saturating_add(1)..end) {
-        out.push((base, bytes));
-    }
-    out
-}
-
-/// The address of the 64 KiB page shown at `page` in every title view that
-/// shows it, `page`'s own address included; empty if `page` is not a view.
-pub(crate) fn pages_of(page: usize) -> Vec<usize> {
-    let v = views();
-    let Some((&base, &(bytes, section, offset))) = v.views.range(..=page).next_back() else {
-        return Vec::new();
-    };
-    let within = page.wrapping_sub(base);
-    if within >= bytes || !within.is_multiple_of(K64) {
-        return Vec::new();
-    }
-    v.pages.get(&(section, offset + within as u64)).cloned().unwrap_or_default()
-}
-
 /// The title views that show any of the physical bytes `[offset, offset +
 /// len)` of `section`, as `(address, bytes)` ranges in address order; not
 /// those of a page shown in very many views (`MANY_VIEWS`).
@@ -397,121 +250,6 @@ pub(crate) fn views_of_section(section: usize, offset: u64, len: usize) -> Vec<(
         }
     }
     runs
-}
-
-/// Whether what shaders wrote goes back into title view memory through a
-/// view of our own (`VICTORY_BACK_OWN_VIEW=1`; off by default).
-///
-/// The copy-back writes title memory at the title's address, so it opens
-/// the guard on the 64 KiB block first (and on every other view of the
-/// page), and the block then counts as written by the title: the host
-/// copy that just put the bytes there copies all 64 KiB of it back in at
-/// its next refresh, and sends them up to the card again if it lives
-/// there. In runs 218-222 the bytes copied in went with the bytes copied
-/// back, 0.83 MB for each MB (78 readings), some 50 MB of 142 MB a frame.
-///
-/// With the switch the bytes are stored through a view of our own on the
-/// same section, which no guard covers: the title's views stay read-only
-/// (a title write still faults and is seen), the write-watch journal is
-/// told the page was written (`crate::watch::wrote_own`) so that every
-/// other copy of it takes it again, and the copy that wrote it notes the
-/// page current (`put_back_own` in `crate::shadow`).
-pub(crate) fn back_own() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_OWN_VIEW").is_some_and(|v| v == "1"))
-}
-
-/// A view of our own on a whole section of the title's physical pages:
-/// where it is, its bytes, and which of its 64 KiB blocks we have asked
-/// to be committed through it (a bit each).
-struct Own {
-    base: usize,
-    bytes: u64,
-    committed: Vec<u64>,
-}
-
-/// Our own views by section handle; `None` in a section's place if the
-/// host refused the view (not asked again).
-static OWN: Mutex<Option<std::collections::HashMap<usize, Option<Own>>>> = Mutex::new(None);
-
-/// Stores `bytes` at title address `at` through a view of our own
-/// ([`back_own`]), if `[at, at + bytes.len())` lies in one 64 KiB page of
-/// a title view of a section. Gives the addresses of that page in every
-/// title view that shows it (the page of `at` among them), or `None` with
-/// nothing written: not view memory, a page of very many views, the
-/// runtime changing mappings at this moment, or the host refusing.
-pub(crate) fn write_own(at: usize, bytes: &[u8]) -> Option<Vec<usize>> {
-    if bytes.is_empty() || at / K64 != (at + bytes.len() - 1) / K64 {
-        return None;
-    }
-    // No mapping changes until the bytes are in: the view found below
-    // shows these pages for as long as this is held.
-    let _still = crate::watch::title_memory_reading_now()?;
-    let (section, offset, shown, section_bytes) = {
-        let v = views();
-        let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
-        if at + bytes.len() > base + len {
-            return None;
-        }
-        let offset = offset + (at - base) as u64;
-        let shown = v.pages.get(&(section, offset - offset % K64 as u64))?.clone();
-        if shown.len() > crate::watch::MANY_VIEWS {
-            return None;
-        }
-        let section_bytes = v.sections.iter().find(|s| s.0 == section)?.1;
-        (section, offset, shown, section_bytes)
-    };
-    if offset + bytes.len() as u64 > section_bytes {
-        return None;
-    }
-    let mut own = OWN.lock().unwrap_or_else(|e| e.into_inner());
-    let view = own
-        .get_or_insert_with(Default::default)
-        .entry(section)
-        .or_insert_with(|| {
-            // SAFETY: a section handle the runtime gave us, alive as long
-            // as the title's views of it are; the view is ours and stays.
-            let at = unsafe { mem::MapViewOfFile(section as *mut c_void, mem::FILE_MAP_WRITE, 0, 0, 0) };
-            if at.Value.is_null() {
-                tracing::warn!(
-                    section,
-                    error = %std::io::Error::last_os_error(),
-                    "no view of our own on a section of title pages: what shaders wrote goes back the old way there"
-                );
-                return None;
-            }
-            tracing::info!(
-                section,
-                mb = section_bytes >> 20,
-                "a view of our own on a section of title pages, for what shaders wrote (VICTORY_BACK_OWN_VIEW=1)"
-            );
-            Some(Own {
-                base: at.Value as usize,
-                bytes: section_bytes,
-                committed: vec![0; (section_bytes as usize).div_ceil(K64).div_ceil(64)],
-            })
-        })
-        .as_mut()?;
-    if offset + bytes.len() as u64 > view.bytes {
-        return None;
-    }
-    let block = offset as usize / K64;
-    if (view.committed[block / 64] & (1u64 << (block % 64))) == 0 {
-        // The title's view committed these pages of the section; asked
-        // once more through ours, which changes nothing if they are.
-        // SAFETY: a block inside our own view.
-        let there = unsafe {
-            mem::VirtualAlloc((view.base + block * K64) as *const c_void, K64, mem::MEM_COMMIT, mem::PAGE_READWRITE)
-        };
-        if there.is_null() {
-            return None;
-        }
-        view.committed[block / 64] |= 1u64 << (block % 64);
-    }
-    // SAFETY: committed bytes inside our own view; the source is the
-    // caller's slice.
-    unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), (view.base + offset as usize) as *mut u8, bytes.len()) };
-    Some(shown)
 }
 
 /// How the views cover `[at, at + len)`.
@@ -1168,14 +906,11 @@ fn real_part(spans: &[(u64, u64, bool)]) -> Vec<String> {
     lines
 }
 
-/// Called once a second by the thread that submits, before a submission
-/// (`host::sweep`): with [`probe_level`], the probe at the first call, the
+/// Called before submissions (`Host::execute`): with [`probe_level`],
+/// the probe at the first call, the
 /// census (on a thread of its own: it asks Windows about every copy) 30
 /// and 150 seconds later.
 pub(crate) fn tick() {
-    if level() > 0 {
-        say();
-    }
     if probe_level() == 0 {
         return;
     }
@@ -1189,7 +924,11 @@ pub(crate) fn tick() {
             };
             let mb = std::env::var("VICTORY_INPLACE_PROBE_MB").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(64usize);
             let took = std::time::Instant::now();
-            let probe = probe(&host.device, &|| host.video_memory(), mb.min(1024));
+            let probe = probe(&host.device, &|| crate::host::video_memory().map(|[(used, budget), (shared, shared_budget)]| [(budget * 1e6) as u64, (used * 1e6) as u64, (shared_budget * 1e6) as u64, (shared * 1e6) as u64]), mb.min(1024));
+            tracing::info!(part_reads = probe.part_reads, part_writes = probe.part_writes,
+                section_reads = probe.section_reads, section_writes = probe.section_writes,
+                section_outlives_views = probe.section_outlives_views,
+                reserved_section_refused = probe.reserved_section_refused, "in-place probe capabilities");
             for line in &probe.lines {
                 tracing::info!("in place probe: {line}");
             }

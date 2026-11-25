@@ -24,6 +24,10 @@ fn workspace_root() -> PathBuf {
 /// for tests, so that it follows `CARGO_TARGET_DIR` like the rest of the
 /// build.
 fn build_probe() -> PathBuf {
+    // Cross-built tests under Wine cannot launch the host's Cargo executable.
+    if let Some(path) = std::env::var_os("VICTORY_TEST_HLE_PROBE") {
+        return PathBuf::from(path);
+    }
     let manifest = workspace_root().join("tests/fixtures/hle-probe/Cargo.toml");
     let target = Path::new(env!("CARGO_TARGET_TMPDIR")).join("hle-probe");
     let status = Command::new(env!("CARGO"))

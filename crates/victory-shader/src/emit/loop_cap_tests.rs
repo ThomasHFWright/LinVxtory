@@ -169,6 +169,7 @@ fn emitted(words: &[u32]) -> (super::super::bitcode::Module, usize, usize) {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     };
     // Also exercise production cleanup and serialization when DXIL validation
     // is available, before adding the CPU-only observation calls below.

@@ -37,104 +37,86 @@ pub(crate) enum C {
     TexWatched,
     TexHashed,
     TexChanged,
-    /// Frames presented since the last line (what the line divides by).
-    Frames,
-    /// Calls of list methods that record into a host list, and the
-    /// nanoseconds they took, summed over the title's recording threads.
-    RecordCalls,
-    RecordNs,
-    /// Waiting for host pipelines being made (`pipeline::make`).
+    /// Time in the kernel's write-watch answers, in the view check of the
+    /// guard, in protecting; bytes and time of copies of memory neither
+    /// watched nor guarded (copied whole).
+    KernelUs,
+    ViewQueryUs,
+    ProtectUs,
+    WholeBytes,
+    WholeUs,
+    /// Snapshots of ranges shaders write (bytes, time); page faults while
+    /// preparing submissions and while copying back.
+    SnapshotBytes,
+    SnapshotUs,
+    FaultsPrep,
+    FaultsBack,
+    /// Pages marked changed because a write landed on another mapping of
+    /// them.
+    AliasMarks,
+    /// Time in the guard handler; protection changes making pages read-only
+    /// (calls, pages) and giving write access back (pages).
+    HandlerUs,
+    ProtectCalls,
+    ProtectPages,
+    OpenPages,
+    /// Tracked pages written (distinct, per frame), and of those the ones
+    /// written the frame before too.
+    WrittenPages,
+    WrittenAgain,
+    /// In change checks: time asking the runtime for other mappings, and
+    /// waiting for the guard lock.
+    AliasUs,
+    GuardWaitUs,
+    /// Preparing submissions: refresh batches done (copies and change
+    /// checks); time in each kind of step (a step that flushes the batch
+    /// counts that too); texture uploads for heaps; state preludes.
+    FlushUs,
+    StepRefreshUs,
+    StepCopyUs,
+    StepWorkUs,
+    StepGpuWriteUs,
+    StepTextureUs,
+    StepHeapUs,
+    StepMemoryUs,
+    UploadsUs,
+    PreludeUs,
+    /// Copying back: bytes of copies compared with their snapshots, and
+    /// the time.
+    CompareBytes,
+    CompareUs,
+    /// Copying back pages shaders marked as written through views: pages
+    /// compared, bytes written back, the time; pages that kept the title's
+    /// bytes (it wrote them, their bytes from before unknown); pages whose
+    /// bytes the title's first write saved.
+    MarkedPages,
+    MarkedBytes,
+    MarkedUs,
+    MarkedKept,
+    SavedPages,
+    /// Preparing submissions: descriptors the title copied into its heaps
+    /// as bytes, made on the host first.
+    SyncHeapsUs,
+    /// Of those: heap slots looked at (every slot of each page written).
+    SyncSlots,
+    /// Time in copies redone piece by piece after meeting an unmapped page.
+    FallbackUs,
+    /// Title threads writing a view into a shader-visible heap: time
+    /// waiting for the heaps' lock (held by heap syncs and other writers).
+    /// Time awaiting host pipelines.
     PipelineWaitUs,
-    /// Dynamic descriptor slots: tables asked for, refused (no free run),
-    /// and the nanoseconds of the searches.
+    /// Dynamic descriptor table requests, refusals and search nanoseconds.
     DynamicAsked,
     DynamicRefused,
     DynamicNs,
-    /// Marker texts for device-removed data (`HostList::note`).
-    NoteNs,
-    /// Ranges given to shaders (steps), their snapshots, and the bytes
-    /// compared after the submission.
-    GpuWrites,
-    SnapshotUs,
-    BackCompared,
-    /// Reading around unmapped pages after a failed bulk read.
+    /// Time reading around unmapped pages after a failed bulk read.
     SparseUs,
-    /// Guarding view memory (part of the write-watch askings' time).
-    GuardUs,
-    /// Bytes copied whole because their memory is neither write-watched
-    /// nor a view (`Shadow::update_free`).
-    WholeBytes,
-    /// Submissions with ranges shaders write (they need the GPU's results
-    /// before they return).
-    BackSubmissions,
-    /// The title's frame waits (`frame::wait`) and the time slept in them,
-    /// over all its threads.
+    /// Frame waits and microseconds slept across title threads.
     PaceWaits,
     PaceUs,
-    /// After a present: until the title's first list call and until its
-    /// first submission; and from its last submission to its next present.
-    UntilRecordUs,
-    UntilSubmitUs,
-    TailUs,
-    /// Resetting host lists (`HostList::reset`).
-    ResetNs,
-    /// What shaders wrote: finding the 64 KiB pieces that differ, how many
-    /// do, and putting them into title memory.
-    BackScanUs,
-    BackDiffer,
-    BackSyncUs,
-    /// Texture uploads recorded, and left out as unchanged.
-    TexUploads,
-    TexSkipped,
-    /// Held submissions a present ran although their waits were not met.
-    Forced,
-    /// Ranges named through unordered access views by shaders that cannot
-    /// store to buffers, not given to shaders as written, and their bytes.
-    GpuWritesLeftOut,
-    GpuWritesLeftOutBytes,
-    /// Waits for memory values looked at (`list::ValueWait::met`) and the
-    /// nanoseconds the looks took, on every thread.
-    WaitChecks,
-    WaitCheckNs,
-    /// Host lists made (`Host::new_list`: for the lists a queue holds and
-    /// for the parts of lists cut at waits) and the nanoseconds that took.
-    HostLists,
-    HostListNs,
-    /// Parts of held submissions that ran while the part behind them could
-    /// have run with them (its waits were met already).
-    PartsTogether,
-    /// Microseconds of the copies counted in `WholeBytes`.
-    WholeUs,
-    /// Submissions by how long the card was waited for (under 2 ms, 2-8,
-    /// 8-32, longer), and the microseconds waited in each class.
-    CardUnder2,
-    Card2To8,
-    Card8To32,
-    CardOver32,
-    CardUnder2Us,
-    Card2To8Us,
-    Card8To32Us,
-    CardOver32Us,
-    /// Submissions that hand nothing back to the title (no range shaders
-    /// write, no value written when done), and the microseconds the card
-    /// was waited for them.
-    NothingBack,
-    NothingBackUs,
-    /// Waits for every earlier shader write recorded into host lists: for
-    /// the title's barrier groups, for its barriers on buffers, and the
-    /// indirect commands bounded (each a dispatch of ours between two such
-    /// waits).
-    WaitsForGroups,
-    WaitsForBuffers,
-    IndirectBounded,
-    /// `watch::writes` kernel askings that failed (the range is not
-    /// write-watched: view memory or not watchable).
-    WatchFailed,
-    /// `watch::writes` askings not made because the range's first block is
-    /// already known to be guarded view memory (no kernel call).
-    WatchKnownView,
+    MirrorWaitUs,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = C::MirrorWaitUs as usize + 1;
 static COUNT: [AtomicU64; COUNTERS] = [const { AtomicU64::new(0) }; COUNTERS];
 
 pub(crate) fn add(c: C, n: u64) {
@@ -155,112 +137,6 @@ pub(crate) fn mode() -> u8 {
 type Ranges = HashMap<(usize, usize), (u64, u64, u64, u32)>;
 static RANGES: Mutex<Option<Ranges>> = Mutex::new(None);
 
-/// Per range copied whole because its memory is not watched (start,
-/// length): copies and microseconds.
-static WHOLE: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
-
-/// `len` bytes at `src`, memory that is not watched, were copied whole in
-/// `us`.
-pub(crate) fn whole(src: usize, len: usize, us: u64) {
-    add(C::WholeUs, us);
-    let mut map = WHOLE.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
-    e.0 += 1;
-    e.1 += us;
-}
-
-/// The longest wait for the card since the last line: microseconds, and
-/// what ran (lists and pipelines).
-static LONGEST: Mutex<(u64, String)> = Mutex::new((0, String::new()));
-
-/// The waits for the card since the last line by what ran (lists and
-/// pipelines): how many, and their microseconds.
-static WAITS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64)>>> = Mutex::new(None);
-
-/// With `VICTORY_GPU_TIMING`: the commands' time on the card since the last
-/// line by what they ran (a pipeline, or the kind of command): how many,
-/// their microseconds, and the longest one's.
-static COMMANDS_BY_WORK: Mutex<Option<HashMap<String, (u64, u64, u64)>>> = Mutex::new(None);
-
-/// A command took `ms` on the card (timing run). `op` is its note: the
-/// kind and size first, then the pipeline in brackets, then what it binds.
-pub(crate) fn command_took(op: &str, ms: f64) {
-    let us = (ms * 1e3) as u64;
-    let mut by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-    let e = by.get_or_insert_with(HashMap::new).entry(command_key(op)).or_insert((0, 0, 0));
-    e.0 += 1;
-    e.1 += us;
-    e.2 = e.2.max(us);
-}
-
-/// What a command's note is summed under: its pipeline (`[compute ...]`,
-/// `[mesh ..., pixel ...]`) with the command's first word, or without a
-/// pipeline its first two words.
-fn command_key(op: &str) -> String {
-    let head = op.split(" | ").next().unwrap_or(op);
-    let word = head.split(' ').next().unwrap_or("");
-    match (head.find('['), head.find(']')) {
-        (Some(a), Some(b)) if a < b => format!("{word} {}", &head[a..=b]),
-        _ => head.split(' ').take(2).collect::<Vec<_>>().join(" "),
-    }
-}
-
-/// The card was waited for `us` for a submission; `what` names it if it is
-/// the longest since the last line.
-pub(crate) fn card_waited(us: u64, what: impl FnOnce() -> String) {
-    let (n, t) = match us {
-        0..2_000 => (C::CardUnder2, C::CardUnder2Us),
-        2_000..8_000 => (C::Card2To8, C::Card2To8Us),
-        8_000..32_000 => (C::Card8To32, C::Card8To32Us),
-        _ => (C::CardOver32, C::CardOver32Us),
-    };
-    add(n, 1);
-    add(t, us);
-    // Every submission is named (some forty a frame): the same lists run
-    // every frame, and the eight longest waits of a line were one list
-    // eight times.
-    let text = what();
-    {
-        let mut by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner());
-        let e = by.get_or_insert_with(HashMap::new).entry(text.clone()).or_insert((0, 0));
-        e.0 += 1;
-        e.1 += us;
-    }
-    let mut longest = LONGEST.lock().unwrap_or_else(|e| e.into_inner());
-    if us > longest.0 {
-        *longest = (us, text);
-    }
-}
-
-/// Whether an experiment on barriers is on (`VICTORY_BARRIER_TEST`): bit 0
-/// for `groups` (the title's barrier groups record no wait for earlier
-/// shader writes), bit 1 for `indirect` (the pass that bounds an indirect
-/// command runs without its two such waits; its state changes stay), both
-/// bits for `both`. For timing only: without the waits a shader may read
-/// what another has not finished writing.
-pub(crate) fn barrier_test() -> u8 {
-    static TEST: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
-    *TEST.get_or_init(|| match std::env::var("VICTORY_BARRIER_TEST").as_deref() {
-        Ok("groups") => 1,
-        Ok("indirect") => 2,
-        Ok("both") => 3,
-        _ => 0,
-    })
-}
-
-/// Per range compared after a submission (start, length): times, and the
-/// bytes of it written back to the title.
-static COMPARED: Mutex<Option<HashMap<(usize, usize), (u64, u64)>>> = Mutex::new(None);
-
-/// `len` bytes at `src` were compared after a submission and `written` of
-/// them put back into title memory.
-pub(crate) fn compared(src: usize, len: usize, written: usize) {
-    let mut map = COMPARED.lock().unwrap_or_else(|e| e.into_inner());
-    let e = map.get_or_insert_with(HashMap::new).entry((src, len)).or_insert((0, 0));
-    e.0 += 1;
-    e.1 += written as u64;
-}
-
 /// A copy of `len` bytes from `src` (memory type `kind`) took `us`.
 pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     let mut map = RANGES.lock().unwrap_or_else(|e| e.into_inner());
@@ -271,6 +147,19 @@ pub(crate) fn range(src: usize, len: usize, us: u64, kind: u32) {
     e.0 += 1;
     e.1 += len as u64;
     e.2 += us;
+}
+
+/// Snapshot bytes per host copy (its title start and length).
+static SNAPSHOTS: Mutex<Option<HashMap<(u64, u64), u64>>> = Mutex::new(None);
+
+/// A snapshot of `bytes` of the copy of `[start, start + len)`.
+pub(crate) fn snapshot(start: u64, len: u64, bytes: u64) {
+    *SNAPSHOTS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry((start, len))
+        .or_default() += bytes;
 }
 
 /// Our own allocations alive now, by size of block (under 4 KiB, to 64 KiB,
@@ -353,6 +242,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE { note_large(layout.size()); }
         }
         at
     }
@@ -363,6 +254,8 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
         if !at.is_null() {
             own(layout.size(), true);
             big(at, layout.size(), true);
+            HEAP_BYTES.fetch_add(layout.size() as u64, Relaxed);
+            if layout.size() >= LARGE { note_large(layout.size()); }
         }
         at
     }
@@ -370,6 +263,7 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
     unsafe fn dealloc(&self, at: *mut u8, layout: std::alloc::Layout) {
         own(layout.size(), false);
         big(at, layout.size(), false);
+        HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
         // SAFETY: the caller's contract, passed on.
         unsafe { std::alloc::System.dealloc(at, layout) };
     }
@@ -382,6 +276,9 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
             own(size, true);
             big(at, layout.size(), false);
             big(moved, size, true);
+            HEAP_BYTES.fetch_sub(layout.size() as u64, Relaxed);
+            HEAP_BYTES.fetch_add(size as u64, Relaxed);
+            if size >= LARGE { note_large(size); }
         }
         moved
     }
@@ -389,73 +286,6 @@ unsafe impl std::alloc::GlobalAlloc for Counting {
 
 #[global_allocator]
 static HEAP: Counting = Counting;
-
-#[cfg(test)]
-mod command_tests {
-    /// Commands are summed by pipeline and first word; those without a
-    /// pipeline by their first two words.
-    #[test]
-    fn commands_are_named_by_their_pipeline() {
-        use super::command_key;
-        assert_eq!(
-            command_key("dispatch 182x1x1 [compute 24f989b98dcb03f0] | 24f989b98dcb03f0: u4=0xa6b080 [heap 341380: x]"),
-            "dispatch [compute 24f989b98dcb03f0]"
-        );
-        assert_eq!(
-            command_key("indirect kind 10 max 1 at 0xd9358fce0 [mesh 0750cb2d975c7563, pixel 085d374c5a795549] | t"),
-            "indirect [mesh 0750cb2d975c7563, pixel 085d374c5a795549]"
-        );
-        assert_eq!(command_key("texture upload 0x271b61c28b0 (2048x2048x1 f99 mips 10) sub 0"), "texture upload");
-        assert_eq!(command_key("alias copy of 0x26f66aca780 into 0x26fbdc93890"), "alias copy");
-    }
-}
-
-#[cfg(test)]
-mod own_tests {
-    use super::{OWN, block_class};
-    use std::sync::atomic::Ordering::Relaxed;
-
-    #[test]
-    fn blocks_count_in_their_size_class() {
-        assert_eq!(block_class(0), 0);
-        assert_eq!(block_class(4095), 0);
-        assert_eq!(block_class(4096), 1);
-        assert_eq!(block_class(65535), 1);
-        assert_eq!(block_class(65536), 2);
-        assert_eq!(block_class((1 << 20) - 1), 2);
-        assert_eq!(block_class(1 << 20), 3);
-    }
-
-    /// A block of 32 MiB or more is listed by its size while it lives.
-    #[test]
-    fn big_blocks_are_listed_while_they_live() {
-        let size = (48usize << 20) + 4096;
-        let listed = |at: usize| {
-            super::BIG_AT
-                .iter()
-                .zip(&super::BIG_BYTES)
-                .any(|(place, bytes)| place.load(Relaxed) == at && bytes.load(Relaxed) == size as u64)
-        };
-        let block = vec![0u8; size];
-        let at = block.as_ptr() as usize;
-        assert!(listed(at));
-        assert!(super::big_blocks().contains("48.00"));
-        drop(block);
-        assert!(!listed(at));
-    }
-
-    /// A big block shows in the counters while it lives (other tests
-    /// allocate small blocks meanwhile: only the big class is looked at,
-    /// and only for at least this block).
-    #[test]
-    fn a_block_is_counted_while_it_lives() {
-        let block = vec![1u8; 8 << 20];
-        assert!(OWN[3].load(Relaxed) >= 8 << 20);
-        assert!(OWN[7].load(Relaxed) >= 1);
-        drop(block);
-        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
-    }
-}
 
 /// The process's memory in bytes: in physical memory, and committed
 /// (private bytes).
@@ -685,22 +515,6 @@ fn log_memory() {
     let mb = |v: u64| v as f64 / (1 << 20) as f64;
     let (working, private) = process_memory();
     let (free, left) = system_memory();
-    let copies = crate::shadow::memory();
-    let staged = crate::texture::memory();
-    let textures = [0, 1].map(|i| crate::resource::HOST_TEXTURES[i].load(Relaxed));
-    let made: Vec<u64> = crate::host::MADE.iter().map(|m| m.load(Relaxed)).collect();
-    let windows = crate::shadow::windows();
-    let stagings = crate::texture::let_go();
-    let census = crate::resource::census();
-    let kinds: Vec<u64> = crate::resource::KINDS.iter().map(|k| k.load(Relaxed)).collect();
-    let card = crate::host::host()
-        .and_then(|h| h.video_memory())
-        .unwrap_or_default();
-    // Everything the system says of the two memory groups, beside the
-    // budget and use the lines below print.
-    if let Some(h) = crate::host::host() {
-        h.log_video_memory("with the memory line");
-    }
     // What else holds memory: the map, on a thread of its own, with every
     // sixth line; and what the shader table and the pipeline library keep.
     static LINES: AtomicU64 = AtomicU64::new(0);
@@ -725,236 +539,27 @@ fn log_memory() {
         mb(kept[4]),
         mb(kept[5]),
     );
-    tracing::info!(
-        "memory of textures: {} title textures have no host copy yet ({:.0} MB of title memory); \
-         host copies the host renders to or writes: {} alive {:.0} MB; host copies the title \
-         fills: {} alive {:.0} MB ({} of them placed), {} let go {:.0} MB and {} made again \
-         {:.0} MB since the start; {} host copies made in all; passes that made none for lack of \
-         room: {}; the card: {:.0} MB in use of a budget of {:.0} MB, {:.0} MB of the PC's memory \
-         shared with it in use",
-        census[2],
-        mb(census[3]),
-        census[0],
-        mb(census[1]),
-        census[4],
-        mb(census[5]),
-        census[6],
-        kinds[2],
-        mb(kinds[3]),
-        kinds[4],
-        mb(kinds[5]),
-        kinds[6],
-        crate::draw::HEAP_TEXTURES_FULL.load(Relaxed),
-        mb(card[1]),
-        mb(card[0]),
-        mb(card[3]),
-    );
-    let targets = crate::resource::targets_census();
-    tracing::info!(
-        "host copies the sweep never lets go: {} the host renders to or writes {:.0} MB ({} of them placed {:.0} MB);          of them {} have title memory that is not mapped now {:.0} MB, {} were not used for 30 s and are held by no          list and no slot {:.0} MB, {} are both {:.0} MB; and {} copies of textures the title fills that the host          copied into {:.0} MB",
-        targets[0],
-        mb(targets[1]),
-        targets[10],
-        mb(targets[11]),
-        targets[2],
-        mb(targets[3]),
-        targets[4],
-        mb(targets[5]),
-        targets[6],
-        mb(targets[7]),
-        targets[8],
-        mb(targets[9]),
-    );
-    tracing::info!(
-        "memory let go since the start: {} windows outside buffers {:.0} MB, {} staging buffers \
-         {:.0} MB; of the windows alive, {:.0} MB lie between the lowest and highest address \
-         asked for in each",
-        windows[0],
-        mb(windows[1]),
-        stagings[0],
-        mb(stagings[1]),
-        mb(windows[2]),
-    );
-    tracing::info!(
-        "memory: {:.0} MB private ({:.0} MB of it in memory; the PC has {:.0} MB free and {:.0} MB \
-         left to commit); host copies of title memory: {} alive {:.0} MB, of them {} windows \
-         outside buffers {:.0} MB; snapshot buffers kept: {} reserving {:.0} MB; staging of \
-         textures: {} alive {:.0} MB, {} kept by their texture; host textures: {} alive {:.0} MB, \
-         {} placed in title memory; made so far: {} upload buffers {:.0} MB, {} shared buffers \
-         {:.0} MB, {} card buffers {:.0} MB",
-        mb(private),
-        mb(working),
-        mb(free),
-        mb(left),
-        copies[0],
-        mb(copies[1]),
-        copies[2],
-        mb(copies[3]),
-        copies[4],
-        mb(copies[5]),
-        staged[0],
-        mb(staged[1]),
-        staged[2],
-        textures[0],
-        mb(textures[1]),
-        crate::resource::placed_textures(),
-        made[0],
-        mb(made[1]),
-        made[2],
-        mb(made[3]),
-        made[4],
-        mb(made[5]),
-    );
-    tracing::info!(
-        "memory, placed textures: {} of them were asked for again with other filler words in their description          (one resource and host copy each since the filler left the key; VICTORY_PLACED_FILLER=1 keeps it)",
-        crate::resource::placed_filler_twins()
-    );
-    // What the line above leaves open: what is alive of the buffers "made
-    // so far", what the windows hold and what holds them, and what our own
-    // code has allocated.
-    let alive: Vec<u64> = crate::host::ALIVE.iter().map(|a| a.load(Relaxed)).collect();
-    let window = crate::shadow::window_use();
+    let (textures, bytes, used, shared, saved, replaced) = crate::resource::texture_counts();
     let views = crate::descriptor::views_kept();
     let own: Vec<u64> = OWN.iter().map(|o| o.load(Relaxed)).collect();
     tracing::info!(
-        "memory, what holds it: {} host lists alive; their scratch memory: {} chunks {:.0} MB, of          them {} chunks {:.0} MB spare ({} taken from the spare ones so far); their other upload          buffers: {} alive {:.0} MB; windows outside buffers (grid {} KiB): {:.0} MB of their          pages ever copied, {} shown by descriptor slots {:.0} MB, {} held by lists or the pass          over the heap {:.0} MB, {} asked for without a length {:.0} MB; buffer views of the heap          whose slot showed another copy than the one brought up to date: {}; distinct views          kept: {} ({} free) {:.0} MB; our own allocations: {:.0} MB in {} blocks (under 4 KiB          {:.0} MB in {}, to 64 KiB {:.0} MB in {}, to 1 MiB {:.0} MB in {}, larger {:.0} MB in {})",
-        alive[0],
-        alive[1],
-        mb(alive[2]),
-        alive[3],
-        mb(alive[4]),
-        alive[5],
-        alive[6],
-        mb(alive[7]),
-        window[7] >> 10,
-        mb(window[0]),
-        window[1],
-        mb(window[2]),
-        window[3],
-        mb(window[4]),
-        window[5],
-        mb(window[6]),
-        crate::draw::HEAP_VIEWS_ELSEWHERE.load(Relaxed),
-        views[0],
-        views[1],
-        mb(views[2]),
-        mb(own[..4].iter().sum()),
-        own[4..].iter().sum::<u64>(),
-        mb(own[0]),
-        own[4],
-        mb(own[1]),
-        own[5],
-        mb(own[2]),
-        own[6],
-        mb(own[3]),
-        own[7],
+        "memory: {:.0} MiB private, {:.0} MiB working set; host free {:.0} MiB, commit remaining {:.0} MiB; \
+         host textures {} / {:.0} MiB (used {:.0} MiB), shared {} saving {:.0} MiB, replaced {}; \
+         descriptor views {} / {:.0} MiB; own allocations {:.0} MiB / {} blocks",
+        mb(private), mb(working), mb(free), mb(left), textures, mb(bytes), mb(used),
+        shared, mb(saved), replaced, views[0], mb(views[2]),
+        mb(own[..4].iter().sum()), own[4..].iter().sum::<u64>(),
     );
-    // Round 2: what the view table still holds and what goes around it,
-    // what host lists cost, the card's share that is the layer's own or
-    // the title's no more, and which big blocks are ours.
-    let lists: Vec<u64> = crate::host::LISTS.iter().map(|l| l.load(Relaxed)).collect();
-    tracing::info!(
-        "memory, more: views named whole in their records since the start: {} constant buffer \
-         views, {} views of placed memory; of the view table's entries {} are constant buffer \
-         views and {} views of placed memory; shapes of placed views kept: {}; host lists: {} \
-         made by the host, {} preludes made for them, private bytes grew {:.0} MB while \
-         lists were made; twins of depth textures: {:.0} MB; host copies of \
-         placed textures whose title memory is not mapped any more (estimate): {:.0} MB, of \
-         them still shown by a descriptor slot {:.0} MB; the pipeline library's mapped file \
-         let go from memory so far: {:.0} MB; our own blocks of 32 MB and more, in MB: {}",
-        views[6],
-        views[7],
-        views[3],
-        views[4],
-        views[5],
-        lists[0],
-        lists[1],
-        lists[2] as i64 as f64 / (1 << 20) as f64,
-        mb(census[7]),
-        mb(census[8]),
-        mb(census[9]),
-        mb(kept[6]),
-        big_blocks(),
-    );
-    // Round 3: whether windows hold the same memory more than once (they
-    // can, once they are cut finer than 4 MiB), and how many host lists
-    // the title made and never used.
-    tracing::info!(
-        "memory, windows: the {:.0} MB of windows lie over {:.0} MB of title memory (the rest is \
-         memory that is in more than one window, and is copied once for each); host lists never \
-         reset since they were made: {}",
-        mb(copies[3]),
-        mb(crate::shadow::window_cover()),
-        lists[3],
-    );
-}
+    tracing::info!(census = ?crate::resource::texture_census(), large_allocations = %big_blocks(), "texture bytes by writer and reachability");
+    if let Some([(used, budget), (shared, shared_budget)]) = crate::host::video_memory() {
+        tracing::info!(used_mb = used, budget_mb = budget, shared_mb = shared,
+            shared_budget_mb = shared_budget, "GPU memory budget");
+    }
 
-/// Microseconds since the first call.
-fn now_us() -> u64 {
-    static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    EPOCH.get_or_init(std::time::Instant::now).elapsed().as_micros() as u64
-}
-
-/// When the last frame was presented and when the last submission returned
-/// ([`now_us`]), and whether a list call and a submission followed that
-/// present yet.
-static PRESENTED_AT: AtomicU64 = AtomicU64::new(0);
-static SUBMITTED_AT: AtomicU64 = AtomicU64::new(0);
-static RECORDED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-static SUBMITTED_SINCE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
-
-/// What a thread that submits did between its submissions and in them
-/// (microseconds; list calls in nanoseconds).
-#[derive(Default, Clone, Copy)]
-struct Submitter {
-    submissions: u64,
-    /// From a submission's return to the next one's call: wall time, of it
-    /// the thread running (user, kernel), and inside our list calls.
-    between: u64,
-    between_user: u64,
-    between_kernel: u64,
-    between_ours: u64,
-    /// Waiting for the submission lock; running inside submissions.
-    lock: u64,
-    inside_user: u64,
-    inside_kernel: u64,
-}
-
-/// By thread: the submitting threads, and list-call time (nanoseconds,
-/// calls) of every recording thread.
-static SUBMITTERS: Mutex<Vec<(u32, Submitter)>> = Mutex::new(Vec::new());
-static RECORDERS: Mutex<Vec<(u32, u64, u64)>> = Mutex::new(Vec::new());
-
-thread_local! {
-    /// This thread's last submission: when it returned ([`now_us`]) and the
-    /// thread's processor time then (user, kernel).
-    static LEFT: std::cell::Cell<Option<(u64, u64, u64)>> = const { std::cell::Cell::new(None) };
-    /// The thread's processor time when its running submission was called.
-    static ENTERED: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-    /// List-call nanoseconds of this thread since its last submission.
-    static OURS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    /// List-call time not yet added to `RECORDERS` (nanoseconds, calls).
-    static UNSENT: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
-}
-
-fn thread_id() -> u32 {
-    // SAFETY: a plain query.
-    unsafe { windows_sys::Win32::System::Threading::GetCurrentThreadId() }
 }
 
 fn micros(t: windows_sys::Win32::Foundation::FILETIME) -> u64 {
     (u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime)) / 10
-}
-
-/// This thread's processor time so far (user, kernel), in microseconds.
-fn thread_times() -> (u64, u64) {
-    use windows_sys::Win32::Foundation::FILETIME;
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    let zero = FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
-    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
-    // SAFETY: our own thread and four valid out pointers.
-    unsafe { GetThreadTimes(GetCurrentThread(), &mut created, &mut exited, &mut kernel, &mut user) };
-    (micros(user), micros(kernel))
 }
 
 /// The process's processor time so far (user, kernel), in microseconds.
@@ -968,103 +573,41 @@ fn process_times() -> (u64, u64) {
     (micros(user), micros(kernel))
 }
 
-fn submitter(all: &mut Vec<(u32, Submitter)>, id: u32) -> &mut Submitter {
-    let at = match all.iter().position(|s| s.0 == id) {
-        Some(at) => at,
-        None => {
-            all.push((id, Submitter::default()));
-            all.len() - 1
+fn working_set() -> u64 { process_memory().0 }
+
+/// Our process's hard page faults so far (read from disk or the page
+/// file), from the system's process list: `HardFaultCount` at +0x10 of
+/// each entry, the process id at +0x50.
+fn hard_faults() -> u64 {
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn NtQuerySystemInformation(class: u32, info: *mut u8, len: u32, ret: *mut u32) -> i32;
+    }
+    const PROCESSES: u32 = 5;
+    let id = std::process::id() as usize;
+    let mut buf = vec![0u8; 4 << 20];
+    let mut ret = 0;
+    // SAFETY: a buffer of that length.
+    if unsafe { NtQuerySystemInformation(PROCESSES, buf.as_mut_ptr(), buf.len() as u32, &mut ret) } < 0 {
+        return 0;
+    }
+    let mut at = 0usize;
+    loop {
+        let entry = &buf[at..];
+        let next = u32::from_le_bytes(entry[0..4].try_into().unwrap_or_default()) as usize;
+        let pid = usize::from_le_bytes(entry[0x50..0x58].try_into().unwrap_or_default());
+        if pid == id {
+            return u64::from(u32::from_le_bytes(entry[0x10..0x14].try_into().unwrap_or_default()));
         }
-    };
-    &mut all[at].1
-}
-
-/// A list call on this thread that began at `started` has returned.
-pub(crate) fn recorded(started: std::time::Instant) {
-    let ns = started.elapsed().as_nanos() as u64;
-    add(C::RecordCalls, 1);
-    add(C::RecordNs, ns);
-    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
-    crate::framelog::add(crate::framelog::T::RecordNs, ns);
-    crate::framelog::here(crate::framelog::H::RecordNs, ns);
-    if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
-        let began = now_us().saturating_sub(ns / 1000);
-        add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
-    }
-    OURS.with(|o| o.set(o.get() + ns));
-    let (unsent, calls) = UNSENT.with(|u| u.get());
-    let (unsent, calls) = (unsent + ns, calls + 1);
-    // By thread, a couple of milliseconds at a time.
-    if unsent < 2_000_000 {
-        UNSENT.with(|u| u.set((unsent, calls)));
-        return;
-    }
-    UNSENT.with(|u| u.set((0, 0)));
-    if crate::framelog::on() {
-        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
-        if crate::framelog::on_slow_core() {
-            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        if next == 0 || at + next + 0x58 > buf.len() {
+            return 0;
         }
-    }
-    let id = thread_id();
-    let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
-    match all.iter_mut().find(|r| r.0 == id) {
-        Some(r) => (r.1, r.2) = (r.1 + unsent, r.2 + calls),
-        None => all.push((id, unsent, calls)),
+        at += next;
     }
 }
 
-/// A submission is called on this thread (before it waits for the
-/// submission lock).
-pub(crate) fn submission_begins() {
-    let now = now_us();
-    if !SUBMITTED_SINCE.load(Relaxed) && !SUBMITTED_SINCE.swap(true, Relaxed) {
-        add(C::UntilSubmitUs, now.saturating_sub(PRESENTED_AT.load(Relaxed)));
-    }
-    let (user, kernel) = thread_times();
-    ENTERED.with(|e| e.set((user, kernel)));
-    let ours = OURS.with(|o| o.replace(0));
-    if let Some((left, u, k)) = LEFT.with(|l| l.get()) {
-        let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
-        let s = submitter(&mut all, thread_id());
-        s.between += now.saturating_sub(left);
-        s.between_user += user.saturating_sub(u);
-        s.between_kernel += kernel.saturating_sub(k);
-        s.between_ours += ours;
-    }
-}
 
-/// The submission returns; it waited `lock` microseconds for the
-/// submission lock.
-pub(crate) fn submission_ends(lock: u64) {
-    let now = now_us();
-    SUBMITTED_AT.store(now, Relaxed);
-    let (user, kernel) = thread_times();
-    let (u, k) = ENTERED.with(|e| e.get());
-    LEFT.with(|l| l.set(Some((now, user, kernel))));
-    OURS.with(|o| o.set(0));
-    let mut all = SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner());
-    let s = submitter(&mut all, thread_id());
-    s.submissions += 1;
-    s.lock += lock;
-    s.inside_user += user.saturating_sub(u);
-    s.inside_kernel += kernel.saturating_sub(k);
-}
-
-/// The title calls its present (before our own copy to the window runs).
-pub(crate) fn present_begins() {
-    add(C::TailUs, now_us().saturating_sub(SUBMITTED_AT.load(Relaxed)));
-}
-
-/// A frame was presented.
-pub(crate) fn presented() {
-    add(C::Frames, 1);
-    PRESENTED_AT.store(now_us(), Relaxed);
-    RECORDED_SINCE.store(false, Relaxed);
-    SUBMITTED_SINCE.store(false, Relaxed);
-}
-
-fn page_faults() -> u64 {
+pub(crate) fn page_faults() -> u64 {
     use windows_sys::Win32::System::ProcessStatus::{
         K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
     };
@@ -1084,8 +627,6 @@ fn page_faults() -> u64 {
 /// second or more: a 4 s frame after an unlogged 4 s frame showed two
 /// frames' counts as one's).
 pub(crate) fn log(frames: f64) {
-    let counted = COUNT[C::Frames as usize].swap(0, Relaxed);
-    let frames = if counted > 0 { counted as f64 } else { frames };
     static FAULTS: AtomicU64 = AtomicU64::new(0);
     let faults = page_faults();
     let faults = faults - FAULTS.swap(faults, Relaxed).min(faults);
@@ -1099,8 +640,15 @@ pub(crate) fn log(frames: f64) {
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
          {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
          {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed",
+         unchanged; {:.1} fallbacks ({:.1} ms); {:.0} guard faults; textures {:.1} MB watched and \
+         changed, {:.1} MB hashed, {:.1} MB of them changed; watch time: kernel {:.1} ms, view queries {:.1} ms, protecting {:.1} ms; copied whole (not tracked) {:.1} MB in {:.1} ms; snapshots {:.1} MB in {:.1} ms; page faults {:.0} preparing, {:.0} copying back; {:.0} tracked pages marked through another mapping; \
+         guards: {:.2} ms in the handler, {:.0} protect calls for {:.0} pages, {:.0} pages opened; \
+         {:.0} tracked pages written ({:.0} of them the frame before too); change checks: {:.1} ms \
+         asking for other mappings, {:.1} ms waiting for the guard lock; preparing: {:.1} ms in \
+         refresh batches, steps (each with the batch it flushes): refresh {:.1} ms, copy {:.1} ms, \
+         work {:.1} ms, GPU writes {:.1} ms, textures {:.1} ms, heaps {:.1} ms, title memory {:.1} ms; \
+         heap texture uploads {:.1} ms, state preludes {:.1} ms, heap slots the title copied {:.1} ms ({:.0} slots), title threads waiting to write views {:.1} ms; copying back compared {:.1} MB          in {:.1} ms; marked pages: {:.0} compared, {:.1} MB written back in {:.1} ms, {:.0} kept the title's, {:.0} saved; working set {:.0} MB, \
+         {:.0} hard faults",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
@@ -1120,47 +668,63 @@ pub(crate) fn log(frames: f64) {
         mb(c[C::Checked as usize]),
         mb(c[C::Unchanged as usize]),
         c[C::Fallbacks as usize],
+        ms(c[C::FallbackUs as usize]),
         c[C::GuardFaults as usize],
         mb(c[C::TexWatched as usize]),
         mb(c[C::TexHashed as usize]),
         mb(c[C::TexChanged as usize]),
-    );
-    tracing::info!(
-        "recording per frame ({frames:.0} frames): {:.0} list calls {:.1} ms (all recording \
-         threads); {:.1} ms waiting for pipelines; dynamic slots: {:.0} tables asked, {:.0} \
-         refused, {:.1} ms searching; notes {:.1} ms; shader-written ranges: {:.0} steps in \
-         {:.1} submissions, snapshots {:.1} ms, {:.1} MB compared back; sparse reads {:.1} ms; \
-         guards {:.1} ms; {:.1} MB copied whole (memory not watched); {:.1} frame waits \
-         sleeping {:.1} ms (all threads); ranges of shaders that cannot store to buffers: \
-         {:.0} steps {:.1} MB left out",
-        c[C::RecordCalls as usize],
-        c[C::RecordNs as usize] / 1e6,
-        ms(c[C::PipelineWaitUs as usize]),
-        c[C::DynamicAsked as usize],
-        c[C::DynamicRefused as usize],
-        c[C::DynamicNs as usize] / 1e6,
-        c[C::NoteNs as usize] / 1e6,
-        c[C::GpuWrites as usize],
-        c[C::BackSubmissions as usize],
-        ms(c[C::SnapshotUs as usize]),
-        mb(c[C::BackCompared as usize]),
-        ms(c[C::SparseUs as usize]),
-        ms(c[C::GuardUs as usize]),
+        ms(c[C::KernelUs as usize]),
+        ms(c[C::ViewQueryUs as usize]),
+        ms(c[C::ProtectUs as usize]),
         mb(c[C::WholeBytes as usize]),
-        c[C::PaceWaits as usize],
-        ms(c[C::PaceUs as usize]),
-        c[C::GpuWritesLeftOut as usize],
-        mb(c[C::GpuWritesLeftOutBytes as usize]),
+        ms(c[C::WholeUs as usize]),
+        mb(c[C::SnapshotBytes as usize]),
+        ms(c[C::SnapshotUs as usize]),
+        c[C::FaultsPrep as usize],
+        c[C::FaultsBack as usize],
+        c[C::AliasMarks as usize],
+        ms(c[C::HandlerUs as usize]),
+        c[C::ProtectCalls as usize],
+        c[C::ProtectPages as usize],
+        c[C::OpenPages as usize],
+        c[C::WrittenPages as usize],
+        c[C::WrittenAgain as usize],
+        ms(c[C::AliasUs as usize]),
+        ms(c[C::GuardWaitUs as usize]),
+        ms(c[C::FlushUs as usize]),
+        ms(c[C::StepRefreshUs as usize]),
+        ms(c[C::StepCopyUs as usize]),
+        ms(c[C::StepWorkUs as usize]),
+        ms(c[C::StepGpuWriteUs as usize]),
+        ms(c[C::StepTextureUs as usize]),
+        ms(c[C::StepHeapUs as usize]),
+        ms(c[C::StepMemoryUs as usize]),
+        ms(c[C::UploadsUs as usize]),
+        ms(c[C::PreludeUs as usize]),
+        ms(c[C::SyncHeapsUs as usize]),
+        c[C::SyncSlots as usize],
+        ms(c[C::MirrorWaitUs as usize]),
+        mb(c[C::CompareBytes as usize]),
+        ms(c[C::CompareUs as usize]),
+        c[C::MarkedPages as usize],
+        mb(c[C::MarkedBytes as usize]),
+        ms(c[C::MarkedUs as usize]),
+        c[C::MarkedKept as usize],
+        c[C::SavedPages as usize],
+        working_set() as f64 / 1e6,
+        {
+            static HARD: AtomicU64 = AtomicU64::new(0);
+            let hard = hard_faults();
+            (hard - HARD.swap(hard, Relaxed).min(hard)) as f64 / frames
+        },
     );
-    let [together, written, mapped] =
-        [0, 1, 2].map(|n| crate::watch::ALIASES[n].load(std::sync::atomic::Ordering::Relaxed));
     tracing::info!(
-        "guards over several views of a page, since the start: {together} blocks guarded with their other views, \
-         {written} views opened by a write through another, {mapped} ranges opened because a view of them was mapped"
+        "additional work per frame: pipelines {:.1} ms waiting; dynamic tables {:.0} asked, {:.0} refused, {:.1} ms searching; sparse reads {:.1} ms; frame waits {:.1}, sleeping {:.1} ms",
+        ms(c[C::PipelineWaitUs as usize]),
+        c[C::DynamicAsked as usize], c[C::DynamicRefused as usize],
+        c[C::DynamicNs as usize] / 1e6,
+        ms(c[C::SparseUs as usize]), c[C::PaceWaits as usize], ms(c[C::PaceUs as usize]),
     );
-    // Where the wall clock of a frame goes: the phases of a frame, the
-    // processor time of the whole process, and what each submitting and
-    // recording thread did.
     static CPU: Mutex<(u64, u64)> = Mutex::new((0, 0));
     let (user, kernel) = process_times();
     let (user, kernel) = {
@@ -1169,174 +733,22 @@ pub(crate) fn log(frames: f64) {
         *last = (user, kernel);
         (spent.0 as f64 / 1e3 / frames, spent.1 as f64 / 1e3 / frames)
     };
-    tracing::info!(
-        "frame account per frame: after a present {:.1} ms until the first list call and {:.1} ms \
-         until the first submission; {:.1} ms from the last submission to the present call; \
-         lists reset in {:.1} ms; the process ran {user:.0} ms user + {kernel:.0} ms kernel on \
-         all threads; what shaders wrote: {:.1} ms finding {:.0} pieces that differ, {:.1} ms \
-         putting them back; texture uploads: {:.0} recorded, {:.0} left out; {:.1} held \
-         submissions run at the present with their waits not met; waits for memory values: \
-         {:.0} looks {:.1} ms; {:.0} host lists made {:.1} ms; {:.0} parts of held submissions \
-         ran alone that the next part could have run with",
-        ms(c[C::UntilRecordUs as usize]),
-        ms(c[C::UntilSubmitUs as usize]),
-        ms(c[C::TailUs as usize]),
-        c[C::ResetNs as usize] / 1e6,
-        ms(c[C::BackScanUs as usize]),
-        c[C::BackDiffer as usize],
-        ms(c[C::BackSyncUs as usize]),
-        c[C::TexUploads as usize],
-        c[C::TexSkipped as usize],
-        c[C::Forced as usize],
-        c[C::WaitChecks as usize],
-        c[C::WaitCheckNs as usize] / 1e6,
-        c[C::HostLists as usize],
-        c[C::HostListNs as usize] / 1e6,
-        c[C::PartsTogether as usize],
-    );
-    // What is copied whole, largest first: memory nobody tells us about.
-    let whole = WHOLE.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut whole: Vec<_> = whole.into_iter().flatten().collect();
-    whole.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
-    tracing::info!(
-        "  copied whole (memory not watched): {:.1} ms per frame in {} ranges; the largest follow",
-        ms(c[C::WholeUs as usize]),
-        whole.len()
-    );
-    for ((src, len), (n, us)) in whole.into_iter().take(6) {
-        tracing::info!(
-            "  copied whole from {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.2} ms/frame",
-            n as f64 / frames,
-            (len as u64 * n) as f64 / 1e6 / frames,
-            us as f64 / 1e3 / frames
-        );
-    }
-    // The waiting for the card: many short waits or a few long ones, how
-    // much of it is for submissions the title gets nothing back from, and
-    // the longest one.
-    let longest = std::mem::take(&mut *LONGEST.lock().unwrap_or_else(|e| e.into_inner()));
-    tracing::info!(
-        "  waiting for the card per frame: {:.1} submissions under 2 ms ({:.1} ms), {:.1} of 2-8 ms \
-         ({:.1} ms), {:.1} of 8-32 ms ({:.1} ms), {:.1} longer ({:.1} ms); {:.1} submissions hand \
-         nothing back to the title ({:.1} ms of the waiting); the longest since the last line: \
-         {:.1} ms, {}",
-        c[C::CardUnder2 as usize],
-        ms(c[C::CardUnder2Us as usize]),
-        c[C::Card2To8 as usize],
-        ms(c[C::Card2To8Us as usize]),
-        c[C::Card8To32 as usize],
-        ms(c[C::Card8To32Us as usize]),
-        c[C::CardOver32 as usize],
-        ms(c[C::CardOver32Us as usize]),
-        c[C::NothingBack as usize],
-        ms(c[C::NothingBackUs as usize]),
-        longest.0 as f64 / 1e3,
-        longest.1
-    );
-    let by = WAITS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut by: Vec<_> = by.into_iter().flatten().collect();
-    by.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
-    for (what, (n, us)) in by.into_iter().take(12) {
-        tracing::info!(
-            "  the card's time by what ran: {:.1} ms a frame in {:.1} submissions a frame: {}",
-            us as f64 / 1e3 / frames,
-            n as f64 / frames,
-            what.chars().take(700).collect::<String>()
-        );
-    }
-    let by = COMMANDS_BY_WORK.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut by: Vec<_> = by.into_iter().flatten().collect();
-    by.sort_by_key(|&(_, (_, us, _))| std::cmp::Reverse(us));
-    // All of them together, and by their first word: the forty lines below
-    // are the heaviest only (100 of 226 ms waited in run 102), and what the
-    // commands do not account for is the layer's own lists (the card
-    // copies' passes, preludes) and the waits themselves.
-    if !by.is_empty() {
-        let mut kinds: Vec<(String, u64, u64)> = Vec::new();
-        for (what, (n, us, _)) in &by {
-            let word = what.split(' ').next().unwrap_or("").to_owned();
-            match kinds.iter_mut().find(|k| k.0 == word) {
-                Some(k) => (k.1, k.2) = (k.1 + n, k.2 + us),
-                None => kinds.push((word, *n, *us)),
-            }
-        }
-        kinds.sort_by_key(|k| std::cmp::Reverse(k.2));
-        let all: u64 = kinds.iter().map(|k| k.2).sum();
-        let text: Vec<String> =
-            kinds.iter().map(|(word, n, us)| format!("{word} {:.1} ms in {:.0}", *us as f64 / 1e3 / frames, *n as f64 / frames)).collect();
-        tracing::info!(
-            "  the card's time by command (timing run), all {} kinds together: {:.1} ms a frame; by first word: {}",
-            by.len(),
-            all as f64 / 1e3 / frames,
-            text.join(", ")
-        );
-    }
-    for (what, (n, us, longest)) in by.into_iter().take(40) {
-        tracing::info!(
-            "  the card's time by command (timing run): {:.2} ms a frame in {:.1} commands a frame, the longest {:.2} ms: {what}",
-            us as f64 / 1e3 / frames,
-            n as f64 / frames,
-            longest as f64 / 1e3
-        );
-    }
-    tracing::info!(
-        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
-         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
-         out of the submissions' askings ahead: {:.0}",
-        c[C::WatchFailed as usize],
-        c[C::WatchKnownView as usize],
-        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
-    );
-    tracing::info!(
-        "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
-         for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \
-         such waits each); barrier experiment {}",
-        c[C::WaitsForGroups as usize],
-        c[C::WaitsForBuffers as usize],
-        c[C::IndirectBounded as usize],
-        barrier_test()
-    );
-    // What is compared after submissions, largest first, and how much of
-    // it shaders had written.
-    let compared = COMPARED.lock().unwrap_or_else(|e| e.into_inner()).take();
-    let mut compared: Vec<_> = compared.into_iter().flatten().collect();
-    compared.sort_by_key(|&((_, len), (n, _))| std::cmp::Reverse(len as u64 * n));
-    tracing::info!("  compared after submissions: {} ranges; the largest follow", compared.len());
-    for ((src, len), (n, written)) in compared.into_iter().take(8) {
-        tracing::info!(
-            "  compared {src:#x}+{len:#x}: {:.1}x/frame, {:.2} MB/frame, {:.3} MB/frame of it written back",
-            n as f64 / frames,
-            (len as u64 * n) as f64 / 1e6 / frames,
-            written as f64 / 1e6 / frames
-        );
-    }
-    let mut submitters = std::mem::take(&mut *SUBMITTERS.lock().unwrap_or_else(|e| e.into_inner()));
-    submitters.sort_by_key(|s| std::cmp::Reverse(s.1.submissions));
-    for (id, s) in submitters.into_iter().take(4) {
-        let per = |v: u64| v as f64 / 1e3 / frames;
-        tracing::info!(
-            "  thread {id} submitted {:.1}x/frame: between its submissions {:.1} ms (running \
-             {:.1} ms user + {:.1} ms kernel; {:.1} ms in list calls), in them running {:.1} ms \
-             user + {:.1} ms kernel, {:.1} ms waiting for the submission lock",
-            s.submissions as f64 / frames,
-            per(s.between),
-            per(s.between_user),
-            per(s.between_kernel),
-            s.between_ours as f64 / 1e6 / frames,
-            per(s.inside_user),
-            per(s.inside_kernel),
-            per(s.lock),
-        );
-    }
-    let mut recorders = std::mem::take(&mut *RECORDERS.lock().unwrap_or_else(|e| e.into_inner()));
-    recorders.sort_by_key(|r| std::cmp::Reverse(r.1));
-    let busiest: Vec<String> = recorders
+    tracing::info!("process CPU per frame: {user:.0} ms user + {kernel:.0} ms kernel across all threads");
+    log_memory();
+    let held: Vec<String> = crate::watch::held_times()
+        .iter()
+        .map(|(line, total, longest)| format!("watch.rs:{line} {:.1} ms (longest {longest:.1})", total / frames))
+        .collect();
+    tracing::info!("  guard lock held per frame: {}", held.join(", "));
+    let mut snapshots: Vec<((u64, u64), u64)> =
+        SNAPSHOTS.lock().unwrap_or_else(|e| e.into_inner()).take().into_iter().flatten().collect();
+    snapshots.sort_by_key(|&(_, bytes)| std::cmp::Reverse(bytes));
+    let snapshots: Vec<String> = snapshots
         .iter()
         .take(6)
-        .map(|r| format!("thread {} {:.0} ms in {:.0} calls", r.0, r.1 as f64 / 1e6 / frames, r.2 as f64 / frames))
+        .map(|((start, len), bytes)| format!("{start:#x}+{len:#x} {:.1} MB", *bytes as f64 / 1e6 / frames))
         .collect();
-    tracing::info!("  list calls by thread: {} threads; {}", recorders.len(), busiest.join(", "));
-    log_memory();
+    tracing::info!("  snapshots per frame by copy: {}", snapshots.join(", "));
     let ranges = RANGES.lock().unwrap_or_else(|e| e.into_inner()).take();
     let mut ranges: Vec<_> = ranges.into_iter().flatten().collect();
     ranges.sort_by_key(|&(_, (_, bytes, _, _))| std::cmp::Reverse(bytes));
@@ -1353,5 +765,87 @@ pub(crate) fn log(frames: f64) {
             bytes as f64 / 1e6 / frames,
             us as f64 / 1e3 / frames
         );
+    }
+}
+
+/// Bytes [`Counting`] has handed out and not taken back.
+pub(crate) static HEAP_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// Allocations of at least this many bytes name their caller, once per
+/// power-of-two size class (who holds the big blocks of our heap).
+const LARGE: usize = 32 << 20;
+
+/// Logs the stack of a large allocation of `size` bytes, the first of its
+/// size class.
+fn note_large(size: usize) {
+    static SEEN: std::sync::Mutex<u64> = std::sync::Mutex::new(0);
+    std::thread_local!(static INSIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+    let class = 1u64 << size.ilog2().min(63);
+    if INSIDE.with(|i| i.replace(true)) {
+        return;
+    }
+    let first = {
+        let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+        let first = *seen & class == 0;
+        *seen |= class;
+        first
+    };
+    if first {
+        let trace = std::backtrace::Backtrace::force_capture().to_string();
+        let frames: Vec<&str> = trace.lines().filter(|l| l.contains("victory")).take(24).collect();
+        tracing::info!(mb = size >> 20, "a large heap allocation (first of its size class): {}", frames.join(" | "));
+    }
+    INSIDE.with(|i| i.set(false));
+}
+
+#[cfg(test)]
+mod own_tests {
+    use super::{OWN, block_class};
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn blocks_count_in_their_size_class() {
+        assert_eq!(block_class(0), 0);
+        assert_eq!(block_class(4095), 0);
+        assert_eq!(block_class(4096), 1);
+        assert_eq!(block_class(65535), 1);
+        assert_eq!(block_class(65536), 2);
+        assert_eq!(block_class((1 << 20) - 1), 2);
+        assert_eq!(block_class(1 << 20), 3);
+    }
+
+    /// A block of 32 MiB or more is listed by its size while it lives.
+    #[test]
+    fn big_blocks_are_listed_while_they_live() {
+        let size = (48usize << 20) + 4096;
+        let listed = |at: usize, size: usize| {
+            super::BIG_AT
+                .iter()
+                .zip(&super::BIG_BYTES)
+                .any(|(place, bytes)| place.load(Relaxed) == at && bytes.load(Relaxed) == size as u64)
+        };
+        let mut block = vec![0u8; size];
+        let at = block.as_ptr() as usize;
+        assert!(listed(at, size));
+        assert!(super::HEAP_BYTES.load(Relaxed) >= size as u64);
+        assert!(super::big_blocks().contains("48.00"));
+        block.reserve_exact(size);
+        let (at, size) = (block.as_ptr() as usize, block.capacity());
+        assert!(listed(at, size), "reallocation updates the live block");
+        assert!(super::HEAP_BYTES.load(Relaxed) >= size as u64);
+        drop(block);
+        assert!(!listed(at, size));
+    }
+
+    /// A big block shows in the counters while it lives (other tests
+    /// allocate small blocks meanwhile: only the big class is looked at,
+    /// and only for at least this block).
+    #[test]
+    fn a_block_is_counted_while_it_lives() {
+        let block = vec![1u8; 8 << 20];
+        assert!(OWN[3].load(Relaxed) >= 8 << 20);
+        assert!(OWN[7].load(Relaxed) >= 1);
+        drop(block);
+        assert!(OWN[7].load(Relaxed) < u64::MAX / 2, "no count below zero");
     }
 }

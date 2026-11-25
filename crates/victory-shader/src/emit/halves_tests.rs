@@ -107,6 +107,7 @@ fn probe(body: &[u32], dynamic: bool) -> (Vec<(u8, u32)>, Vec<TestCall>) {
         outputs: vec![],
         prims: vec![],
         mesh_stride: 0,
+        view_marks: false,
     };
     let bad = HashMap::new();
     let mut lower = Lower::new(&parts, &bad);
@@ -138,8 +139,8 @@ fn typed_properties(calls: &[TestCall], kind: u32) -> Vec<u32> {
 fn pure_fixed_d16_load_and_store_keep_integer_views_and_operations() {
     let body = [
         &buffer(0x83, 1, 8)[..], // load d16 xyzw
-        &buffer(0x87, 1, 12),   // store d16 xyzw
-        &[vop1(1, 7, 10)],     // read descriptor record count, exercising property selection
+        &buffer(0x87, 1, 12),    // store d16 xyzw
+        &[vop1(1, 7, 10)],       // read descriptor record count, exercising property selection
     ]
     .concat();
     let (views, calls) = probe(&body, false);

@@ -54,8 +54,13 @@ pub const LOADS: u32 = 16;
 pub const FIRST: u32 = 32;
 /// The passes over the module.
 pub const MODULE: u32 = DEAD | FOLD | REUSE | FACTS | LOADS;
-/// Every pass.
-pub const ALL: u32 = MODULE | FIRST;
+/// Batch dwords of one raw scalar/global load into calls of up to four.
+/// This is a lowering choice, not a pass over the module.
+pub const WIDE: u32 = 64;
+/// Every pass, including the opt-in wide-load experiment.
+pub const ALL: u32 = MODULE | FIRST | WIDE;
+/// Preserve the existing defaults until wide loads show a measured benefit.
+pub const DEFAULT: u32 = ALL & !WIDE;
 
 /// What the instructions a module writes use, of the features a shader
 /// declares by flag (the validator's "flags must match usage").
