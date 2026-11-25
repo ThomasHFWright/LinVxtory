@@ -2,3 +2,6 @@
 * text=auto eol=lf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+
+# Empty context lines in unified source patches carry a single space.
+docs/runtime/*.patch.txt whitespace=-blank-at-eol,-blank-at-eof

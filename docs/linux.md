@@ -4,6 +4,44 @@ LinVictory follows current fxceless/victory-fork rendering work, pinned initiall
 to `0b0074e0b2765e574c622e9a3de566f20f04135b`. Older debug-rendering experiments
 are archived; they are not the active source base.
 
+## Latest local result — 2026-11-25
+
+Normal in-world visuals are verified: textured characters, floor geometry and
+lighting. Interactive gameplay is not yet verified; some character detail is
+missing and observed frame rates vary substantially (roughly 0.1–1.4 fps).
+
+The exact code-table change from [PR1006](https://github.com/fxceless/victory-fork/pull/1006)
+at `4e7af7b01356417864b935bd1fffc7d0dece266f` was the change between two trials
+using the same app/runtime corrections. The preceding build hit Xid 13 at
+world entry after 131 seconds. The new build ran for 583.74 seconds without
+an NVIDIA Xid, then exited with a title breakpoint (`0x80000003`). This is
+progress past the earlier GPU failure, not a claim of complete stability.
+
+Captured production shader tables shrank from 18,368 to 632 bytes and from
+16,640 to 616 bytes; the retained values exactly match their original trailing
+data. The trial used normal shaders, default loop limits, the watchdog hook
+and Vulkan core/synchronization validation. Existing local fixes include
+per-subresource texture states, null-CBV metadata and runtime allocator/null-CBV
+corrections. These were also present in the immediately preceding failed run.
+
+Validation: native shader suite **179 passed / 2 ignored**; Windows shader suite
+**225 passed / 1 known stub-pipeline failure / 3 ignored**; GPU suite after the
+state/null-CBV work **193 passed / 4 known failures / 7 ignored**. Diagnostic
+build and all-target/all-feature Clippy pass. Restoring the old table-start
+rule makes the new regression fail. [Aggregate results posted upstream](https://github.com/fxceless/victory-fork/pull/1006#issuecomment-7168360845).
+
+The imported optimization assumes dynamic code-relative reads target trailing
+data. A synthetic embedded-data case exposes a limitation; a conservative gap
+guard also prevented trimming a real shader because of an unreachable NOP.
+That guard is not enabled. The current implementation retains the tested PR's
+behaviour, with its helper/tests in a separate module to meet the file-size
+policy. Stronger address-bound analysis is still needed to generalize it.
+
+The sections below retain earlier checkpoints and their original limitations.
+
+For the exact external runtime revisions, source patches and build settings, see
+[the runtime recipe](linux-runtime.md).
+
 ## Compatibility changes
 
 - [PR20](https://github.com/fxceless/victory-fork/pull/20): runtime HLSL falls

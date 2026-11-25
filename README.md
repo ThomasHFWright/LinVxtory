@@ -21,10 +21,13 @@ normal gameplay. Performance work comes after visible, functioning scenes.
 
 ## Current Linux status
 
-**Linux gameplay is not yet verified.** The current build boots and reaches world
-loading, but our first run on this base hit an NVIDIA GPU memory fault before
-we verified scene geometry. See [Linux validation](docs/linux.md) for the tested
-runtime, passing checks and known failures.
+**Normal in-world visuals now render on Linux; interactive gameplay is not yet
+verified.** A local integration of the code-table fix in
+[PR1006](https://github.com/fxceless/victory-fork/pull/1006) produced textured
+characters, floor geometry and lighting on an RTX 5090. The run lasted 9 minutes
+44 seconds without the previous NVIDIA Xid fault, then ended with a title
+assertion. Rendering remains incomplete and very slow. See
+[Linux validation](docs/linux.md) for the exact scope, runtime and checks.
 
 The active branch is `linux-edge`, initially based on fxceless/victory-fork
 [`0b0074e`](https://github.com/fxceless/victory-fork/commit/0b0074e0b2765e574c622e9a3de566f20f04135b)
@@ -46,6 +49,8 @@ The executable remains `victory.exe`.
   [victory-fork PR846](https://github.com/fxceless/victory-fork/pull/846).
 - **ryotdev:** initialized/root UAV test support adapted from
   [victory-fork PR33](https://github.com/fxceless/victory-fork/pull/33).
+- **desplmfao:** the original code-table trimming fix; **OctoAlgo:** its Proton
+  investigation and port in [victory-fork PR1006](https://github.com/fxceless/victory-fork/pull/1006).
 - **jtrudeau1530:** reports of Linux memory-range and descriptor synchronization
   issues that informed independently implemented fixes here.
 
