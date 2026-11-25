@@ -26,9 +26,9 @@ pub(crate) struct HostHeap {
     sampler: bool,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
-    /// A fingerprint of the record each slot held when the pass over
-    /// records copied in as bytes last looked at it
-    /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
+    /// Fingerprints of records synchronized by the copied-record pass;
+    /// 0 means invalid. Mutations invalidate and publish under `made`,
+    /// taking `copied` second. Page scans release `copied` before mirroring.
     copied: Mutex<Vec<u64>>,
     /// The host resource each slot views, held while the slot does: shaders
     /// index heaps directly, so a slot the title has not rewritten since it
@@ -1449,6 +1449,10 @@ impl HostHeap {
     /// Makes host slot `index` null again, as it is before its view is
     /// made: a null view of the kind it held.
     fn unmake(&self, made: &mut [u64], index: u32) {
+        self.forget_copied(index);
+        if let Some(stamp) = self.tabled.get(index as usize) {
+            stamp.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
@@ -1834,42 +1838,59 @@ impl HostHeap {
         if index >= self.count {
             return false;
         }
-        // A slot draws read through a table lately is left to its draws,
-        // as the passes over slots picked by index leave it
-        // (`texture_slots_remapped`, `slots_written_under`): the title
-        // writes its per-draw tables into the same heap every frame, and
-        // each draw makes what its table shows in a slot of its own. Those
-        // were most of the 26,000 to 43,000 records a frame this pass
-        // mirrored in run 200 and in the play session after it, each then
-        // made and brought up to date once more by the pass over buffer
-        // views (some 50 ms a frame). `VICTORY_HEAP_SYNC_TABLES=1`: they
-        // are mirrored too, as in run 200.
-        if !sync_tables() && self.tabled_lately(index, crate::frame::current()) {
-            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(header) = copied_header(record) else {
+            return false;
+        };
+        let print = record_print(record) | 1;
+        if self
+            .copied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(index as usize)
+            .is_some_and(|&last| last == print)
+        {
             return false;
         }
-        let n = record.len();
-        // Never 0, which is "never looked at". (A multiply-and-fold over
-        // the record's words: BLAKE3 here was most of the 35 to 42 ms a
-        // frame this pass took over some 250,000 to 300,000 records, run
-        // 200.)
-        let print = record_print(record) | 1;
-        {
-            let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
-            if copied.is_empty() {
-                copied.resize(self.count as usize, 0);
-            }
-            let Some(last) = copied.get_mut(index as usize) else {
-                return false;
-            };
-            // A slot never looked at that holds nothing: as it was.
-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
-                return false;
-            }
-            *last = print;
+        self.apply_copied(index, handle, header, print)
+    }
+
+    /// Apply the captured header, then publish its fingerprint under the
+    /// same lock that serializes API writes and invalidation of host slots.
+    fn apply_copied(&self, index: u32, handle: u64, header: [u32; 3], print: u64) -> bool {
+        let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        let [tag, i, generation] = header;
+        let key = u64::from(generation) << 32 | u64::from(i);
+        // A historical table mark says nothing about a replacement record.
+        // Only an actual read of the texture still installed can save work.
+        let tabled = !sync_tables()
+            && self.tabled_stamp(index) & TABLED_READ != 0
+            && self.tabled_lately(index, crate::frame::current())
+            && made[index as usize] == key
+            && tag == VIEW_TAG
+            && view_at(i, generation).as_ref().is_some_and(is_texture_view);
+        if tabled {
+            COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        } else {
+            self.mirror_record(&mut made, index, handle, header, false);
         }
-        self.mirror(index, handle, false);
-        true
+        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+        if copied.is_empty() {
+            copied.resize(self.count as usize, 0);
+        }
+        copied[index as usize] = print;
+        !tabled
+    }
+
+    /// Called under `made`; never acquire `made` while holding `copied`.
+    fn forget_copied(&self, index: u32) {
+        if let Some(last) = self
+            .copied
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(index as usize)
+        {
+            *last = 0;
+        }
     }
 
     /// [`HostHeap::mirror_copied`] for every record of one changed page of
@@ -1878,15 +1899,8 @@ impl HostHeap {
     /// the bytes read from title address `from` on. Returns the records
     /// looked at and those mirrored.
     ///
-    /// The same records are mirrored as one by one. What differs is the
-    /// work for the others, which are nearly all of them (some 330,000
-    /// looked at a frame for 14,000 mirrored, 16 ms, run 225): the lock of
-    /// the fingerprints is taken once for the page and not once for each
-    /// record, and a record whose fingerprint is the one last seen is done
-    /// with before the question whether its slot was a table's lately. So
-    /// the count of slots "left to the draws" is now of records that
-    /// changed, not of every record on the page. The slots to mirror are
-    /// made after the page's walk, in slot order as before.
+    /// Compare fingerprints under one lock per page. Changed records carry
+    /// their captured headers out of the scan; never reread live title bytes.
     pub(crate) fn mirror_copied_page(
         &self,
         slots: std::ops::Range<u64>,
@@ -1894,9 +1908,8 @@ impl HostHeap {
         from: usize,
         page: &[u8],
     ) -> (u64, u64) {
-        let (frame, tables) = (crate::frame::current(), sync_tables());
         let mut looked = 0u64;
-        let mut due: Vec<(u32, u64)> = Vec::new();
+        let mut due = Vec::new();
         {
             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
             if copied.is_empty() {
@@ -1919,25 +1932,21 @@ impl HostHeap {
                 };
                 // Never 0, which is "never looked at".
                 let print = record_print(record) | 1;
-                // The record last seen, or a slot never looked at that
-                // holds nothing: as it was.
-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
+                // Only a synchronized record can bypass the slot lifecycle.
+                // An unseen zero record may be clearing an API-written slot.
+                if *last == print {
                     continue;
                 }
-                // A table's slot lately: left to its draws, and looked at
-                // again next time.
-                if !tables && self.tabled_lately(index as u32, frame) {
-                    COPIED_TABLED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    continue;
+                if let Some(header) = copied_header(record) {
+                    due.push((index as u32, handle, header, print));
                 }
-                *last = print;
-                due.push((index as u32, handle));
             }
         }
-        for &(index, handle) in &due {
-            self.mirror(index, handle, false);
+        let mut mirrored = 0;
+        for (index, handle, header, print) in due {
+            mirrored += u64::from(self.apply_copied(index, handle, header, print));
         }
-        (looked, due.len() as u64)
+        (looked, mirrored)
     }
 
     /// Makes host slot `index` from the record the title has at `handle`
@@ -1960,31 +1969,53 @@ impl HostHeap {
             return None;
         }
         // SAFETY: the handle is a descriptor slot in title memory.
-        let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
-        // Generations start at 1, so a made slot's key is never 0.
-        let key = u64::from(generation) << 32 | u64::from(i);
+        let header = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        self.mirror_record(&mut made, index, handle, header, for_draw)
+    }
+
+    fn mirror_record(
+        &self,
+        made: &mut [u64],
+        index: u32,
+        handle: u64,
+        [tag, i, generation]: [u32; 3],
+        for_draw: bool,
+    ) -> Option<View> {
+        let key = u64::from(generation) << 32 | u64::from(i);
+        // API writes supersede the copied record even if the host slot is
+        // still deferred. Draws preserving the same installed view do not.
+        if !for_draw || tag != VIEW_TAG || made[index as usize] != key {
+            self.forget_copied(index);
+        }
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
+            self.forget_copied(index);
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
                 self.make_null(index);
-                let _ = self.note_buffer(index, None, false);
-            } else if for_draw {
-                // Left for later and stale since: out of the sets and the stride table.
-                let _ = self.note_buffer(index, None, false);
             }
+            if let Some(stamp) = self.tabled.get(index as usize) {
+                stamp.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+            // A deferred buffer has made == 0 but still owns bookkeeping.
+            let _ = self.note_buffer(index, None, false);
             return None;
         };
+        if !is_texture_view(&view) || (!for_draw && made[index as usize] != key) {
+            if let Some(stamp) = self.tabled.get(index as usize) {
+                stamp.store(0, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         if made[index as usize] != key {
             // Views of other textures in the memory this one describes
             // are stale: their host slots read nothing from here on, and
             // let go of the host copies they held.
             for stale in self.note_buffer(index, Some(&view), for_draw) {
                 if stale != index {
-                    self.unmake(&mut made, stale);
+                    self.unmake(made, stale);
                 }
             }
             // A view of a texture object that has no host copy yet waits
@@ -2258,6 +2289,14 @@ fn sync_tables() -> bool {
 /// Since the last frame line: slots on changed heap pages that
 /// [`HostHeap::mirror_copied`] left to their draws (tables' slots).
 pub(crate) static COPIED_TABLED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Decode only from the snapshot whose fingerprint is being cached.
+fn copied_header(record: &[u8]) -> Option<[u32; 3]> {
+    let bytes: &[u8; 12] = record.get(..12)?.try_into().ok()?;
+    Some(std::array::from_fn(|i| {
+        u32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap())
+    }))
+}
 
 /// A 64-bit fingerprint of a descriptor record's bytes (16 or 32 of them):
 /// equal records give equal prints, and two different records the same
@@ -3799,5 +3838,255 @@ mod own_copy_tests {
         assert_eq!(own_bytes_if(true, 8, base, 2, 0, 32, 32, true), None);
         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+    }
+}
+
+#[cfg(test)]
+mod copied_record_tests {
+    use super::*;
+    use crate::descriptor::{self, HeapDesc, Placement};
+    use crate::object::{S_OK, This};
+
+    // Registered heaps exercise Create*View -> descriptor::mirror as well
+    // as both copied-record entry points. No command lists are submitted.
+    struct HeapFixture(This);
+
+    impl HeapFixture {
+        fn new(sampler: bool) -> Self {
+            #[repr(C)]
+            struct Extended(HeapDesc, Placement);
+            let desc = Extended(
+                HeapDesc {
+                    kind: u32::from(sampler),
+                    count: 4,
+                    flags: 1,
+                    nodes: 1,
+                },
+                Placement {
+                    address: 0,
+                    size: 0,
+                },
+            );
+            let mut heap = std::ptr::null();
+            assert_eq!(
+                descriptor::create_heap(
+                    std::ptr::null(),
+                    &desc.0,
+                    &descriptor::HEAP_IIDS[0],
+                    &mut heap
+                ),
+                S_OK
+            );
+            let fixture = Self(heap);
+            fixture.host(); // Require a host adapter (WARP is sufficient).
+            fixture
+        }
+
+        fn host(&self) -> &HostHeap {
+            descriptor::heap(self.0)
+                .host()
+                .expect("copied-record tests require a D3D12 adapter")
+        }
+
+        fn handle(&self, index: u32) -> u64 {
+            descriptor::heap(self.0).handle(index).unwrap()
+        }
+
+        fn write(&self, index: u32, record: &[u8]) {
+            // SAFETY: fixture records fit their allocated descriptor slots.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    record.as_ptr(),
+                    self.handle(index) as *mut u8,
+                    record.len(),
+                )
+            };
+        }
+
+        fn sync(&self, page: bool, index: u32, record: &[u8]) -> bool {
+            let handle = self.handle(index);
+            if page {
+                let step = if self.host().sampler { 16 } else { 32 };
+                let (looked, made) = self.host().mirror_copied_page(
+                    u64::from(index)..u64::from(index) + 1,
+                    (descriptor::heap(self.0).start, step),
+                    handle as usize,
+                    record,
+                );
+                assert_eq!(looked, 1);
+                made != 0
+            } else {
+                self.host().mirror_copied(index, handle, record)
+            }
+        }
+
+        fn key(&self, index: u32) -> u64 {
+            self.host().made.lock().unwrap()[index as usize]
+        }
+    }
+
+    impl Drop for HeapFixture {
+        fn drop(&mut self) {
+            descriptor::release(self.0);
+        }
+    }
+
+    fn bytes<const N: usize>(words: [u32; N]) -> Vec<u8> {
+        words.into_iter().flat_map(u32::to_le_bytes).collect()
+    }
+
+    fn key(record: &[u8]) -> u64 {
+        let i = u32::from_le_bytes(record[4..8].try_into().unwrap());
+        let generation = u32::from_le_bytes(record[8..12].try_into().unwrap());
+        u64::from(generation) << 32 | u64::from(i)
+    }
+
+    const SAMPLER_A: [u32; 13] = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+    const SAMPLER_B: [u32; 13] = [21, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
+
+    #[test]
+    fn copied_records_follow_api_writes_and_zeroing() {
+        let mut source = [0u32; 4];
+        descriptor::create_sampler(std::ptr::null(), &SAMPLER_A, source.as_mut_ptr() as u64);
+        let a = bytes(source);
+        for page in [false, true] {
+            let heap = HeapFixture::new(true);
+            // raw A -> API B -> raw A must install A, not deduplicate it.
+            heap.write(0, &a);
+            assert!(heap.sync(page, 0, &a));
+            assert_eq!(heap.key(0), key(&a));
+            heap.host().mirror(0, heap.handle(0), true);
+            assert!(
+                !heap.sync(page, 0, &a),
+                "unchanged installed record stays fast"
+            );
+            descriptor::create_sampler(std::ptr::null(), &SAMPLER_B, heap.handle(0));
+            assert_ne!(heap.key(0), key(&a));
+            heap.write(0, &a);
+            assert!(heap.sync(page, 0, &a));
+            assert_eq!(heap.key(0), key(&a));
+
+            // API-only population has no copied fingerprint yet.
+            descriptor::create_sampler(std::ptr::null(), &SAMPLER_A, heap.handle(1));
+            assert_eq!(heap.key(1), key(&a));
+            let zero = [0u8; 16];
+            heap.write(1, &zero);
+            assert!(heap.sync(page, 1, &zero));
+            assert_eq!(heap.key(1), 0);
+            assert!(!heap.sync(page, 1, &zero));
+        }
+    }
+
+    #[test]
+    fn copied_records_install_the_fingerprinted_snapshot() {
+        let mut source = [0u32; 4];
+        descriptor::create_sampler(std::ptr::null(), &SAMPLER_A, source.as_mut_ptr() as u64);
+        let a = bytes(source);
+        descriptor::create_sampler(std::ptr::null(), &SAMPLER_B, source.as_mut_ptr() as u64);
+        let b = bytes(source);
+        assert_ne!(key(&a), key(&b));
+        for page in [false, true] {
+            let heap = HeapFixture::new(true);
+            heap.write(0, &b); // The live slot changed after A was captured.
+            assert!(heap.sync(page, 0, &a));
+            assert_eq!(
+                heap.key(0),
+                key(&a),
+                "do not install live B while caching A"
+            );
+            heap.write(0, &a);
+            assert!(!heap.sync(page, 0, &a));
+            assert_eq!(heap.key(0), key(&a));
+            heap.write(0, &b);
+            assert!(heap.sync(page, 0, &b));
+            assert_eq!(heap.key(0), key(&b));
+        }
+    }
+
+    #[test]
+    fn copied_records_repair_repurposed_table_slots_and_unmade_views() {
+        let null = std::ptr::null();
+        // Distinct synthetic null texture SRVs; no title data is needed.
+        let texture_a = [28, 4, 5768, 0, 0, 1, 0, 0, 0, 0];
+        let texture_b = [28, 4, 5768, 0, 0, 2, 0, 0, 0, 0];
+        let mut source = [0u32; 8];
+        descriptor::create_srv(
+            null,
+            std::ptr::null_mut(),
+            &texture_a,
+            source.as_mut_ptr() as u64,
+        );
+        let a = bytes(source);
+        descriptor::create_srv(
+            null,
+            std::ptr::null_mut(),
+            &texture_b,
+            source.as_mut_ptr() as u64,
+        );
+        let b = bytes(source);
+        let resource = [1, 0, 0, 0, 256, 0, 1, 0x1_0001, 0, 1, 0, 1, 0, 0];
+        let buffer_desc = [0, 1, 5768, 0, 0, 0, 4, 16, 0, 0, 0, 0x6f, 0, 0, 0, 0];
+        descriptor::create_placed_srv(null, &resource, &buffer_desc, source.as_mut_ptr() as u64);
+        let buffer = bytes(source);
+        for page in [false, true] {
+            let heap = HeapFixture::new(false);
+            let host = heap.host();
+            let stride = |index: usize| {
+                let (_, _, data) = host.strides.as_ref().expect("stride table");
+                // SAFETY: the fixture owns a mapped stride table with four slots.
+                unsafe { (*data as *const u32).add(index).read_volatile() }
+            };
+            descriptor::create_srv(null, std::ptr::null_mut(), &texture_a, heap.handle(0));
+            host.texture_slot_tabled(0, true);
+            heap.write(0, &buffer);
+            assert!(heap.sync(page, 0, &buffer));
+            assert!(host.buffer_slots().contains(&0));
+            assert!(host.buffer_changes().contains(&0));
+            assert_eq!(stride(0), 16);
+            assert_eq!(host.tabled_stamp(0), 0);
+            assert_eq!(heap.key(0), 0, "buffer creation remains deferred");
+            assert!(!heap.sync(page, 0, &buffer));
+            assert!(host.buffer_changes().is_empty());
+            // A deferred buffer has no made key, but zeroing must clear it.
+            let zero = [0u8; 32];
+            heap.write(0, &zero);
+            assert!(heap.sync(page, 0, &zero));
+            assert!(!host.buffer_slots().contains(&0));
+            assert!(host.buffer_changes().contains(&0));
+            assert_eq!(stride(0), 0);
+
+            // Membership alone and an actual old read both fail to justify
+            // skipping a replacement texture that is now read only by index.
+            for (index, read) in [(1, false), (2, true)] {
+                descriptor::create_srv(null, std::ptr::null_mut(), &texture_a, heap.handle(index));
+                host.texture_slot_tabled(index, read);
+                heap.write(index, &b);
+                assert!(heap.sync(page, index, &b));
+                assert_eq!(heap.key(index), key(&b));
+                assert_eq!(host.tabled_stamp(index), 0);
+                assert!(
+                    host.texture_slots_due(crate::frame::current(), 8)
+                        .0
+                        .iter()
+                        .any(|&(slot, _)| slot == index)
+                );
+                assert!(!heap.sync(page, index, &b));
+            }
+
+            // Keep the shortcut for the exact texture a draw made/read.
+            descriptor::create_srv(null, std::ptr::null_mut(), &texture_a, heap.handle(3));
+            host.texture_slot_tabled(3, true);
+            assert_eq!(heap.sync(page, 3, &a), sync_tables() || !tabled_out());
+            assert_eq!(heap.key(3), key(&a));
+            assert!(!heap.sync(page, 3, &a));
+            // A texture made null by invalidation must be remade even when
+            // the next captured bytes equal its old fingerprint.
+            assert!(host.texture_slot_gone(3));
+            assert_eq!(heap.key(3), 0);
+            assert_eq!(host.tabled_stamp(3), 0);
+            assert!(heap.sync(page, 3, &a));
+            assert_eq!(heap.key(3), key(&a));
+            assert!(!heap.sync(page, 3, &a));
+        }
     }
 }
