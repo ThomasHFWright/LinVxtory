@@ -139,4 +139,12 @@ lowering while retaining the tests makes all three families fail at the first
 crossing x2 case: loads read the wrong mapping, and stores change a canary.
 The fixture uses gomeaw's validation cases and ryotdev's initialized/root UAV
 support; hardware selection is adapted for Linux. No title data is used.
-Clippy and the Windows build pass. Gameplay impact remains to be tested.
+Clippy and the Windows build pass. The game trial still hit an NVIDIA Xid 13/MMU
+fault after approximately 127 seconds. A separate comparison with the relay
+turned off (`VICTORY_RELAY=0`, synchronous submission/copy-back) also faulted,
+after approximately 136 seconds. The suspected crash region in both included
+the same small texture-processing compute shader. No normal world geometry
+was verified; the page-transfer correction has not resolved gameplay.
+
+The Linux synthetic validation and its limitations are posted on
+[the existing PR](https://github.com/fxceless/victory-fork/pull/846#issuecomment-7165765806).
