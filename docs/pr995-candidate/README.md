@@ -2,9 +2,13 @@
 
 This kit reconstructs the source of the tested standalone candidate from
 public [PR995](https://github.com/fxceless/victory-fork/pull/995), pinned at
-`7406afbbd9cef0dcddef0b0a23b4855437715eb5`. This is the default renderer for LinVxtory.
+`7406afbbd9cef0dcddef0b0a23b4855437715eb5`. The tested three-PR renderer adds the PR1722 cache fix, the PR2026 CPU detile port and the PR2398 whole-row mesh port to the frozen Linux baseline.
 
-LinVictory's RTX 5090 test created all four previously failing compute pipelines
+The final tree is `cc6e33fe99572a2d433e82a49e8429678b70ca5a`. Its 190 locked inputs reproduce the source of the executable on which mouth movement was observed. [Source verification and tested executable digest](validation.md#updated-source-verification)
+
+## Historical PR995 Linux baseline
+
+Before PR1722, LinVictory's RTX 5090 test created all four previously failing compute pipelines
 and reached the rendered room. Two windows using the same checkpoint measured:
 
 | Elapsed window | Presents / measured seconds | Candidate FPS | Published baseline FPS |
@@ -20,10 +24,9 @@ observed. Over nearly 25 minutes following world load, the renderer delivered
 
 Opposite controller inputs turned the camera from the window to the bunks and
 back. Holding the mapped left trigger at the tutorial changed the view and
-advanced its instruction. Releasing it restored the original prompt. Walking
-remains unverified, and some lighting, hair and surfaces render incorrectly.
+advanced its instruction. Releasing it restored the original prompt. Walking was unverified in that baseline run, and some lighting, hair and surfaces render incorrectly.
 
-Frozen executable SHA256:
+Historical PR995 executable SHA-256:
 `c24b8578d2a8d51882f2d2c3b5b983383e85235d8a9d7d0758aa4b131d203403`.
 The matching PDB digest and all 188 selected build-input digests are in
 [source-lock.json](source-lock.json). Reconstruction verified every selected
@@ -33,26 +36,20 @@ byte claim: build paths and compiler/linker metadata can differ.
 
 ## Reconstruct and build
 
-Use a fresh checkout of the public repository at the pinned commit, outside
-this repository and all game/cache/data folders. Obtain dependencies before
-entering the offline build environment; this kit does not fetch anything.
-With the checkout already at the exact commit:
+From the repository root, give the wrapper one external source directory.
+Use a new path, a clean checkout at the pinned commit, the reconstructed Linux
+baseline or the finished three-PR source. Keep this directory outside game,
+cache and data folders. Configure the toolchain and cache dependencies before
+building offline.
 
 ```sh
-kit=/absolute/path/to/this/kit
-candidate=/absolute/path/to/fresh/public-pr995-checkout
-
-test "$(git -C "$candidate" rev-parse HEAD)" = 7406afbbd9cef0dcddef0b0a23b4855437715eb5
-test -z "$(git -C "$candidate" status --porcelain)"
-git -C "$candidate" apply --check --unidiff-zero "$kit/candidate.patch.txt"
-git -C "$candidate" apply --unidiff-zero "$kit/candidate.patch.txt"
-sh "$kit/verify.sh" "$candidate"
-cd "$candidate"
-export CARGO_TARGET_DIR=/absolute/path/to/private-pr995-target
-export CARGO_BUILD_JOBS=2
-cargo build -p victory --profile diag --features diagnostics \
-  --target x86_64-pc-windows-msvc --offline --locked
+sh build.sh "../linvxtory-renderer"
 ```
+
+To verify the finished source without building, run
+`sh docs/pr995-candidate/verify.sh "../linvxtory-renderer"`. The wrapper
+uses the original 188-input lock before applying the three-PR delta, then
+checks all 190 final inputs before invoking Cargo.
 
 The zero-context patch deliberately excludes untouched upstream text; use
 `--unidiff-zero` only after checking the pinned clean base. All patch content is
@@ -75,38 +72,89 @@ CPU regression command (no GPU):
 cargo test -p victory-shader --lib --all-features --offline --locked
 ```
 
-The frozen source passed 187 native shader tests, with two ignored, including
+The historical PR995 source passed 187 native shader tests, with two ignored, including
 code-table boundaries, paired-wave guards and retained host annotations. Further GPU/title validation is separate from source reconstruction. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
 
-## Optional PR927 facial-animation build
+## PR1722 host pipeline library
 
-To build the PR995 renderer with the half-precision buffer fix, first reconstruct
-the frozen source and run `verify.sh` above. Then apply this additional patch
-from the same kit and rebuild with the same diagnostics features and preset.
+Impre-visible’s PR passes a null pointer and zero bytes to
+`CreatePipelineLibrary` when starting an empty library. vkd3d-proton rejects
+the non-null pointer from an empty Rust slice. PR995 keeps its existing
+nonempty-blob load and locking code. Upstream had already taken the locking
+change by the final PR head, `ee84a44859d4384ea5b945fa59e09ad9f9ac8d61`.
+[Upstream diff](https://github.com/Marvisak/VIctory/pull/1722/files) · [Author’s scope correction](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7148430206)
 
-```sh
-git -C "$candidate" apply --check --unidiff-zero "$kit/pr927.patch.txt"
-git -C "$candidate" apply --unidiff-zero "$kit/pr927.patch.txt"
-(cd "$candidate" && cargo build -p victory --profile diag --features diagnostics \
-  --target x86_64-pc-windows-msvc --offline --locked)
-```
+PR1722 changes one build input, `crates/victory-gpu/src/pipeline/library.rs`.
+Its SHA-256 is `427c8eb03d1f96a88ebee05c5beb041fbe6ef160a85603ad2dbd2a4fb723942c`.
+The default lock combines the frozen lock with the eight full-file hashes for this round.
+[Baseline lock](source-lock.json) · [Updated file hashes](upstream-files.json) · [Source verification](validation.md#updated-source-verification)
 
-The patch ports tippythetaidum’s half-view changes and the Linux fork’s
-mixed-access and descriptor-cache safeguards. On the RTX 5090, the integer
-path preserved all 65,536 possible 16-bit patterns in GPU readback. The
-float-conversion control preserved one. All 12 targeted Windows regressions
-passed, and the native shader suite passed 193 tests with two ignored.
-[Original PR 927](https://github.com/fxceless/victory-fork/pull/927) ·
-[Linux integration notes](../pr927-integration.md)
+| Independent Linux tester | Measured result |
+| --- | --- |
+| axknxla, RTX 2070 SUPER, GE-Proton 11-14 | The cold run saved 27,128 bytes and 1,279 early keys. Two full-cache replays each scheduled 1,050 distinct keys and loaded 28 pipelines before exiting. The library-only replay loaded 182. Follow-up traces found a compiler fault after a library miss. [Matched runs](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7167202555) · [Crash follow-up](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7167543708) |
+| ntgata1-dotcom, RX 9070 XT, Wine 11.22/RADV | First-boot menus saved 1,208 bytes and reloaded all six pipelines on the second run. [Menu comparison](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7159448409) |
+| OsiPog, Wine-staging 11.21/RADV | A 4.5 MB library loaded in 9–17 ms, with about 2,400 pipelines reused on the next run. [Linux report](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7161314791) |
+| necrobytes, RX 9060 XT, Fedora/Proton Experimental | The library saved 313,400 bytes and loaded 1,360 pipelines before world entry. Only one patched run completed the 40-second sampling window, leaving the FPS effect unresolved. [World comparison](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7179758064) |
+| arogan178, RX 9070 XT, CachyOS/Proton Experimental | The offline shader-cache prebuild saved 4.5 MB. Its repeat reported zero made and 27,120 already present in 2.0 s. This measures prebuild reuse. [Prebuild results](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7186428452) |
 
-In matched offline checkpoint runs on the same RTX 5090, the original build
-averaged 5.17 FPS and the PR927 build averaged 5.19 FPS over seconds 180–330
-after the first world pipeline bind. Both runs started with empty shader and
-driver caches and ended at the 390-second harness limit. The PR927 run cached
-24 compute translations that selected half views. The cell still showed exposed
-eyes and detached jaw geometry in frontal views. Lip motion during speech
-remains visually unverified.
+On the author’s GTX 1660, the second short run loaded all 14 cached pipelines.
+A separate world-scale run on another tree kept 1,717 early entries. Three
+warm launches reached the world in 201, 157 and 159 seconds against 151 seconds
+cold. The replicated benefit is persistence and reuse. [Author’s short runs](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7148430206) · [Author’s world runs](https://github.com/Marvisak/VIctory/pull/1722#issuecomment-7159492357)
+
+## PR2026 CPU detiling
+
+0xkn0wh3r3’s upstream change bounds-checks a row once before copying its
+contiguous runs. The PR995 port uses the new path only for detiling swizzled
+textures. Tiling and linear copies use the existing PR995 code. A regression
+covers pitched rows, shorter final runs and untouched padding. [Marvisak PR2026 at `1ec3877`](https://github.com/Marvisak/VIctory/pull/2026/commits/1ec3877c526ccbb8decafeb57a2c3722b2c7ff3a)
+
+The private CPU harness compared the frozen texture source against baseline in
+one executable, checked output bytes for equality and alternated execution
+order across 16 pairs per case. Each column gives the median paired speedup
+for that run. Values above 1 mean faster detiling.
+
+| Swizzled texture | First run | Repeat |
+| --- | ---: | ---: |
+| RGBA8 3840×2160, 64 KiB S | 1.217× | 1.185× |
+| RGBA8 3840×2160, 64 KiB D | 1.316× | 1.380× |
+| RGBA8 2048×2048, 256 B | 1.138× | 1.166× |
+| R8 2048×2048 | 1.129× | 1.198× |
+| RGBA16F 3840×2160 | 0.959× | 1.167× |
+| BC1 4096×4096 | 1.378× | 1.235× |
+| BC7 4096×4096 | 1.106× | 1.252× |
+| RGBA32F 2048×2048 | 1.163× | 1.078× |
+| RGBA8 1024×1024, 64 KiB D | 1.225× | 1.324× |
+
+The recorded formats suite passed 26 tests with four ignored in both debug
+and release. These timings measure CPU texture copies in isolation.
+
+## PR2398 whole-row mesh linking
+
+Texbirds’s upstream work links mesh and pixel signatures to fit D3D12’s
+32,768-byte mesh output limit. This port only attempts a linked pipeline for an
+over-budget mesh with a pixel shader on a mesh-capable device. It drops whole
+unread user semantics, preserves packed-half locations from the original
+signatures, and checks the surviving pixel reads, producer types and locations
+before using the pair. A failed link or PSO creation falls back to PR995’s
+standalone pipeline attempt. Depth-only linking and partial-channel trimming
+are outside this port. [Marvisak PR2398 at `13ac07b`](https://github.com/Marvisak/VIctory/pull/2398/commits/13ac07b570b806fbe77434a6240b6f6d190b063e)
+
+The local synthetic 128-thread fixture expects 34,816 bytes standalone and
+6,144 bytes after dropping unread rows. The 64-thread fixture expects 17,408
+bytes after tightening the standalone counts. The recorded native suite passed
+189 tests with two ignored. Two Windows mesh regressions passed under GE-Proton
+on the RTX 5090, including a draw that checked all 256 output texels. The
+Wine WARP request selected the hardware adapter again. The linked selection
+counter in the diagnostics build records the first use of each linked pipeline.
+
+## Historical PR927 experiment
+
+tippythetaidum’s half-view work and the associated Linux tests are recorded
+with the original source patch at commit `4331d2b`. Its matched checkpoint
+runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
+[Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
 
 ## Linux preset and runtime
 
@@ -177,8 +225,8 @@ be reviewed independently.
 This is not OctoAlgo's unpublished combined 3.54-FPS source tree. It lacks #938's
 loop-latch normalization and early-pipeline-list fallback, and does not import
 the full #854/#993 stack, #1002/#683/#917, ambient changes or current LinVictory host
-optimizations. PR995's empty pipeline-library pointer behavior remains; cache
-persistence parity with current LinVictory is unverified. No shader-table provenance
+optimizations. The frozen PR995 baseline retains the empty pipeline-library pointer behavior.
+The default includes the PR1722 fix for that call. No shader-table provenance
 or unsupported fixture is inferred from the four passing cases.
 
 The default PR995 selection retains earlier successful paths for two inputs;

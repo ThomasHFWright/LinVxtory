@@ -1,8 +1,12 @@
 #!/bin/sh
-# Build the tested PR995 source in a user-owned external checkout.
+# Reconstruct a locked renderer in a user-owned PR995 checkout.
 set -eu
 kit=$(CDPATH= cd -- "$(dirname -- "$0")/docs/pr995-candidate" && pwd)
-src=${1:?Usage: sh build.sh /path/to/external/pr995-source}
+if [ "$#" -ne 1 ] || [ -z "$1" ]; then
+    echo 'Usage: sh build.sh /path/to/pr995-source' >&2
+    exit 1
+fi
+src=$1
 commit=7406afbbd9cef0dcddef0b0a23b4855437715eb5
 if [ ! -e "$src" ]; then
     git init -q -- "$src"
@@ -13,8 +17,13 @@ test "$(git -C "$src" rev-parse HEAD)" = "$commit" || {
     echo 'Expected the pinned PR995 checkout.' >&2
     exit 1
 }
-if git -C "$src" diff --quiet HEAD -- && git -C "$src" apply --check --unidiff-zero "$kit/candidate.patch.txt"; then
+if [ -z "$(git -C "$src" status --porcelain)" ]; then
     git -C "$src" apply --unidiff-zero "$kit/candidate.patch.txt"
+fi
+# The original Linux patch leaves library.rs identical to the public pin.
+if git -C "$src" diff --quiet HEAD -- crates/victory-gpu/src/pipeline/library.rs; then
+    python3 "$kit/check_inputs.py" "$src"
+    git -C "$src" apply --unidiff-zero "$kit/upstream.patch.txt"
 fi
 sh "$kit/verify.sh" "$src"
 cd "$src"

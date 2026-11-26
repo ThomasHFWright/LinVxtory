@@ -1,0 +1,815 @@
+diff --git a/crates/victory-formats/src/texture.rs b/crates/victory-formats/src/texture.rs
+index fa719c9..40f218e 100644
+--- a/crates/victory-formats/src/texture.rs
++++ b/crates/victory-formats/src/texture.rs
+@@ -680,0 +681,32 @@ impl Layout {
++        if DETILE && !linear {
++            // Validate the column runs once. Every row then needs only two slice checks.
++            let mut span = 0;
++            for &(t, l, len) in &runs {
++                span = span.max(t.checked_add(len).ok_or(Error::TooSmall)?);
++                if l.checked_add(len).is_none_or(|end| end > bytes) {
++                    return Err(Error::TooSmall);
++                }
++            }
++            for z in 0..depth {
++                let (s, inner) = self.split(first + z);
++                let base = u64::from(s) * self.slice_size + m.offset;
++                for y in 0..m.height {
++                    let t = (base + self.row(m, y, inner)) as usize;
++                    let l = z as usize * depth_pitch + y as usize * row_pitch;
++                    let from = src[t..][..span].as_ptr();
++                    let to = dst[l..][..bytes].as_mut_ptr();
++                    // SAFETY: every run lies inside these disjoint slices. For the fixed
++                    // widths, chunk_size checked all body runs. The tail uses its own len.
++                    unsafe {
++                        match chunk_size {
++                            Some(8) => detile_runs::<8>(body, from, to),
++                            Some(16) => detile_runs::<16>(body, from, to),
++                            Some(32) => detile_runs::<32>(body, from, to),
++                            _ => detile_runs::<0>(body, from, to),
++                        }
++                        detile_runs::<0>(last, from, to);
++                    }
++                }
++            }
++            return Ok(());
++        }
+@@ -725,0 +758,16 @@ fn copy_run<const DETILE: bool>(
++/// Copies runs from a checked tiled row into its linear row.
++///
++/// # Safety
++/// Every run must fit both disjoint rows. If nonzero, N must equal every run's length.
++unsafe fn detile_runs<const N: usize>(
++    runs: &[(usize, usize, usize)],
++    from: *const u8,
++    to: *mut u8,
++) {
++    for &(tiled, linear, len) in runs {
++        let len = if N == 0 { len } else { N };
++        // SAFETY: the caller established the bounds and disjointness.
++        unsafe { std::ptr::copy_nonoverlapping(from.add(tiled), to.add(linear), len) };
++    }
++}
++
+@@ -1059,0 +1108,60 @@ mod tests {
++    /// Rows copied at their bounds: linear memory exactly as long as its last
++    /// row's bytes (no slack past it), tiled memory exactly the layout's
++    /// size, rows whose last run is shorter than the others (the mip ends
++    /// partway through it), pitch padding between rows left alone, and
++    /// tiled bytes outside the subresource left alone by `tile`.
++    #[test]
++    fn rows_are_copied_exactly_at_their_bounds() {
++        let mut partial = false;
++        for d in [
++            desc(33, 17, 6, 1, Swizzle::SW_4KB_D),
++            desc(83, 31, 6, 1, Swizzle::SW_256B_S),
++            desc(100, 60, 7, 4, Swizzle::SW_64KB_D),
++            desc(30, 20, 5, 4, Swizzle::LINEAR),
++            desc(5, 3, 1, 4, Swizzle::LINEAR),
++        ] {
++            let l = Layout::new(&d).unwrap();
++            let n = d.element_bytes as usize;
++            for mip in 0..d.mips {
++                let m = l.mips[mip as usize];
++                let active = m.width as usize * n;
++                let row = active + 7;
++                let len = (m.height as usize - 1) * row + active;
++                let linear: Vec<u8> = (0..len).map(|i| (i * 11 + 3) as u8).collect();
++                // What tile writes: this subresource's bytes, nothing else.
++                let mut tiled = vec![0x5a; l.size as usize];
++                l.tile(&mut tiled, mip, 0, &linear, row, len).unwrap();
++                let mut mine = vec![false; tiled.len()];
++                for y in 0..m.height {
++                    for x in 0..m.width {
++                        let at = l.offset(mip, x, y, 0).unwrap() as usize;
++                        mine[at..at + n].fill(true);
++                    }
++                }
++                assert!(
++                    tiled.iter().zip(&mine).all(|(&b, &m)| m || b == 0x5a),
++                    "{d:?} mip {mip}: tile wrote outside its subresource"
++                );
++                let mut back = vec![0xcc; len];
++                l.detile(&tiled, mip, 0, &mut back, row, len).unwrap();
++                for y in 0..m.height as usize {
++                    let start = y * row;
++                    assert_eq!(back[start..start + active], linear[start..start + active]);
++                    if y + 1 < m.height as usize {
++                        assert!(back[start + active..start + row].iter().all(|&b| b == 0xcc));
++                    }
++                }
++                if d.swizzle != Swizzle::LINEAR {
++                    // Find the first and last contiguous column runs independently.
++                    let breaks: Vec<_> = (1..m.width)
++                        .filter(|&x| l.column(&m, x) != l.column(&m, x - 1) + n as u64)
++                        .collect();
++                    if let (Some(&first), Some(&last)) = (breaks.first(), breaks.last()) {
++                        partial |= m.width - last < first;
++                    }
++                }
++            }
++        }
++        assert!(partial, "some row ends in a shorter run");
++    }
++
+diff --git a/crates/victory-gpu/src/pipeline/library.rs b/crates/victory-gpu/src/pipeline/library.rs
+index fac6f59..ea5b177 100644
+--- a/crates/victory-gpu/src/pipeline/library.rs
++++ b/crates/victory-gpu/src/pipeline/library.rs
+@@ -490 +490,28 @@ fn open(device: &ID3D12Device1, blob: Blob) -> Option<Library> {
+-    let library = make(&[]).ok()?;
++    // An empty library is asked for with a null blob. An empty Rust slice has
++    // a dangling, non-null pointer; Windows only looks at the length, but
++    // vkd3d-proton (Wine) refuses a non-null blob of length 0 with
++    // E_INVALIDARG, and no pipeline was ever kept there.
++    let empty = || -> windows::core::Result<ID3D12PipelineLibrary1> {
++        use windows::core::Interface;
++        let mut out = std::ptr::null_mut();
++        // SAFETY: the method's own arguments; a null blob of length 0 makes
++        // an empty library.
++        unsafe {
++            (Interface::vtable(device).CreatePipelineLibrary)(
++                Interface::as_raw(device),
++                std::ptr::null(),
++                0,
++                &ID3D12PipelineLibrary::IID,
++                &mut out,
++            )
++            .ok()?;
++            ID3D12PipelineLibrary::from_raw(out).cast()
++        }
++    };
++    let library = match empty() {
++        Ok(library) => library,
++        Err(e) => {
++            tracing::info!(error = %e, "empty host pipeline library refused");
++            return None;
++        }
++    };
+diff --git a/crates/victory-gpu/src/pipeline/make.rs b/crates/victory-gpu/src/pipeline/make.rs
+index b21b716..ce27f82 100644
+--- a/crates/victory-gpu/src/pipeline/make.rs
++++ b/crates/victory-gpu/src/pipeline/make.rs
+@@ -35,0 +36,4 @@ pub(crate) struct Pending {
++    #[cfg(feature = "diagnostics")]
++    linked: OnceLock<(String, String, u64, u64)>,
++    #[cfg(feature = "diagnostics")]
++    reported_link: OnceLock<()>,
+@@ -58,0 +63,4 @@ impl Pending {
++            #[cfg(feature = "diagnostics")]
++            linked: OnceLock::new(),
++            #[cfg(feature = "diagnostics")]
++            reported_link: OnceLock::new(),
+@@ -61,0 +70,21 @@ impl Pending {
++    fn linked_pipeline(&self) -> Option<HostPipeline> {
++        use victory_shader::emit::{MESH_OUTPUT_LIMIT, mesh_output_bytes, translate_linked};
++        let [a, b] = self.shaders.as_slice() else { return None };
++        let (ms, ps) = match (a.stage, b.stage) {
++            ("mesh", "pixel") => (a, b),
++            ("pixel", "mesh") => (b, a),
++            _ => return None,
++        };
++        // Probe device capabilities before the first translation or cache lookup.
++        let device = crate::host::host()?;
++        if !device.mesh_shaders() { return None; }
++        let old = mesh_output_bytes(&ms.translated()?.host.dxil)?;
++        if old <= MESH_OUTPUT_LIMIT { return None; }
++        let (mesh, pixel, _new) = translate_linked(&ms.container, &ps.container, &ps.translated()?.host)?;
++        let shaders = [linked_stage(ms, mesh)?, linked_stage(ps, pixel)?];
++        let pipeline = HostPipeline::new(&shaders, self.graphics.as_deref())?;
++        #[cfg(feature = "diagnostics")]
++        let _ = self.linked.set((ms.hash.clone(), ps.hash.clone(), old, _new));
++        Some(pipeline)
++    }
++
+@@ -64 +93 @@ impl Pending {
+-            .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
++            .get_or_init(|| self.linked_pipeline().or_else(|| HostPipeline::new(&self.shaders, self.graphics.as_deref())));
+@@ -70,0 +100,19 @@ impl Pending {
++/// Keep original container analysis and own the paired bytecode in this PSO's stages.
++fn linked_stage(original: &Shader, host: victory_shader::emit::HostShader) -> Option<Arc<Shader>> {
++    let original_translation = original.translated()?;
++    Some(Arc::new(Shader {
++        stage: original.stage,
++        hash: original.hash.clone(),
++        container: original.container.clone(),
++        walks: OnceLock::new(),
++        translated: OnceLock::from(Some(super::Translated {
++            host,
++            used: original_translation.used.clone(),
++            stores: original_translation.stores,
++            writes: original_translation.writes,
++            picked_stores: original_translation.picked_stores,
++            picks: original_translation.picks.clone(),
++        })),
++    }))
++}
++
+@@ -130 +178,6 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+-    p.made.get()?.as_ref()
++    let pipeline = p.made.get()?.as_ref()?;
++    #[cfg(feature = "diagnostics")]
++    if let Some((mesh, pixel, old_bytes, new_bytes)) = p.linked.get() {
++        p.reported_link.get_or_init(|| tracing::info!(mesh, pixel, old_bytes, new_bytes, "linked mesh and pixel selected"));
++    }
++    Some(pipeline)
+diff --git a/crates/victory-shader/src/emit/container.rs b/crates/victory-shader/src/emit/container.rs
+index 7620cfd..b252134 100644
+--- a/crates/victory-shader/src/emit/container.rs
++++ b/crates/victory-shader/src/emit/container.rs
+@@ -119 +119 @@ pub(crate) fn signature(elements: &[SigElement], input: bool) -> Vec<u8> {
+-pub(crate) const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
++pub const MESH_OUTPUT_LIMIT: u64 = 32 * 1024;
+diff --git a/crates/victory-shader/src/emit/linked.rs b/crates/victory-shader/src/emit/linked.rs
+new file mode 100644
+index 0000000..f381838
+--- /dev/null
++++ b/crates/victory-shader/src/emit/linked.rs
+@@ -0,0 +1,108 @@
++//! Pipeline-local linkage for mesh outputs that still exceed the host budget.
++use std::collections::BTreeMap;
++
++use super::{
++    Container, FourCC, HostShader, HwStage, MESH_OUTPUT_LIMIT, container, signature,
++    translate_selected,
++};
++use container::SigElement;
++
++pub(super) struct Semantics(pub(super) BTreeMap<(String, u32), u8>);
++
++impl Semantics {
++    pub(super) fn reads(dxil: &[u8]) -> Option<Self> {
++        let shader = Container::parse(dxil).ok()?;
++        let data = shader.part(FourCC::ISG1)?.data;
++        let base = crate::dxbc::u32_at(data, 4).ok()? as usize;
++        let mut reads = BTreeMap::new();
++        for (i, element) in signature(data).ok()?.iter().enumerate() {
++            let mask = *data.get(base + i * 32 + 25)?;
++            if element.kind == 0 && mask != 0 {
++                *reads
++                    .entry((element.name.to_ascii_uppercase(), element.index))
++                    .or_default() |= mask;
++            }
++        }
++        Some(Self(reads))
++    }
++
++    pub(super) fn prune(&self, elements: &mut Vec<SigElement>) {
++        elements.retain(|e| {
++            e.kind != 0 || self.0.contains_key(&(e.name.to_ascii_uppercase(), e.index))
++        });
++    }
++}
++
++/// Measures the emitted declaration, including any reduction to lane counts.
++pub fn mesh_output_bytes(dxil: &[u8]) -> Option<u64> {
++    let shader = Container::parse(dxil).ok()?;
++    let psv = shader.part(FourCC::PSV0)?.data;
++    if crate::dxbc::u32_at(psv, 0).ok()? < 48 || *psv.get(28)? != 13 {
++        return None;
++    }
++    let count = |off| {
++        Some(u32::from(u16::from_le_bytes(
++            psv.get(off..off + 2)?.try_into().ok()?,
++        )))
++    };
++    let mut vertex = signature(shader.part(FourCC::OSG1)?.data).ok()?;
++    let mut primitive = match shader.part(FourCC::PSG1) {
++        Some(p) => signature(p.data).ok()?,
++        None => Vec::new(),
++    };
++    // Unallocated system values consume no output storage.
++    vertex.retain(|e| e.row.is_some());
++    primitive.retain(|e| e.row.is_some());
++    Some(container::mesh_output_bytes(
++        &vertex,
++        &primitive,
++        count(16)?,
++        count(18)?,
++    ))
++}
++
++/// Require every surviving arbitrary pixel input to have its producer at the
++/// same location and with the same type. Leave incompatible pairs standalone.
++pub(super) fn matching_outputs(mesh: &[u8], pixel: &[u8]) -> Option<bool> {
++    let ms = Container::parse(mesh).ok()?;
++    let ps = Container::parse(pixel).ok()?;
++    let mut outputs = signature(ms.part(FourCC::OSG1)?.data).ok()?;
++    if let Some(prims) = ms.part(FourCC::PSG1) {
++        outputs.extend(signature(prims.data).ok()?);
++    }
++    let inputs = signature(ps.part(FourCC::ISG1)?.data).ok()?;
++    Some(inputs.iter().filter(|i| i.kind == 0).all(|i| {
++        outputs.iter().any(|o| {
++            o.kind == 0
++                && o.index == i.index
++                && o.name.eq_ignore_ascii_case(&i.name)
++                && o.comp == i.comp
++                && o.row == i.row
++                && o.col == i.col
++                && o.cols == i.cols
++        })
++    }))
++}
++
++/// Re-emit both stages using the standalone pixel shader's actual input reads.
++pub fn translate_linked(
++    mesh: &[u8],
++    pixel: &[u8],
++    standalone_pixel: &HostShader,
++) -> Option<(HostShader, HostShader, u64)> {
++    let reads = Semantics::reads(&standalone_pixel.dxil)?;
++    let ms = translate_selected(mesh, Some(&reads)).ok()?;
++    let bytes = mesh_output_bytes(&ms.dxil)?;
++    if bytes > MESH_OUTPUT_LIMIT {
++        return None;
++    }
++    let ps = translate_selected(pixel, Some(&reads)).ok()?;
++    if ms.stage != HwStage::Ms
++        || ps.stage != HwStage::Ps
++        || Semantics::reads(&ps.dxil)?.0 != reads.0
++        || !matching_outputs(&ms.dxil, &ps.dxil)?
++    {
++        return None;
++    }
++    Some((ms, ps, bytes))
++}
+diff --git a/crates/victory-shader/src/emit/linked_tests.rs b/crates/victory-shader/src/emit/linked_tests.rs
+new file mode 100644
+index 0000000..a6f2f00
+--- /dev/null
++++ b/crates/victory-shader/src/emit/linked_tests.rs
+@@ -0,0 +1,364 @@
++//! Synthetic sparse mesh/pixel linkage fixture adapted from Marvisak/VIctory #2398.
++use super::container::SigElement;
++use super::{
++    container, emit, emit_selected,
++    linked::{Semantics, mesh_output_bytes},
++    signature,
++};
++use crate::native::StageIo;
++use crate::{Container, FourCC, HwStage, NativeProgram, io, ir, resource, structure};
++
++fn wide_mesh_parts(
++    threads: u32,
++    max_vertices: u32,
++    max_primitives: u32,
++) -> (Vec<u8>, NativeProgram) {
++    let mut words = vec![
++        0xD765_0001u32, // v_mbcnt_lo_u32_b32 v1, -1, 0
++        0x0001_00C1,
++        0x3604_0281, // v_and_b32 v2, 1, v1
++        0x3606_0282, // v_and_b32 v3, 2, v1
++        0x7E04_0D02, // v_cvt_f32_u32 v2, v2
++        0x7E06_0D03, // v_cvt_f32_u32 v3, v3
++        0x1008_04F6, // v_mul_f32 v4, 4.0, v2
++        0x0608_08F3, // v_add_f32 v4, -1.0, v4
++        0x100A_06F4, // v_mul_f32 v5, 2.0, v3
++        0x060A_0AF3, // v_add_f32 v5, -1.0, v5
++        0x7E0C_02F0, // v_mov_b32 v6, 0.5
++        0x7E0E_02F2, // v_mov_b32 v7, 1.0
++        0x7E10_02FF, // v_mov_b32 v8, 0.25
++        0.25f32.to_bits(),
++        0x7E12_02FF, // v_mov_b32 v9, TRIANGLE
++        (1 << 10) | (2 << 20),
++        0x7E14_0280, // v_mov_b32 v10, 0.0
++        0x7E16_02FF, // v_mov_b32 v11, packed f16 (0.25, 1.0)
++        0x3C00_3400,
++    ];
++    // param0 = (1.0, 0.5, 0.0, 0.0)
++    words.extend([0xF800_000F | (32 << 4), 0x0A0A_0607]);
++    // Param1 packs TEXCOORD1 and TEXCOORD15. Linking drops the leading
++    // semantic. The surviving pair of values must still come from dword 3.
++    words.extend([0xF800_000F | (33 << 4), 0x0B0A_0A0A]);
++    for k in 2..15u32 {
++        words.extend([0xF800_000F | ((32 + k) << 4), 0x0A0A_0A0A]);
++    }
++    words.extend([
++        0xF800_0941, // exp prim v9, off, off, off done
++        0x0000_0009,
++        0xF800_08CF, // exp pos0 v4, v5, v6, v7 done
++        0x0706_0504,
++        0xBF81_0000, // s_endpgm
++    ]);
++    let outputs: Vec<crate::native::VsOutput> = (0..15u8)
++        .map(|k| crate::native::VsOutput {
++            usage: crate::native::Usage::Generic,
++            row: k + 1,
++            param: k,
++            fp16: k == 1,
++            pack2: k == 1,
++        })
++        .collect();
++    let native = NativeProgram {
++        stage: HwStage::Ms,
++        wave64: false,
++        vgprs: 12,
++        layout: vec![],
++        used: vec![],
++        io: StageIo::Ms(crate::native::MeshIo {
++            outputs,
++            clip_cntl: 0,
++            threads,
++            max_vertices,
++            max_primitives,
++            topology: 2,
++            lds_bytes: 0,
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let mut sig = vec![SigElement {
++        name: "SV_Position".into(),
++        index: 0,
++        kind: 3,
++        comp: 9,
++        interp: 0,
++        row: Some(0),
++        col: 0,
++        cols: 4,
++        usage: 0xF,
++        half: false,
++    }];
++    for k in 0..16u32 {
++        sig.push(SigElement {
++            name: "TEXCOORD".into(),
++            index: k,
++            kind: 0,
++            comp: 9,
++            interp: 0,
++            row: Some(k + 1),
++            col: 0,
++            cols: 4,
++            usage: 0xF,
++            half: false,
++        });
++    }
++    let mut osg1 = container::signature(&sig, false);
++    // Console signature component type 6 is f16. The host writer widens it.
++    for element in [2, 16] {
++        let component = 8 + 32 * element + 16;
++        osg1[component..component + 4].copy_from_slice(&6u32.to_le_bytes());
++    }
++    let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
++    (bytes, native)
++}
++
++/// A 64-lane mesh shader whose declared `max_vertices`/`max_primitives`
++/// (128) would push its 68 output components past 32 KiB tightens those
++/// maxima down to its thread count (64), fitting in 17,408 bytes and
++/// passing DXIL validation standalone.
++#[test]
++fn mesh_exceeding_32k_tightens_counts_to_group_threads() {
++    let (bytes, native) = wide_mesh_parts(64, 128, 128);
++    let c = Container::parse(&bytes).unwrap();
++    let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++    let st = structure::structure(&p).unwrap();
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++    let io = io::raise(&p, &native).unwrap();
++    let ms = emit(&c, &native, &p, &st, &io, &res).unwrap();
++    assert_eq!(mesh_output_bytes(&ms.dxil), Some(68 * 4 * 64));
++    #[cfg(windows)]
++    if let Ok(mut v) = crate::emit::validator::Validator::load(
++        crate::emit::validator::Validator::default_path().as_deref(),
++    ) {
++        v.validate(&mut ms.dxil.clone()).unwrap();
++    }
++}
++
++/// A 128-lane mesh shader with 68 output components (34,816 B > 32 KiB
++/// even at one vertex per lane). Drop the fourteen unread rows and draw
++/// the two surviving rows into an RGBA32F target on Windows.
++#[test]
++fn linked_mesh_and_pixel_prune_unused_outputs_under_32k_and_draw() {
++    let (ms_bytes, ms_native) = wide_mesh_parts(128, 128, 256);
++    let mc = Container::parse(&ms_bytes).unwrap();
++    let mp = ir::build(&ms_native.patched_code(), ms_native.wave64, ms_native.vgprs).unwrap();
++    let mst = structure::structure(&mp).unwrap();
++    let mres = resource::track(&mp, &ms_native.layout, ms_native.stage, Some(&mst)).unwrap();
++    let mio = io::raise(&mp, &ms_native).unwrap();
++    let mesh = |keep| {
++        emit_selected(&mc, &ms_native, &mp, &mst, &mio, &mres, keep)
++            .unwrap()
++            .0
++    };
++    let standalone = mesh(None);
++    assert_eq!(mesh_output_bytes(&standalone.dxil), Some(34_816));
++
++    // Paired pixel shader declaring the same 17 rows, reading only
++    // TEXCOORD0.xy and TEXCOORD15.zw.
++    let p1 =
++        |vdst: u32, attr: u32, ch: u32| 0xC800_0000u32 | (vdst << 18) | (attr << 10) | (ch << 8);
++    let p2 =
++        |vdst: u32, attr: u32, ch: u32| 0xC801_0001u32 | (vdst << 18) | (attr << 10) | (ch << 8);
++    let ps_words = [
++        p1(2, 0, 0),
++        p2(2, 0, 0), // v2 = TEXCOORD0.x (1.0)
++        p1(3, 0, 1),
++        p2(3, 0, 1), // v3 = TEXCOORD0.y (0.5)
++        p1(4, 15, 2),
++        p2(4, 15, 2), // v4 = TEXCOORD15.z (0.25)
++        p1(5, 15, 3),
++        p2(5, 15, 3), // v5 = TEXCOORD15.w (1.0)
++        0xF800_180F,
++        0x0504_0302, // exp mrt0, v2, v3, v4, v5 done vm
++        0xBF81_0000, // s_endpgm
++    ];
++    let ps_inputs: Vec<crate::native::PsInput> = (0..16u8)
++        .map(|k| crate::native::PsInput {
++            usage: crate::native::Usage::Generic,
++            row: k + 1,
++            mask: 0xF,
++            attr: k,
++            flat: false,
++            fp16: false,
++            pack2: false,
++            row2: 0,
++        })
++        .collect();
++    let ps_native = NativeProgram {
++        stage: HwStage::Ps,
++        wave64: false,
++        vgprs: 8,
++        layout: vec![],
++        used: vec![],
++        io: StageIo::Ps {
++            inputs: ps_inputs,
++            input_addr: 1 << 1,
++            db_shader_control: 0,
++            patches: vec![],
++        },
++        code: ps_words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let mut ps_sig = vec![SigElement {
++        name: "SV_Position".into(),
++        index: 0,
++        kind: 3,
++        comp: 9,
++        interp: 0,
++        row: Some(0),
++        col: 0,
++        cols: 4,
++        usage: 0,
++        half: false,
++    }];
++    for k in 0..16u32 {
++        ps_sig.push(SigElement {
++            name: "TEXCOORD".into(),
++            index: k,
++            kind: 0,
++            comp: 9,
++            interp: 0,
++            row: Some(k + 1),
++            col: 0,
++            cols: 4,
++            usage: 0,
++            half: false,
++        });
++    }
++    let isg1 = container::signature(&ps_sig, true);
++    let osg1 = container::signature(
++        &[SigElement {
++            name: "SV_Target".into(),
++            kind: 16,
++            index: 0,
++            row: Some(0),
++            ..ps_sig[0].clone()
++        }],
++        false,
++    );
++    let ps_bytes = crate::dxbc::build(&[(FourCC::ISG1, &isg1), (FourCC::OSG1, &osg1)]);
++    let pc = Container::parse(&ps_bytes).unwrap();
++    let pp = ir::build(&ps_native.patched_code(), ps_native.wave64, ps_native.vgprs).unwrap();
++    let pst = structure::structure(&pp).unwrap();
++    let pres = resource::track(&pp, &ps_native.layout, ps_native.stage, Some(&pst)).unwrap();
++    let pio = io::raise(&pp, &ps_native).unwrap();
++    let pixel = |keep| {
++        emit_selected(&pc, &ps_native, &pp, &pst, &pio, &pres, keep)
++            .unwrap()
++            .0
++    };
++    let full_ps = pixel(None);
++    let reads = Semantics::reads(&full_ps.dxil).unwrap();
++    assert_eq!(reads.0.len(), 2);
++    assert_eq!(reads.0.get(&("TEXCOORD".into(), 0)), Some(&3));
++    assert_eq!(reads.0.get(&("TEXCOORD".into(), 15)), Some(&12));
++    let linked_ms = mesh(Some(&reads));
++    let linked_ps = pixel(Some(&reads));
++    // OSG1 marks unwritten channels. TEXCOORD15 must keep all four writes
++    // even though its packed partner no longer has a host output element.
++    let emitted = Container::parse(&linked_ms.dxil).unwrap();
++    let output = emitted.part(FourCC::OSG1).unwrap().data;
++    let base = crate::dxbc::u32_at(output, 4).unwrap() as usize;
++    let last = signature(output)
++        .unwrap()
++        .iter()
++        .position(|e| e.index == 15)
++        .unwrap();
++    assert_eq!(output[base + last * 32 + 25] & 15, 0);
++    assert_eq!(Semantics::reads(&linked_ps.dxil).unwrap().0, reads.0);
++    assert_eq!(
++        super::linked::matching_outputs(&linked_ms.dxil, &linked_ps.dxil),
++        Some(true)
++    );
++    for (bytes, part) in [
++        (&linked_ms.dxil, FourCC::OSG1),
++        (&linked_ps.dxil, FourCC::ISG1),
++    ] {
++        let c = Container::parse(bytes).unwrap();
++        let elements = signature(c.part(part).unwrap().data).unwrap();
++        let kept: Vec<_> = elements
++            .iter()
++            .filter(|e| e.kind == 0)
++            .map(|e| (e.index, e.row, e.col, e.cols))
++            .collect();
++        assert_eq!(kept, [(0, Some(1), 0, 4), (15, Some(16), 0, 4)]);
++    }
++    // The sparse signatures fit even at the original declared count, but
++    // 128 lanes cannot emit indices for 256 primitives.
++    for mesh in [&standalone, &linked_ms] {
++        let c = Container::parse(&mesh.dxil).unwrap();
++        let psv = c.part(FourCC::PSV0).unwrap().data;
++        assert_eq!(
++            u16::from_le_bytes(psv[4 + 14..4 + 16].try_into().unwrap()),
++            128
++        );
++    }
++    // Position and two surviving four-component rows.
++    assert_eq!(mesh_output_bytes(&linked_ms.dxil), Some(12 * 4 * 128));
++    assert!(!linked_ps.dxil.is_empty());
++
++    #[cfg(windows)]
++    {
++        if let Ok(mut v) = crate::emit::validator::Validator::load(
++            crate::emit::validator::Validator::default_path().as_deref(),
++        ) {
++            v.validate(&mut linked_ms.dxil.clone()).unwrap();
++            v.validate(&mut linked_ps.dxil.clone()).unwrap();
++        }
++        use crate::emit::host::{Draw, Host, Root};
++        use windows::Win32::Graphics::Direct3D12::{
++            D3D12_FEATURE_D3D12_OPTIONS7, D3D12_FEATURE_DATA_D3D12_OPTIONS7,
++            D3D12_MESH_SHADER_TIER_NOT_SUPPORTED, D3D12_SHADER_VISIBILITY_MESH,
++            D3D12_SHADER_VISIBILITY_PIXEL,
++        };
++        let _one = crate::emit::valu_tests::ONE_AT_A_TIME
++            .lock()
++            .unwrap_or_else(|e| e.into_inner());
++        for (label, warp) in [("hardware", false), ("warp", true)] {
++            let Ok(host) = Host::new(warp) else {
++                eprintln!("no SM 6.6 {label} device; skipped");
++                continue;
++            };
++            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS7::default();
++            // SAFETY: the query writes the structure of the given size.
++            let queried = unsafe {
++                host.device.CheckFeatureSupport(
++                    D3D12_FEATURE_D3D12_OPTIONS7,
++                    (&raw mut options).cast(),
++                    size_of_val(&options) as u32,
++                )
++            };
++            if queried.is_err() || options.MeshShaderTier == D3D12_MESH_SHADER_TIER_NOT_SUPPORTED {
++                eprintln!("no mesh shaders on the {label} device; skipped");
++                continue;
++            }
++            let root = host
++                .root_signature_for(&[
++                    (&linked_ms, D3D12_SHADER_VISIBILITY_MESH),
++                    (&linked_ps, D3D12_SHADER_VISIBILITY_PIXEL),
++                ])
++                .unwrap();
++            let pso = host
++                .mesh_pipeline_with(&root, &linked_ms.dxil, &linked_ps.dxil)
++                .unwrap_or_else(|e| panic!("{label}: mesh pipeline: {e}"));
++            let texels = host
++                .draw(
++                    &root,
++                    &pso,
++                    &Draw {
++                        roots: vec![(0, Root::Constants(vec![0])), (1, Root::Constants(vec![0]))],
++                        textures: &[],
++                        samplers: &[],
++                        vertices: &[],
++                        stride: 0,
++                        size: (16, 16),
++                        mesh_groups: 1,
++                    },
++                )
++                .unwrap_or_else(|e| panic!("{label}: draw: {e}"));
++            assert!(
++                texels.iter().all(|t| *t == [1.0, 0.5, 0.25, 1.0]),
++                "{label}: unexpected pixel {:?}",
++                texels.first()
++            );
++        }
++    }
++}
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 6be180c..ad407a1 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -91,0 +92 @@ enum Stop {
++#[cfg(test)]
+@@ -92,0 +94,4 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
++    lower_selected(parts, None)
++}
++
++pub(super) fn lower_selected(parts: &Parts, keep: Option<&super::linked::Semantics>) -> Result<Lowered, ShaderError> {
+@@ -95 +100 @@ pub(crate) fn lower(parts: &Parts) -> Result<Lowered, ShaderError> {
+-        match Lower::new(parts, &bad).run() {
++        match Lower::new(parts, &bad, keep).run() {
+@@ -183,0 +189 @@ struct Lower<'a> {
++    linked: bool,
+@@ -1453 +1459 @@ impl<'a> Lower<'a> {
+-    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>) -> Self {
++    fn new(x: &'a Parts<'a>, bad: &'a HashMap<Value, Why>, keep: Option<&super::linked::Semantics>) -> Self {
+@@ -1463,0 +1470,7 @@ impl<'a> Lower<'a> {
++        if let Some(keep) = keep {
++            match x.native.stage {
++                HwStage::Ms => keep.prune(&mut s.outputs),
++                HwStage::Ps => keep.prune(&mut s.inputs),
++                _ => unreachable!("only mesh and pixel stages are linked"),
++            }
++        }
+@@ -1664,0 +1678 @@ impl<'a> Lower<'a> {
++            if let Some(keep) = keep { keep.prune(&mut s.prims); }
+@@ -1798,0 +1813 @@ impl<'a> Lower<'a> {
++            linked: keep.is_some(),
+@@ -4577 +4592,4 @@ impl<'a> Lower<'a> {
+-        if !fits(mesh) {
++        // Linking must not restore counts removed by standalone lowering.
++        if !fits(mesh) || (self.linked && mesh_output_bytes(
++            &self.x.outputs, &self.x.prims, mesh.max_vertices, mesh.max_primitives,
++        ) > MESH_OUTPUT_LIMIT) {
+@@ -4651,0 +4670,5 @@ impl<'a> Lower<'a> {
++    /// Packed halves use the console layout even when the host signature omits rows.
++    fn packing_inputs(&self) -> &[SigElement] {
++        if self.linked { &self.x.inputs } else { &self.s.inputs }
++    }
++
+@@ -9698 +9721 @@ impl<'a> Lower<'a> {
+-                        input_packs(&self.x.native.io, &self.s.inputs)
++                        input_packs(&self.x.native.io, self.packing_inputs())
+@@ -9727 +9750 @@ impl<'a> Lower<'a> {
+-                        packed_half(&l.s.inputs, &packs, attribute.row, h)
++                        packed_half(l.packing_inputs(), &packs, attribute.row, h)
+@@ -11284 +11307 @@ impl<'a> Lower<'a> {
+-                        packed_half(outputs, &packs, row, h)
++                        packed_half(if self.linked { &self.x.outputs } else { outputs }, &packs, row, h)
+@@ -11523,3 +11546,2 @@ impl<'a> Lower<'a> {
+-        let free: std::collections::BTreeSet<u32> = self
+-            .s
+-            .outputs
++        let signature = if self.linked { &self.x.outputs } else { &self.s.outputs };
++        let free: std::collections::BTreeSet<u32> = signature
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 1a11299..f0c58ce 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -85,0 +86,5 @@ mod container;
++mod linked;
++#[cfg(test)]
++mod linked_tests;
++pub use linked::{mesh_output_bytes, translate_linked};
++pub use container::MESH_OUTPUT_LIMIT;
+@@ -395 +400,5 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+-    match translate_plain(container) {
++    translate_selected(container, None)
++}
++
++fn translate_selected(container: &[u8], keep: Option<&linked::Semantics>) -> Result<HostShader, ShaderError> {
++    match translate_plain(container, keep) {
+@@ -397 +406 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+-            lower::with_first_half_pairs(|| translate_plain(container))
++            lower::with_first_half_pairs(|| translate_plain(container, keep))
+@@ -403 +412 @@ pub fn translate(container: &[u8]) -> Result<HostShader, ShaderError> {
+-fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
++fn translate_plain(container: &[u8], keep: Option<&linked::Semantics>) -> Result<HostShader, ShaderError> {
+@@ -419,0 +429,3 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
++    if keep.is_some() && !matches!(native.stage, HwStage::Ms | HwStage::Ps) {
++        return Err(ShaderError::Unsupported { offset: 0, what: "linking another shader stage" });
++    }
+@@ -426,0 +439,3 @@ fn translate_plain(container: &[u8]) -> Result<HostShader, ShaderError> {
++    if let Some(keep) = keep {
++        return emit_selected(&c, &native, &p, &st, &io, &res, Some(keep)).map(|(shader, _)| shader);
++    }
+@@ -878,0 +894,12 @@ fn emit_program(
++) -> Result<(HostShader, Option<u32>), ShaderError> {
++    emit_selected(c, native, p, st, io, res, None)
++}
++
++fn emit_selected(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    io: &io::Io,
++    res: &resource::Resources,
++    keep: Option<&linked::Semantics>,
+@@ -937 +964 @@ fn emit_program(
+-    let l = lower::lower(&lower::Parts {
++    let l = lower::lower_selected(&lower::Parts {
+@@ -947 +974 @@ fn emit_program(
+-    })?;
++    }, keep)?;

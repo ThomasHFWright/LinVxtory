@@ -1,0 +1,10 @@
+{
+  "crates/victory-formats/src/texture.rs": "4ce44c0dbcc5a692dc7481f040057c3fb124b07bad8ab7b5fa8dd56b3b1fe617",
+  "crates/victory-gpu/src/pipeline/library.rs": "427c8eb03d1f96a88ebee05c5beb041fbe6ef160a85603ad2dbd2a4fb723942c",
+  "crates/victory-gpu/src/pipeline/make.rs": "80f011f5fc5bf6467fddadcc38b499744de64878931abe5a5afcd1d575b42dd9",
+  "crates/victory-shader/src/emit/container.rs": "2737f353d1fe86e9052ad91ad0454def62e4c7f93e0d6f35cbc21b5cf0f967a8",
+  "crates/victory-shader/src/emit/linked.rs": "88c8dab6d3db9152cd2406bba83c33ae8d287d4f9f92bea565097e0354c70efa",
+  "crates/victory-shader/src/emit/linked_tests.rs": "c6d989b5f0720a0db320b8835ed222b062901d53ba831e72383466160561edd4",
+  "crates/victory-shader/src/emit/lower.rs": "f061d95947e78396a442fb6490cab820bdcbc4b7c86318a9c153eb617b7e79dc",
+  "crates/victory-shader/src/emit/mod.rs": "f26d12961616519d03d8adbcf7f58d001c010b93bf854b37bb3ee3648aa1ee50"
+}
