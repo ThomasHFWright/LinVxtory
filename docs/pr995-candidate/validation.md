@@ -38,15 +38,16 @@ OctoAlgo's unpublished combined renderer.
 ## Updated source verification
 
 The public pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`. All rebuild
-and upgrade paths must reach Git tree `9087a7f7796671ddec0f176aa5931be73c514624`.
-The final lock contains 190 full-file digests when the 13 final overrides are
-combined with the 188-input Linux baseline. [Original lock](source-lock.json) · [Final overrides](followup-files.json)
+and upgrade paths must reach Git tree `f150c5e8a19110b27362d0517e8c68441db5e353`.
+The final lock contains 192 full-file digests when the 20 final overrides are
+combined with the 188-input Linux baseline. [Original lock](source-lock.json) · [Final overrides](raw2885-files.json)
 
 | Layer | Source tree after applying | Patch SHA-256 |
 | --- | --- | --- |
 | Published three-PR checkpoint `91b6968` | `cc6e33fe99572a2d433e82a49e8429678b70ca5a` | `c47ca445f08f13a27d4b9b9a98b4d4e0d22ed510613ca4ad1bd50836c48b28c2` |
 | Five-file follow-up `f0ca006` | `0c158597c6af5254c2d29422bda9ddd9b6b34065` | `fb1113a16121e61d9ec59e3cbcf5f01b05b01f684935c453417fe4616cc596ac` |
 | Three-file performance follow-up | `9087a7f7796671ddec0f176aa5931be73c514624` | `2bd39cdda0174091632022ad0e075510beaa91014fa397cd6d12932fba025d36` |
+| [Overlapping buffer views](raw2885.patch.txt) | `f150c5e8a19110b27362d0517e8c68441db5e353` | `15570181685c20fb7d4f475cb940d7403c1fa989bdbb5ac48ee896c7786de67c` |
 
 The five-file patch changes `crates/victory-gpu/src/descriptor/host.rs`, `shadow.rs`
 and `texture.rs` in the GPU crate, and `lower.rs` and `mod.rs` in
@@ -195,3 +196,18 @@ The first cache run and the control faced the yard window in frames 1820
 and 2048. Both showed the wall, uprights, window mesh, bunk rail and distant
 watchtower. The 30-minute endurance result above used the same executable
 with this setting off. [Upstream performance work](https://github.com/fxceless/victory-fork/pull/995)
+
+### Room comparison for VIctory PR2885
+
+Both trials used cold caches, the same checkpoint and scripted camera route,
+and the published descriptor slot cache setting. The control delivered 2.95
+FPS over world seconds +180 to +330. The candidate delivered 3.03 FPS over
+that interval. Each condition had one replay. The candidate log recorded a
+live structured buffer bound through a raw view with an 8-byte prefix.
+
+The side views retained the same swept crown and hanging hair. The matched
+near-frontal views still showed exposed eyes and teeth, with the cheek, lips
+and jaw missing. The launch harness ended by signal after about 572 seconds,
+after both camera turns. The control completed its 600-second limit. The
+candidate log contains no device-loss or fatal-error report. The port remains
+a private source candidate while the visible defects are investigated.

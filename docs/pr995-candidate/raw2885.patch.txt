@@ -1,0 +1,1254 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 1ac83318dfbb48913d8b8e41969f8fe6bc7e1a87..c88061a81d4bc33ca64916068e5f92abee030e4b 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -15,0 +16,4 @@ use crate::host::host;
++#[cfg(test)]
++#[path = "overlap_test.rs"]
++mod overlap_test;
++
+@@ -1555 +1559 @@ impl HostHeap {
+-            if let Some(kept) = make(&view, self.cpu(slot)) {
++            if let Some(kept) = self.make_slot(slot, &view) {
+@@ -1596,0 +1601 @@ impl HostHeap {
++        self.write_stride(index, 0);
+@@ -1765,2 +1770 @@ impl HostHeap {
+-    /// buffers from the heap: its element stride in the table, and whether
+-    /// it is a buffer view at all.
++    /// buffers from the heap, including whether it is a buffer view at all.
+@@ -1836,7 +1839,0 @@ impl HostHeap {
+-        if let Some((_, _, data, _)) = &self.strides
+-            && index < victory_shader::emit::SLOT_STRIDES_COUNT
+-        {
+-            // SAFETY: inside the mapping; shaders read it while we write (a
+-            // dword, either value is one the slot had).
+-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
+-        }
+@@ -1880 +1877 @@ impl HostHeap {
+-        let kept = make(view, self.cpu(index));
++        let kept = self.make_slot(index, view);
+@@ -1886,0 +1884,29 @@ impl HostHeap {
++    fn make_slot(&self, index: u32, view: &View) -> Option<Kept> {
++        use victory_shader::emit::{VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDE_BITS};
++        let mut bias = 0;
++        let kept = make(view, self.cpu(index), &mut bias);
++        let word = if kept.is_some() {
++            (view_stride(view).unwrap_or(0) & VIEW_STRIDE_BITS) | ((bias / 4) << VIEW_RAW_OFFSET_SHIFT)
++        } else {
++            0
++        };
++        self.write_stride(index, word);
++        #[cfg(feature = "diagnostics")]
++        if bias != 0 && kept.is_some() {
++            static FIRST_BIASED_VIEW: std::sync::Once = std::sync::Once::new();
++            FIRST_BIASED_VIEW.call_once(|| {
++                tracing::info!(index, bias, stride = word & VIEW_STRIDE_BITS, "unaligned structured view bound raw");
++            });
++        }
++        kept
++    }
++
++    fn write_stride(&self, index: u32, word: u32) {
++        if let Some((_, _, data, _)) = &self.strides
++            && index < victory_shader::emit::SLOT_STRIDES_COUNT
++        {
++            // SAFETY: the index lies in the persistently mapped table.
++            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
++        }
++    }
++
+@@ -1894,0 +1921 @@ impl HostHeap {
++        self.write_stride(index, 0);
+@@ -1934,0 +1962 @@ impl HostHeap {
++        self.write_stride(index, 1);
+@@ -1940,0 +1969 @@ impl HostHeap {
++        self.write_stride(index, 0);
+@@ -1973,0 +2003 @@ impl HostHeap {
++        self.write_stride(index, 1);
+@@ -1979,0 +2010 @@ impl HostHeap {
++        self.write_stride(index, 0);
+@@ -2015,0 +2047 @@ impl HostHeap {
++        self.write_stride(index, 0);
+@@ -2506,0 +2539 @@ impl HostHeap {
++                self.write_stride(index, 0);
+@@ -2509 +2542 @@ impl HostHeap {
+-                make(&view, self.cpu(index))
++                self.make_slot(index, &view)
+@@ -2744,4 +2777,2 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
+-    // A view off its buffer's elements is made on a copy of its own bytes
+-    // (`own_bytes`): the same question `buffer_srv` and `buffer_uav` ask,
+-    // of the copy they find, so that the copy brought up to date is the
+-    // one the slot shows.
++    // Use the same shadow as descriptor creation. A raw view including
++    // a prefix still refreshes just the logical title range.
+@@ -2751,11 +2781,0 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
+-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
+-        && let Some(own) = crate::shadow::exact(start, bytes)
+-    {
+-        return Some((own, start, bytes));
+-    }
+-    if view_extent()
+-        && let Some((base, width)) = buffer_extent(view)
+-        // (The console is lax: a view may begin past its buffer's end.)
+-        && address >= base
+-        && address - base < width.max(1)
+-        && let Some(shadow) = crate::shadow::find(base, width)
+@@ -2763 +2783,12 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
+-        return Some((shadow, address, len));
++        let offset = whole.offset(base);
++        if let Some((start, bytes)) = own_bytes(offset, base, first, count, element, stride, unknown)
++            && let Some(own) = crate::shadow::exact(start, bytes)
++        {
++            return Some((own, start, bytes));
++        }
++        if (view_extent() || (unknown && raw_window(offset, first, count, stride).is_some()))
++            && address >= base
++            && address - base < width.max(1)
++        {
++            return Some((whole, address, len));
++        }
+@@ -3113,4 +3144,4 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+-/// the bytes must start on 16 (the host's raw view alignment) and be whole
+-/// dwords. A view that cannot stays structured.
+-fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32)> {
+-    if stride == 0 {
++/// the bytes must be whole dwords. Start on the preceding 16-byte boundary
++/// and publish the prefix separately so overlapping views share the copy.
++fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64, u32, u32)> {
++    if count == 0 || stride == 0 || !stride.is_multiple_of(4) {
+@@ -3120,4 +3151,10 @@ fn raw_window(offset: u64, first: u64, count: u32, stride: u32) -> Option<(u64,
+-    let bytes = u64::from(count) * u64::from(stride);
+-    (start % 16 == 0 && bytes % 4 == 0)
+-        .then(|| u32::try_from(bytes / 4).ok().map(|dwords| (start / 4, dwords)))
+-        .flatten()
++    if !start.is_multiple_of(4) {
++        return None;
++    }
++    let prefix = start % 16;
++    let bytes = u64::from(count) * u64::from(stride) + prefix;
++    // A wrapped shader address uses the last aligned u32 as an out-of-bounds offset.
++    if prefix != 0 && bytes > u64::from(u32::MAX & !3) {
++        return None;
++    }
++    Some(((start - prefix) / 4, u32::try_from(bytes / 4).ok()?, prefix as u32))
+@@ -3167,0 +3205 @@ fn buffer_srv(
++    bias: &mut u32,
+@@ -3193 +3231,2 @@ fn buffer_srv(
+-    if let Some((first, count)) = window {
++    if let Some((first, count, prefix)) = window {
++        *bias = prefix;
+@@ -3206 +3245 @@ fn buffer_srv(
+-        if element == 0 || offset % element != 0 {
++        if structured.StructureByteStride != 0 || element == 0 || offset % element != 0 {
+@@ -3255,0 +3295 @@ fn buffer_uav(
++    bias: &mut u32,
+@@ -3301 +3341,2 @@ fn buffer_uav(
+-    if let Some((first, count)) = window {
++    if let Some((first, count, prefix)) = window {
++        *bias = prefix;
+@@ -3307,2 +3348,2 @@ fn buffer_uav(
+-        if element == 0 || offset % element != 0 {
+-            once!(offset, element, "unordered buffer view not on an element of its host copy");
++        if buffer.StructureByteStride != 0 || element == 0 || offset % element != 0 {
++            once!(offset, element, "unordered buffer view cannot be represented on its host copy");
+@@ -3476,3 +3517,3 @@ fn twin_uav(
+-/// Makes the host descriptor for `view` at `at`: the host resource it
+-/// views, or `None` if it cannot.
+-fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
++/// Makes the descriptor and returns its backing resource. An aligned
++/// raw descriptor that begins before the logical view sets `bias`.
++fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE, bias: &mut u32) -> Option<Kept> {
+@@ -3569 +3610 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+-                buffer_srv(data as u64, len, srv_desc(desc), at)
++                buffer_srv(data as u64, len, srv_desc(desc), at, bias)
+@@ -3579 +3620 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+-                        buffer_uav(data as u64, len, uav_desc(desc), at)
++                        buffer_uav(data as u64, len, uav_desc(desc), at, bias)
+@@ -3648 +3689 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+-                return make(&view, at);
++                return make(&view, at, bias);
+@@ -3668 +3709 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+-                buffer_uav(address, len, uav_desc(words), at)
++                buffer_uav(address, len, uav_desc(words), at, bias)
+@@ -3670 +3711 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+-                buffer_srv(address, len, srv_desc(words), at)
++                buffer_srv(address, len, srv_desc(words), at, bias)
+@@ -4008,2 +4049,2 @@ mod tests {
+-        let (first, count) = raw_window(32, 8, 100, 20).unwrap();
+-        assert_eq!((first, count), (48, 500));
++        let (first, count, bias) = raw_window(32, 8, 100, 20).unwrap();
++        assert_eq!((first, count, bias), (48, 500, 0));
+@@ -4015 +4056,8 @@ mod tests {
+-        assert!(raw_window(4, 0, 100, 20).is_none());
++        for prefix in [4, 8, 12] {
++            assert_eq!(raw_window(u64::from(prefix), 0, 100, 20), Some((0, 500 + prefix / 4, prefix)));
++        }
++        assert!(raw_window(2, 0, 100, 20).is_none());
++        assert!(raw_window(4, 0, 0, 20).is_none());
++        assert!(raw_window(4, 0, u32::MAX, 20).is_none());
++        assert_eq!(raw_window(12, 0, 0x3fff_fffc, 4), Some((0, 0x3fff_ffff, 12)));
++        assert!(raw_window(12, 0, 0x3fff_fffd, 4).is_none());
+@@ -4637,3 +4685,3 @@ mod own_copy_tests {
+-        // A structured view of 32-byte elements 8 bytes in: not on 16, so
+-        // no raw view of the copy either.
+-        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true), Some((base + 64, 128)));
++        // Both dword-aligned structured views share the buffer's copy.
++        assert_eq!(own_bytes_if(true, 8, base, 2, 4, 32, 32, true), None);
++        assert_eq!(own_bytes_if(true, 2, base, 2, 4, 32, 32, true), Some((base + 64, 128)));
+diff --git a/crates/victory-gpu/src/descriptor/overlap_test.rs b/crates/victory-gpu/src/descriptor/overlap_test.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..352b04d133383cfb09003a3b56d73f0d03742e15
+--- /dev/null
++++ b/crates/victory-gpu/src/descriptor/overlap_test.rs
+@@ -0,0 +1,311 @@
++use super::*;
++use crate::host::Host;
++use victory_shader::emit::{HostShader, SLOT_STRIDES};
++use victory_shader::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++
++const LANES: usize = 32;
++const FIELDS: usize = 3;
++const DWORDS: usize = LANES * FIELDS + 3;
++const BYTES: usize = DWORDS * 4;
++const WRITER_SLOT: u32 = 5;
++
++// Each lane addresses element v0 of the heap view at s0. Readers export the
++// selected field through a separate raw output UAV in s2. Writers store the
++// lane index, distinguishable from the initial values in every backing dword.
++fn shader(write: bool, field: usize) -> HostShader {
++    let mut code = vec![
++        0x8F04_8500, // s_lshl_b32 s4, s0, 5
++        0xBE86_0301,
++        0xBE87_0380, // s[6:7] = resource heap
++        0xF408_0203,
++        0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
++    ];
++    let byte = (field * 4) as u32;
++    if write {
++        code.extend([
++            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++            0xE070_2000 | byte,
++            0x8002_0000, // store v0 to elem v0, s[8:11]
++        ]);
++    } else {
++        code.extend([
++            0xBE8C_0302,
++            0xBE8D_0380, // s[12:13] = output table
++            0xF408_0406,
++            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
++            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
++            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++            0xE030_2000 | byte,
++            0x8002_0200, // load v2 from elem v0, s[8:11]
++            0xBF8C_3F70, // s_waitcnt vmcnt(0)
++            0xE070_1000,
++            0x8004_0201, // store v2 to raw byte v1, s[16:19]
++        ]);
++    }
++    code.push(0xBF81_0000); // s_endpgm
++    let layout = [RootType::Constants, RootType::ResourceHeap, RootType::Table]
++        .into_iter()
++        .enumerate()
++        .map(|(slot, root)| RootParam {
++            root,
++            table_offset_dwords: 0,
++            sgprs: 1,
++            base_register: 0,
++            user_data: slot as u8,
++            slot: slot as u8,
++        })
++        .collect();
++    let output = UsedResource {
++        kind: ResourceType::Uav,
++        root: RootType::Table,
++        table_offset_dwords: 0,
++        lower_bound: 0,
++        stride: 0,
++        dwords: 4,
++        user_data: 2,
++        slot: 2,
++    };
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs: 8,
++        layout,
++        used: if write { vec![] } else { vec![output] },
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 3 << 1,
++            threads: [LANES as u32, 1, 1],
++        }),
++        code: code.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    };
++    let ir = victory_shader::ir::build(&native.code, native.wave64, native.vgprs).unwrap();
++    let st = victory_shader::structure::structure(&ir).unwrap();
++    let res =
++        victory_shader::resource::track(&ir, &native.layout, native.stage, Some(&st)).unwrap();
++    let io = victory_shader::io::raise(&ir, &native).unwrap();
++    let signatures = victory_shader::Container {
++        digest: [0; 16],
++        version: (1, 0),
++        parts: Vec::new(),
++    };
++    let emitted = victory_shader::emit::emit(&signatures, &native, &ir, &st, &io, &res).unwrap();
++    assert_eq!(emitted.root_srvs, [SLOT_STRIDES]);
++    emitted
++}
++
++struct Kernel {
++    shader: HostShader,
++    root: ID3D12RootSignature,
++    pso: ID3D12PipelineState,
++}
++
++impl Kernel {
++    fn new(device: &victory_shader::emit::host::Host, write: bool, field: usize) -> Self {
++        let shader = shader(write, field);
++        let (root, pso) = device
++            .compute_pipeline(&shader)
++            .expect("overlap compute pipeline");
++        Self { shader, root, pso }
++    }
++
++    fn run(
++        &self,
++        host: &Host,
++        heap: &HostHeap,
++        slot: u32,
++        backing: &std::sync::Arc<crate::shadow::Shadow>,
++        address: u64,
++    ) {
++        let list = host.new_list().unwrap();
++        // As in draw::State::heap_buffers, merge the overlapping view ranges
++        // and defer their refresh until submission.
++        backing.refresh(&list, address, BYTES as u64);
++        let mut ud = vec![0; self.shader.user_data_dwords().max(1) as usize];
++        for u in &self.shader.user_data {
++            ud[u.index as usize] = match u.root {
++                RootType::Constants => slot,
++                RootType::Table => 0,
++                other => panic!("unexpected root {other:?}"),
++            };
++        }
++        // SAFETY: all descriptors, resources and root arguments live through
++        // the waited submission. Each buffer implicitly promotes from COMMON.
++        unsafe {
++            list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
++            list.list.SetComputeRootSignature(&self.root);
++            list.list.SetPipelineState(&self.pso);
++            list.list
++                .SetComputeRoot32BitConstants(0, ud.len() as u32, ud.as_ptr().cast(), 0);
++            list.list
++                .SetComputeRootShaderResourceView(1, heap.strides_gpu().unwrap());
++            list.list.Dispatch(1, 1, 1);
++        }
++        list.close();
++        // Fence completion and implicit buffer decay precede the next run.
++        host.execute(&[&list]);
++        // SAFETY: status query on the live device.
++        unsafe { host.device.GetDeviceRemovedReason().unwrap() };
++    }
++}
++
++/// A write-watched page, with one registered buffer covering all four overlapping views.
++struct Memory(usize);
++
++impl Memory {
++    fn new(initial: &[u32; DWORDS]) -> Self {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
++        };
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++        // SAFETY: one fresh page holds the initialized test dwords.
++        let p = unsafe {
++            VirtualAlloc(
++                std::ptr::null(),
++                crate::watch::PAGE,
++                MEM_COMMIT | MEM_RESERVE | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            )
++        };
++        assert!(!p.is_null());
++        crate::watch::title_memory_reserved(p as usize, crate::watch::PAGE, false);
++        // SAFETY: p is page-aligned and DWORDS initialized dwords fit in the page.
++        unsafe { std::ptr::copy_nonoverlapping(initial.as_ptr(), p.cast::<u32>(), DWORDS) };
++        crate::shadow::register(p as usize, p as u64, BYTES as u64);
++        Self(p as usize)
++    }
++}
++
++impl Drop for Memory {
++    fn drop(&mut self) {
++        use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
++        crate::inplace::title_memory_freeing(self.0, crate::watch::PAGE);
++        crate::shadow::unregister(self.0, self.0 as u64);
++        // SAFETY: the test owns this allocation; execute waits for each submission.
++        unsafe { VirtualFree(self.0 as *mut _, 0, MEM_RELEASE) };
++    }
++}
++
++fn metadata(heap: &HostHeap, slot: u32) -> u32 {
++    let data = heap.strides.as_ref().unwrap().2 as *const u32;
++    // SAFETY: all test slots are inside the mapped stride table, with the GPU idle.
++    unsafe { data.add(slot as usize).read_volatile() }
++}
++
++fn mirror(
++    heap: &HostHeap,
++    slot: u32,
++    base: u64,
++    prefix: usize,
++    write: bool,
++    backing: &ID3D12Resource,
++) {
++    let address = base + (prefix * 4) as u64;
++    let mut resource = [0; 14];
++    resource[0] = 1; // D3D12_RESOURCE_DIMENSION_BUFFER
++    resource[4] = (BYTES - prefix * 4) as u32;
++    let mut words = [0; 16];
++    words[10] = address as u32;
++    words[11] = (address >> 32) as u32;
++    let mut record = [0u32; 8];
++    let handle = record.as_mut_ptr() as u64;
++    if write {
++        words[1] = D3D12_UAV_DIMENSION_BUFFER.0 as u32;
++        words[4] = LANES as u32;
++        words[5] = (FIELDS * 4) as u32;
++        crate::descriptor::create_placed_uav(std::ptr::null(), &resource, &words, handle);
++    } else {
++        words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
++        words[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        words[6] = LANES as u32;
++        words[7] = (FIELDS * 4) as u32;
++        crate::descriptor::create_placed_srv(std::ptr::null(), &resource, &words, handle);
++    }
++    let view = heap.mirror(slot, handle, true).unwrap();
++    let (copy, start, len) = buffer_copy(&view).unwrap();
++    assert_eq!((start, len), (address, (LANES * FIELDS * 4) as u64));
++    assert_eq!(&copy.buffer, backing, "refresh uses a different shadow");
++    assert_eq!(
++        heap.kept.lock().unwrap()[slot as usize].as_ref(),
++        Some(backing),
++        "descriptor uses a different resource"
++    );
++    assert_eq!(
++        metadata(heap, slot),
++        (FIELDS * 4) as u32 | ((prefix as u32) << 28)
++    );
++}
++
++#[test]
++fn gpu_writes_visible_through_overlapping_views() {
++    let host = host().expect("D3D12 device required for overlap readback");
++    let initial: [u32; DWORDS] = std::array::from_fn(|i| 0xa170_0000 + i as u32);
++    let memory = Memory::new(&initial);
++    let base = memory.0 as u64;
++    let backing = crate::shadow::find(base, BYTES as u64).unwrap();
++    let heap = HostHeap::new(false, 128).unwrap();
++    let device = victory_shader::emit::host::Host {
++        device: host.device.clone(),
++    };
++    let writer = Kernel::new(&device, true, FIELDS - 1);
++    let readers: [_; FIELDS] = std::array::from_fn(|field| Kernel::new(&device, false, field));
++    let (output, mapped) = host.shared_buffer((LANES * 4) as u64).unwrap();
++    heap.raw_uav_at(0, &output, 0, (LANES * 4) as u64);
++
++    for prefix in 0..4 {
++        mirror(
++            &heap,
++            1 + prefix as u32,
++            base,
++            prefix,
++            false,
++            &backing.buffer,
++        );
++    }
++    // An invalid record goes through make_null and clears the made key.
++    // Reusing the original SRV then has to restore both its resource and bias.
++    let empty = [0u32; 8];
++    assert!(heap.mirror(4, empty.as_ptr() as u64, true).is_none());
++    assert_eq!(metadata(&heap, 4), 0);
++    assert!(heap.kept.lock().unwrap()[4].is_none());
++    mirror(&heap, 4, base, 3, false, &backing.buffer);
++
++    let mut expected = initial;
++    for writer_prefix in 0..4 {
++        mirror(
++            &heap,
++            WRITER_SLOT,
++            base,
++            writer_prefix,
++            true,
++            &backing.buffer,
++        );
++        writer.run(host, &heap, WRITER_SLOT, &backing, base);
++        for lane in 0..LANES {
++            expected[writer_prefix + lane * FIELDS + FIELDS - 1] = lane as u32;
++        }
++        for prefix in 0..4 {
++            for (field, reader) in readers.iter().enumerate() {
++                // SAFETY: the preceding dispatch completed; output holds LANES dwords.
++                unsafe { std::ptr::write_bytes(mapped, 0x55, LANES * 4) };
++                reader.run(host, &heap, 1 + prefix as u32, &backing, base);
++                // SAFETY: execute waited for the reader; the mapping is live.
++                let values = unsafe { std::slice::from_raw_parts(mapped.cast::<u32>(), LANES) };
++                for (lane, value) in values.iter().enumerate() {
++                    assert_eq!(
++                        *value,
++                        expected[prefix + lane * FIELDS + field],
++                        "writer +{} reader +{} field {field} lane {lane}",
++                        writer_prefix * 4,
++                        prefix * 4
++                    );
++                }
++            }
++        }
++    }
++    // SAFETY: memory owns these initialized dwords; all submissions have finished.
++    assert_eq!(
++        unsafe { (memory.0 as *const [u32; DWORDS]).read() },
++        initial
++    );
++}
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 647349ca8bc5b9e18adf28355a41ce235065c6ca..93fe7c149a2144e3b165a7aa812ad66a54d292dd 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -2225 +2225,2 @@ impl State {
+-    /// table of element strides, with every buffer view of the heap given
++    /// table of per-slot metadata (stride in bits 0–27, raw start bias in
++    /// dwords in bits 28–29, typed-format flags in bits 30–31), with every buffer view given
+@@ -5122,0 +5124,60 @@ mod tests {
++    /// The slot and its submission-time refresh must agree on the backing.
++    #[test]
++    fn placed_structured_views_share_the_buffer_and_off_element_typed_views_keep_their_copy() {
++        use crate::descriptor::host::{HostHeap, buffer_copy};
++        use std::sync::Arc;
++
++        if crate::host::host().is_none() {
++            return;
++        }
++        let bytes = vec![0u8; 1 << 16];
++        let start = bytes.as_ptr() as u64;
++        struct Registered(u64);
++        impl Drop for Registered {
++            fn drop(&mut self) {
++                crate::shadow::unregister(self.0 as usize, self.0);
++            }
++        }
++        crate::shadow::register(start as usize, start, bytes.len() as u64);
++        let _registered = Registered(start);
++        let whole = crate::shadow::find(start, bytes.len() as u64).unwrap();
++        let view = |offset: u64, stride: u32| {
++            let address = start + offset;
++            let width = 4 * if stride == 0 { 16 } else { stride };
++            let resource = [1, 0, 0, 0, width, 0, 1, 1 | 1 << 16, 0, 1, 0, 1, 0, 0];
++            let mut desc = [0; 16];
++            // DXGI_FORMAT_R32G32B32A32_FLOAT or a structured view.
++            desc[..10].copy_from_slice(&[if stride == 0 { 2 } else { 0 }, 1, 5768, 0, 0, 0, 4, stride, 0, 0]);
++            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
++            View::Placed(false, resource, desc)
++        };
++        let heap = HostHeap::new(false, 1).unwrap();
++        for offset in [96, 100, 104, 108, 456] {
++            let structured = view(offset, 456);
++            heap.make_at(0, &structured);
++            let (copy, address, len) = buffer_copy(&structured).unwrap();
++            #[cfg(feature = "diagnostics")]
++            assert_eq!(heap.shows(0, &copy.buffer), Some(true));
++            assert!(Arc::ptr_eq(&whole, &copy));
++            assert_eq!((address, len), (start + offset, 4 * 456));
++        }
++        assert!(Arc::ptr_eq(&whole, &buffer_copy(&view(16, 0)).unwrap().0));
++        let typed = view(100, 0);
++        let (copy, address, len) = buffer_copy(&typed).unwrap();
++        assert_eq!((copy.span(), address, len), ((start + 100, 64), start + 100, 64));
++        let shown = Arc::downgrade(&copy);
++        heap.make_at(0, &typed);
++        #[cfg(feature = "diagnostics")]
++        assert_eq!(heap.shows(0, &copy.buffer), Some(true));
++        drop(copy);
++        for k in 1..1500 {
++            let offset = 100 + 4 * k;
++            if offset % 16 != 0 {
++                buffer_copy(&view(offset, 0)).unwrap();
++            }
++        }
++        let found = buffer_copy(&typed).unwrap().0;
++        assert!(shown.upgrade().is_some_and(|s| Arc::ptr_eq(&s, &found)));
++        heap.make_null(0);
++    }
++
+diff --git a/crates/victory-shader/src/emit/intersect.rs b/crates/victory-shader/src/emit/intersect.rs
+index 9b5b022b254f477ef54136a9e2ae53ab4445ba9e..4aa42cc00e1b5687ae89efbc6b6251cf8855f3f9 100644
+--- a/crates/victory-shader/src/emit/intersect.rs
++++ b/crates/victory-shader/src/emit/intersect.rs
+@@ -46 +46 @@ enum NodeAt {
+-    Buffer { handle: V, byte: V },
++    Buffer { handle: V, byte: V, bias: Option<V> },
+@@ -152 +152,2 @@ impl<'a> Lower<'a> {
+-                NodeAt::Buffer { handle, byte }
++                let bias = self.raw_slot_word(src, handle).map(|word| self.slot_bias(word));
++                NodeAt::Buffer { handle, byte, bias }
+@@ -291 +292 @@ impl<'a> Lower<'a> {
+-                NodeAt::Buffer { handle, byte } => (handle, byte),
++                NodeAt::Buffer { handle, byte, .. } => (handle, byte),
+@@ -305,0 +307,4 @@ impl<'a> Lower<'a> {
++            let byte = match at {
++                NodeAt::Buffer { bias, .. } => self.raw_byte(byte, bias),
++                NodeAt::Memory { .. } => byte,
++            };
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 2be1060fef3d93ab65c746dba85e0123e426a80b..b9818d9e9df5267f793d8ee09191ca577c157439 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -223,3 +223,2 @@ struct Lower<'a> {
+-    /// Element strides read from the host's table by heap slot
+-    /// ([`super::shader::SLOT_STRIDES`]), by block and descriptor load.
+-    strides: HashMap<(usize, Site, u8), V>,
++    /// Packed view words, by block and effective heap slot.
++    strides: HashMap<(usize, V), V>,
+@@ -5943,5 +5942,13 @@ impl<'a> Lower<'a> {
+-        let picked = match kind {
+-            None => self.slot_stride(src)?,
+-            Some(_) => None,
+-        };
+-        if let Some(stride) = picked {
++        if kind.is_none() && self.picked_buffer(src) {
++            // The slot can contain a CBV. Create each handle only inside its matching arm.
++            let (slot, per_lane) = match src {
++                Source::Phi { block, args } => (self.descriptor_phi(*block, args, false, 8)?, false),
++                Source::Loaded { load, first } => (
++                    self.heap_index(*load, *first, false)?,
++                    self.x.res.waterfall.loads.contains(load),
++                ),
++                _ => (self.lane_heap_index(src, false)?, !matches!(src, Source::Select { .. })),
++            };
++            let word = self.slot_word(slot);
++            let stride = self.slot_element(word);
++            let bias = Some(self.slot_bias(word));
+@@ -5951 +5958,2 @@ impl<'a> Lower<'a> {
+-            let h = self.handle(site, src, false, (11, 0))?;
++            let h = self.s.heap_handle(self.cur, slot, false, per_lane, (11, 0));
++            let raw_addr = self.raw_byte(addr, bias);
+@@ -5955 +5963 @@ impl<'a> Lower<'a> {
+-                raw = self.raw_dwords(b, h, addr, count).into_iter().map(|x| (x, zero)).collect();
++                raw = self.raw_dwords(b, h, raw_addr, count, bias).into_iter().map(|x| (x, zero)).collect();
+@@ -5960 +5968 @@ impl<'a> Lower<'a> {
+-                let a = self.s.m.bin(b, Bin::Add, addr, off);
++                let a = self.raw_following(raw_addr, off, bias);
+@@ -5978 +5986 @@ impl<'a> Lower<'a> {
+-            let h = self.handle(site, src, false, (13, 0x1_0000))?;
++            let h = self.s.heap_handle(self.cur, slot, false, per_lane, (13, 0x1_0000));
+@@ -5994,0 +6003,2 @@ impl<'a> Lower<'a> {
++            let bias = self.raw_slot_word(src, h).map(|word| self.slot_bias(word));
++            let addr = self.raw_byte(addr, bias);
+@@ -5996 +6006 @@ impl<'a> Lower<'a> {
+-                let dwords = self.raw_dwords(c, h, addr, count);
++                let dwords = self.raw_dwords(c, h, addr, count, bias);
+@@ -6004 +6014 @@ impl<'a> Lower<'a> {
+-                let a = self.s.m.bin(c, Bin::Add, addr, off);
++                let a = self.raw_following(addr, off, bias);
+@@ -6223,4 +6233,3 @@ impl<'a> Lower<'a> {
+-            Fields::Buffer { idxen, format, .. } => {
+-                let stride = used.map_or(0, |u| u.stride);
+-                let props = if un.starts_with("buffer_load_format")
+-                    || un.starts_with("buffer_store_format")
++            Fields::Buffer { format, .. } => {
++                let props = if format.is_none() && (un.starts_with("buffer_load_format")
++                    || un.starts_with("buffer_store_format"))
+@@ -6229,2 +6237,0 @@ impl<'a> Lower<'a> {
+-                } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4) {
+-                    (12 | u, stride)
+@@ -6306 +6313,7 @@ impl<'a> Lower<'a> {
+-                let n = field(self, 0);
++                let mut n = field(self, 0);
++                let word = self.raw_slot_word(&src, h);
++                if let Some(word) = word {
++                    let bias = self.slot_bias(word);
++                    let bytes = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[n, bias]); // UMax
++                    n = self.s.m.bin(c, Bin::Sub, bytes, bias);
++                }
+@@ -6310,0 +6324,5 @@ impl<'a> Lower<'a> {
++                } else if let Some(word) = word && used.is_none() {
++                    let stride = self.slot_element(word);
++                    let one = self.s.m.i32(1);
++                    let stride = self.s.op(c, "binary.i32", Attr::ReadNone, i32t, 39, &[stride, one]);
++                    self.s.m.bin(c, Bin::UDiv, n, stride)
+@@ -6455 +6473 @@ impl<'a> Lower<'a> {
+-    fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32) -> Vec<V> {
++    fn raw_dwords(&mut self, b: usize, h: V, addr: V, count: u32, bias: Option<V>) -> Vec<V> {
+@@ -6464 +6482 @@ impl<'a> Lower<'a> {
+-                self.s.m.bin(b, Bin::Add, addr, off)
++                self.raw_following(addr, off, bias)
+@@ -6872,15 +6890,17 @@ impl<'a> Lower<'a> {
+-    /// The bytes per element of the buffer view `src` names, if the program
+-    /// picks it from the view heap at an index it computes (root type
+-    /// `ResourceHeap`): read from the host's table by heap slot in the
+-    /// current block.
+-    fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+-        let Source::Loaded { load, first } = src else {
+-            return Ok(None);
+-        };
+-        let heap = self
+-            .scalar
+-            .get(load)
+-            .and_then(|a| self.x.native.layout.get(a.param))
+-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+-        if !heap {
+-            return Ok(None);
++    /// A heap selection has no statically declared element size.
++    fn picked_buffer(&self, src: &Source) -> bool {
++        src.leaves().into_iter().any(|leaf| {
++            matches!(leaf, Source::Fetched { load, .. } | Source::Loaded { load, .. }
++                if self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param))
++                    .is_some_and(|rp| rp.root == RootType::ResourceHeap))
++        })
++    }
++
++    /// The bias is present on structured table views and can occur at a computed heap slot.
++    /// Read the very slot used to create the handle, including uniform and per-lane joins.
++    fn raw_slot_word(&mut self, src: &Source, h: V) -> Option<V> {
++        let slot = *self.s.raw_slots.get(&h)?;
++        if !self.picked_buffer(src)
++            && !src.leaves().into_iter().any(|leaf| self.used_kind(leaf).is_some_and(|u| u.stride >= 4))
++        {
++            return None;
+@@ -6888 +6908,6 @@ impl<'a> Lower<'a> {
+-        let key = (self.cur, *load, *first);
++        Some(self.slot_word(slot))
++    }
++
++    fn slot_word(&mut self, slot: V) -> V {
++        let c = self.cur;
++        let key = (c, slot);
+@@ -6890 +6915 @@ impl<'a> Lower<'a> {
+-            return Ok(Some(v));
++            return v;
+@@ -6892,2 +6916,0 @@ impl<'a> Lower<'a> {
+-        let c = self.cur;
+-        let slot = self.heap_index(*load, *first, false)?;
+@@ -6896 +6919,3 @@ impl<'a> Lower<'a> {
+-        let last = self.s.m.i32(super::shader::SLOT_STRIDES_COUNT - 1);
++        let last = super::SLOT_STRIDES_COUNT - 1;
++        let limit = super::view_heap_limit();
++        let last = self.s.m.i32(if limit == 0 { last } else { last.min(limit) });
+@@ -6917 +6942,34 @@ impl<'a> Lower<'a> {
+-        Ok(Some(v))
++        v
++    }
++
++    fn slot_element(&mut self, word: V) -> V {
++        let mask = self.s.m.i32(super::VIEW_STRIDE_BITS);
++        self.s.m.bin(self.cur, Bin::And, word, mask)
++    }
++
++    fn slot_bias(&mut self, word: V) -> V {
++        let shift = self.s.m.i32(super::VIEW_RAW_OFFSET_SHIFT - 2);
++        let mask = self.s.m.i32(12);
++        let shifted = self.s.m.bin(self.cur, Bin::LShr, word, shift);
++        self.s.m.bin(self.cur, Bin::And, shifted, mask)
++    }
++
++    /// Host raw windows with a prefix contain at most 0xffff_fffc bytes.
++    /// A wrapped offset must miss the view, even for a store or compare-exchange.
++    fn raw_byte(&mut self, byte: V, bias: Option<V>) -> V {
++        let Some(bias) = bias else { return byte };
++        let physical = self.s.m.bin(self.cur, Bin::Add, byte, bias);
++        let wrapped = self.s.m.cmp(self.cur, pred::IULT, physical, byte);
++        let outside = self.s.m.i32(0xffff_fffc);
++        self.s.m.select(self.cur, wrapped, outside, physical)
++    }
++
++    fn raw_following(&mut self, physical: V, delta: V, bias: Option<V>) -> V {
++        let next = self.s.m.bin(self.cur, Bin::Add, physical, delta);
++        let Some(bias) = bias else { return next };
++        let wrapped = self.s.m.cmp(self.cur, pred::IULT, next, physical);
++        let zero = self.s.m.i32(0);
++        let biased = self.s.m.cmp(self.cur, pred::NE, bias, zero);
++        let miss = self.s.m.bin(self.cur, Bin::And, wrapped, biased);
++        let outside = self.s.m.i32(0xffff_fffc);
++        self.s.m.select(self.cur, miss, outside, next)
+@@ -10866,30 +10923,0 @@ impl<'a> Lower<'a> {
+-        // A buffer the program picks from the view heap by an index it
+-        // computes: no used-resource entry gives its stride, the host's
+-        // table by heap slot does; the access becomes a raw one at the
+-        // element's byte. (Also tells the host this shader reads such
+-        // buffers.)
+-        let mut index = index;
+-        if let Some(stride) = self.slot_stride(src)?
+-            && let Some(element) = index
+-            && !typed
+-            && used.is_none()
+-        {
+-            let at = self.s.m.bin(c, Bin::Mul, element, stride);
+-            off = self.s.m.bin(c, Bin::Add, at, off);
+-            index = None;
+-        }
+-        // A structured buffer by its used-resource entry's stride: raw
+-        // bytes too. The host makes its buffer views raw (a raw read
+-        // through a structured view gives zeros on NVIDIA), and one kind
+-        // of view can then serve every shader that reads the buffer.
+-        if let (Some(element), Some(u)) = (index, used)
+-            && !typed
+-            && u.kind != ResourceType::Cbv
+-            && u.stride >= 4
+-            && u.stride.is_multiple_of(4)
+-        {
+-            let k = self.s.m.i32(u.stride);
+-            let at = self.s.m.bin(c, Bin::Mul, element, k);
+-            off = self.s.m.bin(c, Bin::Add, at, off);
+-            index = None;
+-        }
+@@ -10921,0 +10950,21 @@ impl<'a> Lower<'a> {
++        // PR995 makes structured views raw. Scale the logical index before adding the
++        // selected descriptor's prefix; root views already have their own built_offset.
++        let raw = !typed || format.is_some();
++        if !raw && self.picked_buffer(src) {
++            // t255 also signals that the host must materialize picked buffer views.
++            self.s.root_srv_handle(super::SLOT_STRIDES);
++        }
++        let props = if raw { (11 | u, 0) } else { (10 | u, 0x409) };
++        let h = self.handle(site, src, false, props)?;
++        let word = self.raw_slot_word(src, h);
++        if !typed && let Some(element) = index {
++            let stride = match (used.map(|u| u.stride), word) {
++                (Some(1), _) => self.s.m.i32(1),
++                (Some(n), _) if n >= 4 && n.is_multiple_of(4) => self.s.m.i32(n),
++                (None, Some(word)) => self.slot_element(word),
++                _ => return Err("a structured buffer of unknown stride"),
++            };
++            let row = self.s.m.bin(c, Bin::Mul, element, stride);
++            off = self.s.m.bin(c, Bin::Add, row, off);
++        }
++        let bias = word.map(|word| self.slot_bias(word));
+@@ -10930,8 +10979 @@ impl<'a> Lower<'a> {
+-            let byte = match index {
+-                None => off,
+-                Some(index) if used.is_some_and(|u| u.stride == 1) => {
+-                    self.s.m.bin(c, Bin::Add, index, off)
+-                }
+-                Some(_) => return Err("a byte or 16-bit buffer access by index"),
+-            };
+-            let h = self.handle(site, src, false, (11 | u, 0))?;
++            let byte = off;
+@@ -10943 +10985,4 @@ impl<'a> Lower<'a> {
+-            let next = self.s.m.bin(c, Bin::Add, aligned, four);
++            let aligned = self.raw_byte(aligned, bias);
++            // Compute the high dword from the same physical range. Even a straddling
++            // halfword at UINT_MAX must not wrap the second access into the prefix.
++            let next = self.raw_following(aligned, four, bias);
+@@ -11011,0 +11057 @@ impl<'a> Lower<'a> {
++        let off = self.raw_byte(off, bias);
+@@ -11015,16 +11061 @@ impl<'a> Lower<'a> {
+-            let (h, coords) = match index {
+-                // A raw buffer (stride 1) read by index: the index is the byte.
+-                Some(index) if used.is_some_and(|u| u.stride == 1) => {
+-                    let byte = self.s.m.bin(c, Bin::Add, index, off);
+-                    (self.handle(site, src, false, (11 | u, 0))?, [byte, iu, iu])
+-                }
+-                Some(index) => {
+-                    let stride = used.map_or(0, |u| u.stride);
+-                    if stride < 4 || !stride.is_multiple_of(4) {
+-                        return Err("a structured buffer of unknown stride");
+-                    }
+-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+-                    (h, [index, off, iu])
+-                }
+-                None => (self.handle(site, src, false, (11 | u, 0))?, [off, iu, iu]),
+-            };
++            let coords = [off, iu, iu];
+@@ -11096 +11127 @@ impl<'a> Lower<'a> {
+-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
++                args.push(h);
+@@ -11103,20 +11134 @@ impl<'a> Lower<'a> {
+-                match index {
+-                    // A raw buffer (stride 1) written by index: the index is the byte.
+-                    Some(index) if used.is_some_and(|u| u.stride == 1) => {
+-                        let byte = self.s.m.bin(c, Bin::Add, index, off);
+-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+-                        args.extend([byte, iu]);
+-                    }
+-                    Some(index) => {
+-                        let stride = used.map_or(0, |u| u.stride);
+-                        if stride < 4 || !stride.is_multiple_of(4) {
+-                            return Err("a structured buffer of unknown stride");
+-                        }
+-                        args.push(self.handle(site, src, false, (12 | u, stride))?);
+-                        args.extend([index, off]);
+-                    }
+-                    None => {
+-                        args.push(self.handle(site, src, false, (11 | u, 0))?);
+-                        args.extend([off, iu]);
+-                    }
+-                }
++                args.extend([h, off, iu]);
+@@ -11141 +11152,0 @@ impl<'a> Lower<'a> {
+-            let h = self.handle(site, src, false, (11 | u, 0))?;
+@@ -11157 +11167,0 @@ impl<'a> Lower<'a> {
+-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+@@ -11170,41 +11180,8 @@ impl<'a> Lower<'a> {
+-            match index {
+-                // A raw buffer (stride 1) read by index: the index is the byte.
+-                Some(index) if used.is_some_and(|u| u.stride == 1) => {
+-                    let byte = self.s.m.bin(c, Bin::Add, index, off);
+-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+-                    self.s.op(
+-                        c,
+-                        "rawBufferLoad.f32",
+-                        Attr::ReadOnly,
+-                        self.s.t.res_ret,
+-                        139,
+-                        &[h, byte, iu, mask, align],
+-                    )
+-                }
+-                Some(index) => {
+-                    let stride = used.map_or(0, |u| u.stride);
+-                    if stride < 4 || !stride.is_multiple_of(4) {
+-                        return Err("a structured buffer of unknown stride");
+-                    }
+-                    let h = self.handle(site, src, false, (12 | u, stride))?;
+-                    self.s.op(
+-                        c,
+-                        "rawBufferLoad.f32",
+-                        Attr::ReadOnly,
+-                        self.s.t.res_ret,
+-                        139,
+-                        &[h, index, off, mask, align],
+-                    )
+-                }
+-                None => {
+-                    let h = self.handle(site, src, false, (11 | u, 0))?;
+-                    self.s.op(
+-                        c,
+-                        "rawBufferLoad.f32",
+-                        Attr::ReadOnly,
+-                        self.s.t.res_ret,
+-                        139,
+-                        &[h, off, iu, mask, align],
+-                    )
+-                }
+-            }
++            self.s.op(
++                c,
++                "rawBufferLoad.f32",
++                Attr::ReadOnly,
++                self.s.t.res_ret,
++                139,
++                &[h, off, iu, mask, align],
++            )
+diff --git a/crates/victory-shader/src/emit/lower/paired.rs b/crates/victory-shader/src/emit/lower/paired.rs
+index 7c4f54f825bd6fc4f585462f7de06a30cb67525a..695e0a98db8824e2eed77a499c0efa74ed364eb8 100644
+--- a/crates/victory-shader/src/emit/lower/paired.rs
++++ b/crates/victory-shader/src/emit/lower/paired.rs
+@@ -32 +32 @@ pub(super) struct LaneState {
+-    pub(super) strides: HashMap<(usize, Site, u8), V>,
++    pub(super) strides: HashMap<(usize, V), V>,
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 72f335e6dd2d5ce3298b2ed55de71cffc677d6c9..e96ed47f7b18843d8ec8883ceafd31dd8173301d 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -134 +134 @@ pub use shader::{
+-    set_view_heap_limit, view_heap_limit,
++    VIEW_RAW_OFFSET_BITS, VIEW_RAW_OFFSET_SHIFT, VIEW_STRIDE_BITS, set_view_heap_limit, view_heap_limit,
+diff --git a/crates/victory-shader/src/emit/raw2885_tests.rs b/crates/victory-shader/src/emit/raw2885_tests.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..527dd12f91b582f474c1c36235cde9f97b447ff9
+--- /dev/null
++++ b/crates/victory-shader/src/emit/raw2885_tests.rs
+@@ -0,0 +1,240 @@
++//! Shader-side #2885 fixtures. The raw descriptor begins at the rounded-down
++//! address; only the t255 record gives the logical origin of each view.
++use super::*;
++use crate::emit::SLOT_STRIDES;
++
++const LANES: usize = 32;
++const STRIDES: [u32; 4] = [12, 20, 12, 20];
++
++fn metadata(stride: u32, prefix_words: usize) -> u32 {
++    // Independent encoding of the producer ABI: bits 28..29, in dwords.
++    stride | ((prefix_words as u32) << 28)
++}
++
++fn picked_buffer_shader(write: bool) -> HostShader {
++    // The heap pick and the idxen load/store are from #2885's overlap_test.
++    let mut words = vec![
++        0x8F04_8500, // s_lshl_b32 s4, s0, 5 (heap slot to byte offset)
++        0xBE86_0301,
++        0xBE87_0380,
++        0xF408_0203,
++        0x0800_0000, // s_load_dwordx4 s[8:11], s[6:7], s4
++    ];
++    if write {
++        words.extend([
++            0x4A04_0081, // v_add_nc_u32 v2, 1, v0
++            0xBF8C_C07F, // wait for the descriptor
++            0xE070_2000,
++            0x8002_0200, // store lane+1 to field 0
++            0xE0C8_2004,
++            0x8002_0200, // atomic add lane+1 to field 1
++            0xE0C8_2004,
++            0x8002_0200, // a second add distinguishes it from a store
++        ]);
++    } else {
++        words.extend([
++            0xBE8C_0302,
++            0xBE8D_0380,
++            0xF408_0406,
++            0xFA00_0000, // s_load_dwordx4 s[16:19], s[12:13], 0
++            0x3402_0082, // v_lshlrev_b32 v1, 2, v0
++            0xBF8C_C07F,
++            0xE030_2004,
++            0x8002_0200, // load field 1 of element v0
++            0xBF8C_3F70,
++            0xE070_1000,
++            0x8004_0201, // store result to output[lane]
++        ]);
++    }
++    words.push(0xBF81_0000);
++    let layout = [RootType::Constants, RootType::ResourceHeap, RootType::Table]
++        .into_iter()
++        .enumerate()
++        .map(|(slot, root)| RootParam {
++            root,
++            table_offset_dwords: 0,
++            sgprs: 1,
++            base_register: 0,
++            user_data: slot as u8,
++            slot: slot as u8,
++        })
++        .collect();
++    let output = UsedResource {
++        kind: ResourceType::Uav,
++        root: RootType::Table,
++        table_offset_dwords: 0,
++        lower_bound: 0,
++        stride: 0,
++        dwords: 4,
++        user_data: 2,
++        slot: 2,
++    };
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs: 8,
++        layout,
++        used: if write { vec![] } else { vec![output] },
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 3 << 1,
++            threads: [LANES as u32, 1, 1],
++        }),
++        code: words.iter().flat_map(|w: &u32| w.to_le_bytes()).collect(),
++    };
++    lowered(&native).0
++}
++
++fn on_adapters(mut test: impl FnMut(&Host, &str)) {
++    let _one = crate::emit::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    let mut ran = false;
++    for (label, warp) in [("hardware", false), ("WARP", true)] {
++        if let Ok(host) = Host::new(warp) {
++            test(&host, label);
++            ran = true;
++        }
++    }
++    assert!(ran, "neither hardware nor WARP SM 6.6 adapter available");
++}
++
++fn roots(shader: &HostShader, slot: u32, strides: &[u32]) -> Vec<(u32, Root)> {
++    assert_eq!(shader.root_srvs, [SLOT_STRIDES]);
++    assert!(shader.root_cbvs.is_empty() && shader.root_uavs.is_empty());
++    let mut ud = vec![0; shader.user_data_dwords().max(1) as usize];
++    for u in &shader.user_data {
++        ud[u.index as usize] = match u.root {
++            RootType::Constants => slot,
++            RootType::Table => 0,
++            other => panic!("unexpected user data {other:?}"),
++        };
++    }
++    vec![
++        (0, Root::Constants(ud)),
++        (
++            1,
++            Root::View {
++                srv: true,
++                data: strides.to_vec(),
++            },
++        ),
++    ]
++}
++
++#[test]
++fn heap_reads_use_the_selected_views_stride_and_prefix() {
++    let shader = picked_buffer_shader(false);
++    let mut strides = vec![4]; // output UAV at slot 0
++    let buffers: Vec<Vec<u32>> = STRIDES
++        .iter()
++        .enumerate()
++        .map(|(prefix, &stride)| {
++            strides.push(metadata(stride, prefix));
++            let n = prefix + LANES * stride as usize / 4;
++            (0..n)
++                .map(|i| 10000 * (prefix as u32 + 1) + i as u32)
++                .collect()
++        })
++        .collect();
++    let mut views = vec![View::RawUav(LANES as u32)];
++    views.extend(buffers.iter().map(|data| View::Buffer {
++        data,
++        stride: Stride::Raw,
++    }));
++    on_adapters(|host, label| {
++        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
++        for (prefix, &stride) in STRIDES.iter().enumerate() {
++            let words = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: roots(&shader, prefix as u32 + 1, &strides),
++                        views: &views,
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .expect("readback");
++            let expected: Vec<_> = (0..LANES)
++                .map(|lane| buffers[prefix][prefix + lane * stride as usize / 4 + 1])
++                .collect();
++            assert_eq!(words[0], expected, "{label}, byte prefix {}", 4 * prefix);
++        }
++    });
++}
++
++#[test]
++fn heap_stores_and_atomics_preserve_neighboring_words() {
++    let shader = picked_buffer_shader(true);
++    on_adapters(|host, label| {
++        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
++        for (prefix, &stride) in STRIDES.iter().enumerate() {
++            let step = stride as usize / 4;
++            let mut expected = vec![0; prefix + LANES * step + 1];
++            for lane in 0..LANES {
++                let field = prefix + lane * step;
++                expected[field] = lane as u32 + 1;
++                expected[field + 1] = 2 * (lane as u32 + 1);
++            }
++            let words = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: roots(&shader, 1, &[4, metadata(stride, prefix)]),
++                        views: &[View::RawUav(1), View::RawUav(expected.len() as u32)],
++                        samplers: &[],
++                        groups: [1, 1, 1],
++                    },
++                )
++                .expect("readback");
++            assert_eq!(words[0], [0], "{label}, neighboring slot");
++            assert_eq!(words[1], expected, "{label}, byte prefix {}", 4 * prefix);
++        }
++    });
++}
++
++/// A single dispatch joins two per-lane descriptor choices. A stale or
++/// uniform t255 index produces incorrect values for one half of the wave.
++#[test]
++fn joined_lanes_read_the_prefix_of_the_view_they_chose() {
++    use crate::resource::tests::WATERFALL_JOINED_BUFFER_WAVE32;
++    let shader = build(WATERFALL_JOINED_BUFFER_WAVE32, true);
++    let first: Vec<u32> = (0..LANES as u32 + 1).map(|i| 1000 + i).collect();
++    let second: Vec<u32> = (0..LANES as u32 + 3).map(|i| 2000 + i).collect();
++    let views = [
++        View::Buffer {
++            data: &first,
++            stride: Stride::Raw,
++        },
++        View::Buffer {
++            data: &second,
++            stride: Stride::Raw,
++        },
++        View::RawUav(LANES as u32),
++    ];
++    on_adapters(|host, label| {
++        let (root, pso) = host.compute_pipeline(&shader).expect("compute pipeline");
++        let words = host
++            .dispatch(
++                &root,
++                &pso,
++                &Dispatch {
++                    roots: roots(&shader, 0, &[metadata(4, 1), metadata(4, 3), 4]),
++                    views: &views,
++                    samplers: &[],
++                    groups: [1, 1, 1],
++                },
++            )
++            .expect("readback");
++        let expected: Vec<_> = (0..LANES)
++            .map(|lane| match lane {
++                0..16 => first[lane + 1],
++                16..24 => second[lane + 3],
++                _ => 0,
++            })
++            .collect();
++        assert_eq!(words[0], expected, "{label}");
++    });
++}
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index 5260707f9720750f816c03a0678b2b2fe925e20c..a4ebbd37194eff54c829d667ac23be4184a8808c 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -20 +20 @@ pub const ROOT_CBV_SPACE: u32 = 1;
+-/// element of the buffer view at heap slot `i` (0: none or not a buffer).
++/// element in bits 0..27 (0: none or not a buffer), and the raw prefix in bits 28..29.
+@@ -28,0 +29,5 @@ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
++/// Title element size in bytes in a slot metadata word.
++pub const VIEW_STRIDE_BITS: u32 = (1 << 28) - 1;
++/// Bits 28..29 hold the dwords preceding a structured view in its aligned raw descriptor.
++pub const VIEW_RAW_OFFSET_SHIFT: u32 = 28;
++pub const VIEW_RAW_OFFSET_BITS: u32 = 3 << VIEW_RAW_OFFSET_SHIFT;
+@@ -176,0 +182,2 @@ pub(crate) struct Shader {
++    /// Effective (host-clamped) heap slot of each raw buffer handle.
++    pub raw_slots: std::collections::HashMap<V, V>,
+@@ -233,0 +241 @@ impl Shader {
++            raw_slots: Default::default(),
+@@ -461 +469,5 @@ impl Shader {
+-        self.annotate(block, h, props.0, props.1)
++        let h = self.annotate(block, h, props.0, props.1);
++        if !sampler && props.0 & 0xff == 11 {
++            self.raw_slots.insert(h, index);
++        }
++        h
+diff --git a/crates/victory-shader/src/emit/waterfall_tests.rs b/crates/victory-shader/src/emit/waterfall_tests.rs
+index 494dcd0b960b26a4a88ee0947d787df083d91a07..564cf1d4956be803873e8f94bc40eaa4999f060a 100644
+--- a/crates/victory-shader/src/emit/waterfall_tests.rs
++++ b/crates/victory-shader/src/emit/waterfall_tests.rs
+@@ -139,0 +140,10 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
++        let mut roots = vec![(0, Root::Constants(ud))];
++        if shader.root_srvs.contains(&super::SLOT_STRIDES) {
++            assert_eq!(shader.root_srvs, [super::SLOT_STRIDES]);
++            let data = views.iter().map(|v| match v {
++                View::Texture(..) => 0,
++                View::RawUav(_) | View::Buffer { stride: Stride::Raw, .. } => 4,
++                _ => panic!("unhandled waterfall fixture view"),
++            }).collect();
++            roots.push((1, Root::View { srv: true, data }));
++        }
+@@ -145 +155 @@ fn run(shader: &HostShader, views: &[View]) -> Vec<(&'static str, Vec<u32>)> {
+-                    roots: vec![(0, Root::Constants(ud))],
++                    roots,
+@@ -211 +221 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
+-            stride: Stride::Structured(4),
++            stride: Stride::Raw,
+@@ -215 +225 @@ fn lanes_load_from_the_buffer_their_nested_arms_chose() {
+-            stride: Stride::Structured(4),
++            stride: Stride::Raw,
+@@ -329,0 +340,3 @@ fn a_size_read_from_a_descriptor_used_for_nothing_else_is_the_views() {
++
++#[path = "raw2885_tests.rs"]
++mod raw2885;

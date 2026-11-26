@@ -5,4 +5,4 @@ if [ "$#" -ne 1 ] || [ -z "$1" ]; then
     exit 1
 fi
 kit=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-exec python3 "$kit/check_inputs.py" "$1" "$kit/followup-files.json"
+exec python3 "$kit/check_inputs.py" "$1" "$kit/raw2885-files.json"

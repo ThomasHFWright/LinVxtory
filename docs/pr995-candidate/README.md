@@ -1,11 +1,10 @@
 # PR995 Linux candidate: source and reproduction kit
 
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
-The finished source tree is `9087a7f7796671ddec0f176aa5931be73c514624`.
+The finished source tree is `f150c5e8a19110b27362d0517e8c68441db5e353`.
 It retains the published `91b6968` checkpoint, where a player confirmed
 walking, camera control, conversation and mouth movement on an Xbox Wireless
-Controller. The texture and scheduling update changed five files. The latest
-performance patch touches three, including the existing shader lowering file.
+Controller. The texture and scheduling update changed five files. The performance patch changed three files. The overlapping-view patch changes ten files on top of the renderer used by `438872d` and `5260b8d`.
 [PR995](https://github.com/fxceless/victory-fork/pull/995) · [Source verification and checkpoint results](validation.md#updated-source-verification)
 
 ## Historical PR995 Linux baseline
@@ -40,7 +39,7 @@ byte claim: build paths and compiler/linker metadata can differ.
 
 From the repository root, give the wrapper one external source directory.
 Use a new path, a clean checkout at the pinned commit, the reconstructed Linux
-baseline, the verified `91b6968` or `f0ca006` source, or the finished source. Keep this directory outside game,
+baseline, the verified `91b6968`, `f0ca006`, or `5260b8d` renderer source, or the finished source. Keep this directory outside game,
 cache and data folders. Configure the toolchain and cache dependencies before
 building offline.
 
@@ -52,7 +51,7 @@ To verify the finished source without building, run
 `sh docs/pr995-candidate/verify.sh "../linvxtory-renderer"`. The wrapper
 verifies the 188-input Linux baseline before applying the published three-PR
 delta. At the exact `91b6968` checkpoint it applies the five-file follow-up.
-It applies the three-file performance patch to the verified `f0ca006` source. Every path verifies all 190 final inputs before Cargo.
+It applies the three-file performance patch to the verified `f0ca006` source. At the verified `5260b8d` renderer it applies only the overlapping-view patch. Every path verifies all 192 final inputs before Cargo.
 
 The zero-context patch deliberately excludes untouched upstream text; use
 `--unidiff-zero` only after checking the pinned clean base. All patch content is
@@ -78,6 +77,12 @@ cargo test -p victory-shader --lib --all-features --offline --locked
 The historical PR995 source passed 187 native shader tests, with two ignored, including
 code-table boundaries, paired-wave guards and retained host annotations. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
+
+## Overlapping structured buffer views
+
+jujumoneylol’s fix lets overlapping structured buffer views share their GPU backing when a view starts 4, 8, or 12 bytes past a 16-byte boundary. The host records that offset alongside the stride. The translated shader applies it when accessing the selected view. [Marvisak PR2885](https://github.com/Marvisak/VIctory/pull/2885)
+
+The native shader suite passed 190 tests with two ignored. Under Wine on an RTX 5090, nine GPU-crate tests and six shader tests passed. The overlap test checked 1,536 readback values across four writer and four reader offsets. Other tests covered strided loads, stores, atomics and divergent lanes selecting different views.
 
 ## Performance changes since f0ca006
 

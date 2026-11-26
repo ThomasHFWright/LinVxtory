@@ -17,9 +17,9 @@ the inputs, crashes and remaining rendering defects alongside the results.
 ## What this kit builds
 
 The single build combines the controller-tested renderer with texture recovery,
-faster copy-worker completion and bounded texture-queue selection. The latest
-changes batch memory-protection calls and simplify two shader instructions.
-[Port scope and measurements](docs/pr995-candidate/README.md#performance-changes-since-f0ca006)
+faster copy-worker completion and bounded texture-queue selection. It batches
+memory-protection calls, simplifies two shader instructions and preserves GPU writes
+across overlapping structured buffer views. [Overlap tests and port scope](docs/pr995-candidate/README.md#overlapping-structured-buffer-views)
 
 ## Build the renderer
 
@@ -31,7 +31,7 @@ sh build.sh "../linvxtory-renderer"
 
 The wrapper fetches the pinned public source for a new directory or reuses an
 existing pinned checkout. It accepts the reconstructed Linux baseline and the
-published `91b6968` and `f0ca006` sources as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 190 build inputs before invoking Cargo.
+published `91b6968`, `f0ca006`, and `5260b8d` renderer sources as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 192 build inputs before invoking Cargo.
 Supply your own game files at runtime. The default target path in the external checkout is `target/x86_64-pc-windows-msvc/diag/victory.exe`. [Toolchain and preset](docs/pr995-candidate/README.md) · [Proton runtime setup](docs/linux-runtime.md) · [Indexed wineserver source kit](docs/runtime/indexed-server/README.md)
 
 ## Gameplay status
@@ -65,6 +65,7 @@ The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the w
 
 **Default Linux build and runtime**
 
+- **jujumoneylol** contributed the fix for overlapping structured buffer views. [Marvisak PR2885](https://github.com/Marvisak/VIctory/pull/2885)
 - **UwUCammie** contributed coalesced memory protection. **Ingenioeren**, with co-author **Claude Opus 5.5**, contributed the vector bitfield shader optimization. [fxceless PR1059](https://github.com/fxceless/victory-fork/pull/1059) · [Marvisak PR2954](https://github.com/Marvisak/VIctory/pull/2954)
 - **tunczzz** contributed the frame-rate work underlying the tested PR995 renderer. **fxceless and the victory-fork contributors** supplied the rendering base and its Windows investigation. [PR995](https://github.com/fxceless/victory-fork/pull/995)
 - **Impre-visible** contributed the empty D3D12 pipeline-library fix under Wine. Independent Linux testers verified cache creation and reuse on NVIDIA and AMD. [Marvisak PR1722](https://github.com/Marvisak/VIctory/pull/1722) · [Tester details](docs/pr995-candidate/README.md#pr1722-host-pipeline-library)
