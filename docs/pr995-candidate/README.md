@@ -191,15 +191,17 @@ runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
 
 ## Optional frame-rate patches
 
-This patch applies to the finished three-PR source that `build.sh` leaves in
-the external directory. The switch is off by default, so a build without
-it set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
+These patches apply to the finished three-PR source that `build.sh` leaves in
+the external directory. Both switches are off by default, so a build with
+neither switch set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
 for the measurements.
 
 ```sh
 src=../linvxtory-renderer   # the directory given to build.sh
 git -C "$src" apply --check docs/pr995-candidate/back-quiet.patch.txt
 git -C "$src" apply docs/pr995-candidate/back-quiet.patch.txt
+git -C "$src" apply --check docs/pr995-candidate/dynamic-slots.patch.txt
+git -C "$src" apply docs/pr995-candidate/dynamic-slots.patch.txt
 ```
 
 Then run the same `cargo build` command as the last line of `build.sh`, from the source directory.
@@ -210,6 +212,12 @@ no longer match the lock.
   [fork PR 1188](https://github.com/fxceless/victory-fork/pull/1188) by Yorivel.
   After a copy-back, the pages' write-watch bits are reset, so the copy-back's
   own writes no longer count as title writes.
+- `dynamic-slots.patch.txt`: `VICTORY_DYNAMIC_SLOTS=<n>` (2^18 up to half the
+  heap; we use 524288). NVIDIA caps the host view heap at 1,000,000 slots, and
+  the 2^18 dynamic slots can run full, which drops draws. This patch enlarges
+  that ring and takes the extra slots from the title's slots kept in place. The
+  idea comes from [trustno1-coder/VIctory-NVIDIA a9632bc](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/a9632bc8de343aa20adf4f1123f16445f5b1b21b).
+
 ## Linux preset and runtime
 
 [linux-preset.sh](linux-preset.sh) records the measured candidate flags without
