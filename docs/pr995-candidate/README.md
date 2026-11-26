@@ -191,9 +191,9 @@ runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
 
 ## Optional frame-rate patches
 
-These patches apply to the finished three-PR source that `build.sh` leaves in
-the external directory. Both switches are off by default, so a build with
-neither switch set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
+These patches apply to the finished source that `build.sh` leaves in
+the external directory. All three switches are off by default, so a build with
+none of them set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
 for the measurements.
 
 ```sh
@@ -202,10 +202,12 @@ git -C "$src" apply --check docs/pr995-candidate/back-quiet.patch.txt
 git -C "$src" apply docs/pr995-candidate/back-quiet.patch.txt
 git -C "$src" apply --check docs/pr995-candidate/dynamic-slots.patch.txt
 git -C "$src" apply docs/pr995-candidate/dynamic-slots.patch.txt
+git -C "$src" apply --check docs/pr995-candidate/card-buffers-min-kb.patch.txt
+git -C "$src" apply docs/pr995-candidate/card-buffers-min-kb.patch.txt
 ```
 
 Then run the same `cargo build` command as the last line of `build.sh`, from the source directory.
-Rerunning `build.sh` stops at `verify.sh`, because shadow.rs and descriptor/host.rs
+Rerunning `build.sh` stops at `verify.sh`, because the patched files
 no longer match the lock.
 
 - `back-quiet.patch.txt`: `VICTORY_BACK_QUIET=1` from
@@ -217,6 +219,11 @@ no longer match the lock.
   the 2^18 dynamic slots can run full, which drops draws. This patch enlarges
   that ring and takes the extra slots from the title's slots kept in place. The
   idea comes from [trustno1-coder/VIctory-NVIDIA a9632bc](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/a9632bc8de343aa20adf4f1123f16445f5b1b21b).
+- `card-buffers-min-kb.patch.txt`: `VICTORY_CARD_BUFFERS_MIN_KB=<KiB>`, from
+  fxceless's [c36971b](https://github.com/fxceless/victory-fork/commit/c36971b213770e48f513f0d6e3ced3f1f65a32b2).
+  It lowers the 1 MiB floor for title-buffer copies in the card's memory, so
+  small buffers that shaders hammer stop crossing the bus. We use `64` together
+  with `VICTORY_CARD_BUFFERS_MB=1536`.
 
 ## Linux preset and runtime
 
