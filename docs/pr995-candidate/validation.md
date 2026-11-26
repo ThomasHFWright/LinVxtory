@@ -38,24 +38,24 @@ OctoAlgo's unpublished combined renderer.
 ## Updated source verification
 
 The public pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`. All rebuild
-and upgrade paths must reach Git tree `0c158597c6af5254c2d29422bda9ddd9b6b34065`.
-The final lock contains 190 full-file digests when the 11 final overrides are
-combined with the 188-input Linux baseline. [Original lock](source-lock.json) · [Final overrides](final-files.json)
+and upgrade paths must reach Git tree `9087a7f7796671ddec0f176aa5931be73c514624`.
+The final lock contains 190 full-file digests when the 13 final overrides are
+combined with the 188-input Linux baseline. [Original lock](source-lock.json) · [Final overrides](followup-files.json)
 
 | Layer | Source tree after applying | Patch SHA-256 |
 | --- | --- | --- |
 | Published three-PR checkpoint `91b6968` | `cc6e33fe99572a2d433e82a49e8429678b70ca5a` | `c47ca445f08f13a27d4b9b9a98b4d4e0d22ed510613ca4ad1bd50836c48b28c2` |
-| Five-file follow-up | `0c158597c6af5254c2d29422bda9ddd9b6b34065` | `fb1113a16121e61d9ec59e3cbcf5f01b05b01f684935c453417fe4616cc596ac` |
+| Five-file follow-up `f0ca006` | `0c158597c6af5254c2d29422bda9ddd9b6b34065` | `fb1113a16121e61d9ec59e3cbcf5f01b05b01f684935c453417fe4616cc596ac` |
+| Three-file performance follow-up | `9087a7f7796671ddec0f176aa5931be73c514624` | `2bd39cdda0174091632022ad0e075510beaa91014fa397cd6d12932fba025d36` |
 
-The follow-up changes `crates/victory-gpu/src/descriptor/host.rs`, `shadow.rs`
+The five-file patch changes `crates/victory-gpu/src/descriptor/host.rs`, `shadow.rs`
 and `texture.rs` in the GPU crate, and `lower.rs` and `mod.rs` in
 `crates/victory-shader/src/emit/`. The frozen GPU texture source has SHA-256
 `97ea8719d2cd44b38cc571acb97ce86df691df185bb0c5b9834a56750390d3eb`.
 [Five-file patch](next.patch.txt) · [Port scope and CPU measurements](README.md#changes-since-91b6968)
 
 From a fresh destination or clean public pin, the wrapper reconstructs and
-verifies the Linux baseline and the published checkpoint in sequence. A
-verified existing checkpoint needs only the follow-up patch. A finished
+verifies the Linux baseline and the published checkpoint in sequence. Each verified existing checkpoint receives the remaining layers. A finished
 checkout keeps its source intact. Extra arguments and edited build inputs
 were rejected before Cargo in the packaging checks.
 
@@ -104,7 +104,7 @@ workload. No linked mesh pipeline was selected in this session. Room captures
 still show missing facial surfaces on both the player character and cellmate.
 The harness closed the title at the player's request after 489 seconds.
 
-## Current build on the RTX 5090
+## Texture recovery build on the RTX 5090
 
 The Windows diagnostics build completed. The native shader suite passed 190 tests
 with two ignored, and the formats suite passed 26 with four ignored. Under
@@ -134,3 +134,32 @@ color, normals and depth. The bunk is visible through it. The control faces
 the yard and the current build faces the bunks, which prevents a matched
 hair comparison. The first eight recovered uploads included five BC1, one BC5
 and two BC7 sRGB textures. Their material identities are unknown.
+
+
+## Performance build on the RTX 5090
+
+The native shader suite passed 190 tests with two ignored. The Windows diagnostics
+build completed, and GE-Proton 11-14 passed 13 focused GPU-crate tests and four
+shader tests. These include the 9,216-case protection fallback test and hardware
+readback of signed and unsigned bitfield extraction at zero width, wrapped
+offsets and the sign boundary. The locally tested executable had SHA-256
+`7a396475bad10d71aea95c9046567d6625491e835da9cc46000c1103e0b49bae`.
+[Source patch](followup.patch.txt) · [CPU measurements](README.md#performance-changes-since-f0ca006)
+
+In one cold comparison with `f0ca006`, this build delivered **520 presents in
+145.485 seconds (3.57 FPS)** over world seconds +180 to +330. The earlier
+build delivered 454 in 144.350 seconds (3.15 FPS). Over +180 to +300 the rates
+were 3.43 and 2.95 FPS respectively. Both runs used the same preset and
+synchronous frame-1820 dump. Their cameras faced different parts of the room.
+
+About 13 minutes into the longer test the player rotated the camera. In a
+frontal view at +810 seconds, eyes, teeth and hair rendered, while the nose,
+cheeks, lips and jaw remained missing. The turn happened after the fixed
+performance comparison. Window mesh and yard posts remained visible.
+
+The harness stopped the title at the 30-minute limit (1,802.11 seconds
+including shutdown). From world +181.35 to +1734.41 the renderer delivered
+6,589 presents in 1,553.061 seconds (4.24 FPS). The corresponding late
+slices averaged 4.07, 4.20, 4.34, 4.39 and 4.67 FPS. The last slice spans
+204 seconds. The player’s camera turn changes the visible workload during
+this run. Only the fixed initial window has a matching control.

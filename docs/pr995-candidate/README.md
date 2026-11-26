@@ -1,10 +1,11 @@
 # PR995 Linux candidate: source and reproduction kit
 
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
-The finished source tree is `0c158597c6af5254c2d29422bda9ddd9b6b34065`.
+The finished source tree is `9087a7f7796671ddec0f176aa5931be73c514624`.
 It retains the published `91b6968` checkpoint, where a player confirmed
 walking, camera control, conversation and mouth movement on an Xbox Wireless
-Controller. Five existing source files change after that checkpoint.
+Controller. The texture and scheduling update changed five files. The latest
+performance patch touches three, including the existing shader lowering file.
 [PR995](https://github.com/fxceless/victory-fork/pull/995) · [Source verification and checkpoint results](validation.md#updated-source-verification)
 
 ## Historical PR995 Linux baseline
@@ -39,7 +40,7 @@ byte claim: build paths and compiler/linker metadata can differ.
 
 From the repository root, give the wrapper one external source directory.
 Use a new path, a clean checkout at the pinned commit, the reconstructed Linux
-baseline, the verified `91b6968` source or the finished source. Keep this directory outside game,
+baseline, the verified `91b6968` or `f0ca006` source, or the finished source. Keep this directory outside game,
 cache and data folders. Configure the toolchain and cache dependencies before
 building offline.
 
@@ -51,7 +52,7 @@ To verify the finished source without building, run
 `sh docs/pr995-candidate/verify.sh "../linvxtory-renderer"`. The wrapper
 verifies the 188-input Linux baseline before applying the published three-PR
 delta. At the exact `91b6968` checkpoint it applies the five-file follow-up.
-Every path verifies all 190 final inputs before Cargo.
+It applies the three-file performance patch to the verified `f0ca006` source. Every path verifies all 190 final inputs before Cargo.
 
 The zero-context patch deliberately excludes untouched upstream text; use
 `--unidiff-zero` only after checking the pinned clean base. All patch content is
@@ -77,6 +78,11 @@ cargo test -p victory-shader --lib --all-features --offline --locked
 The historical PR995 source passed 187 native shader tests, with two ignored, including
 code-table boundaries, paired-wave guards and retained host annotations. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
+
+## Performance changes since f0ca006
+
+- UwUCammie’s guard change reopens a contiguous range of clean 64 KiB blocks with one system call. If it crosses a reservation boundary, each block is retried. On GE-Proton, reopening 16 blocks took 1.83 µs versus 8.98 µs in the previous code. The one-block case took about 0.85 µs on both builds. This port covers the writable side of the guard. [fxceless PR1059](https://github.com/fxceless/victory-fork/pull/1059)
+- Ingenioeren’s shader change lowers vector signed and unsigned bitfield extraction to DXIL Ibfe and Ubfe. In our fixture the entry function shrank from 29 to 14 instructions for signed extraction and from 22 to 14 for unsigned. Each operation matched the original translation and the expected console arithmetic across 36,992 inputs. Both also passed a hardware dispatch and readback. [Marvisak PR2954](https://github.com/Marvisak/VIctory/pull/2954)
 
 ## Changes since 91b6968
 

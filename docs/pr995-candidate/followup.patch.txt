@@ -1,0 +1,94 @@
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index 502e61a0113e3dd834651fdd91ce6c0b15737f3a..294924a1cfb84a2639216ed2fbac2ea47c51acb9 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -2255,3 +2255 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
+-        for block in a..b {
+-            read_write(block * BLOCK, BLOCK);
+-        }
++        reopen_clean_run(a, b, read_write);
+@@ -2271,0 +2270,41 @@ fn open_here(g: &mut Guards, start: usize, end: usize) -> bool {
++/// A clean run can cross reservation boundaries, where VirtualProtect fails
++/// atomically. Retry each block so every accessible block is opened.
++fn reopen_clean_run(first: usize, end: usize, mut protect: impl FnMut(usize, usize) -> bool) {
++    let count = end - first;
++    if !protect(first * BLOCK, count * BLOCK) && count > 1 {
++        for block in first..end {
++            protect(block * BLOCK, BLOCK);
++        }
++    }
++}
++
++#[cfg(test)]
++mod reopen_tests {
++    use super::{BLOCK, reopen_clean_run};
++
++    #[test]
++    fn clean_run_fallback_matches_per_block_protection() {
++        for mask in 0u16..256 {
++            for first in 0..8 {
++                for end in first + 1..=8 {
++                    let mut opened = 0;
++                    let mut calls = 0;
++                    reopen_clean_run(first, end, |at, bytes| {
++                        calls += 1;
++                        let bits = ((1u16 << (bytes / BLOCK)) - 1) << (at / BLOCK);
++                        if bits & mask != bits {
++                            return false;
++                        }
++                        opened |= bits;
++                        true
++                    });
++                    let requested = ((1u16 << (end - first)) - 1) << first;
++                    assert_eq!(opened, mask & requested);
++                    let fallback = requested & mask != requested && end - first > 1;
++                    assert_eq!(calls, if fallback { 1 + end - first } else { 1 });
++                }
++            }
++        }
++    }
++}
++
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 2a65a9264292fd1668dbfa218a054cdb936745e1..2be1060fef3d93ab65c746dba85e0123e426a80b 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -9113,2 +9113,4 @@ impl<'a> Lower<'a> {
+-                let w = m31(self, w);
+-                self.bfe(a, off, w, name == "v_bfe_i32")
++                // DXIL Ibfe and Ubfe mask both width and offset to five bits.
++                let op = if name == "v_bfe_i32" { 51 } else { 52 };
++                self.s
++                    .op(c, "tertiary.i32", Attr::ReadNone, self.s.t.i32, op, &[w, off, a])
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index 1364a8a60f303c8fe48451f83e7dcfa0ed9da342..d776fb3f1aebb6e9da2921e73542b8863a0a9ad2 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -994,8 +994,19 @@ fn bfe_signed_and_unsigned_match_rdna2() {
+-    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+-    run_cases(
+-        &v_signed,
+-        &[[0x8000_0000, 4, 32, 0]],
+-        |backend, _, _, got| {
+-            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
+-        },
+-    );
++    // Vector width and offset wrap to five bits. The field can end at or cross bit 31.
++    let vector_cases = [
++        ([0x8000_0000, 4, 32, 0], [0, 0]),
++        ([0x8000_0000, u32::MAX, 33, 0], [1, u32::MAX]),
++        ([0x0000_0080, 36, 36, 0], [8, 0xffff_fff8]),
++        ([0x8000_0000, 28, 4, 0], [8, 0xffff_fff8]),
++        ([0x8000_0000, 28, 5, 0], [8, 0xffff_fff8]),
++        ([0xffff_ffff, 0, 31, 0], [0x7fff_ffff, u32::MAX]),
++        ([0xffff_ffff, 31, 0, 0], [0, 0]),
++    ];
++    let inputs = vector_cases.map(|(input, _)| input);
++    for (signed, shader) in [&v_unsigned, &v_signed].into_iter().enumerate() {
++        run_cases(shader, &inputs, |backend, i, input, got| {
++            assert_eq!(
++                got, vector_cases[i].1[signed],
++                "{backend}: signed={signed} {input:x?}"
++            );
++        });
++    }
