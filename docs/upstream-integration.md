@@ -141,7 +141,7 @@ especially textures and heaps, remains the largest measured cost.
 This bounded run did not reproduce the earlier title assertion at image offset
 `0x5149aec`; it does not establish that the assertion is fixed. The previous
 merged run hit it after 581.39 seconds. All four paths remain experimental and
-opt-in. The source and matching executable are available in the [cbe8b3b prerelease](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-cbe8b3b).
+opt-in. The source is available in the [cbe8b3b prerelease](https://github.com/ThomasHFWright/LinVxtory/releases/tag/linux-edge-cbe8b3b).
 
 With the same executable and `VICTORY_PIPELINE_WAIT_MS=0`, an offline RTX 5090
 trial ended after 590.71 seconds on a title breakpoint at image offset
@@ -197,7 +197,7 @@ slots and all 45,000 instance slots occupied. Both servers reached this
 breakpoint before the scheduled control test. The indexed server is a separate
 runtime experiment. Both runs used the same locally built application.
 
-The [source-only GE11-14 build kit](https://github.com/ThomasHFWright/LinVictory/releases/download/linux-edge-10532b2/ge1114-indexed-source-kit.tar.gz)
+The [source-only GE11-14 build kit](https://github.com/ThomasHFWright/LinVxtory/releases/download/linux-edge-10532b2/ge1114-indexed-source-kit.tar.gz)
 contains source pins, build instructions and the parent/child mapping test.
 The three server variants produced identical results for all 94,376 records.
 The kit downloads the upstream patch at build time. The locally built application also runs with the installed GE runtime.
