@@ -53,7 +53,8 @@ rate remained within the earlier range.
 The [baa1330 build](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-baa1330)
 also avoids polling memory ranges already covered in a submission and supports
 RGB9E5 upscaler output. Its GPU packing test covered every half-float bit
-pattern on the RTX 5090. Its frame rate is still under evaluation.
+pattern on the RTX 5090. On the same checkpoint it reloaded 2,204 pipelines
+from the previous run and measured 0.71 and 0.72 FPS in the two windows.
 
 The world-rendering observations below describe the preserved pre-merge build.
 
