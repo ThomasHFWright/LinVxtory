@@ -38,15 +38,17 @@ OctoAlgo's unpublished combined renderer.
 ## Updated source verification
 
 The public pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`. All rebuild
-and upgrade paths must reach Git tree `9087a7f7796671ddec0f176aa5931be73c514624`.
-The final lock contains 190 full-file digests when the 13 final overrides are
-combined with the 188-input Linux baseline. [Original lock](source-lock.json) · [Final overrides](followup-files.json)
+and upgrade paths must reach Git tree `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
+The final lock verifies 190 full-file digests. The small-buffer overlay
+replaces the digest for the already tracked `shadow.rs`.
+[Original lock](source-lock.json) · [Previous overrides](followup-files.json) · [Small-buffer overlay](card-buffers-files.json)
 
 | Layer | Source tree after applying | Patch SHA-256 |
 | --- | --- | --- |
 | Published three-PR checkpoint `91b6968` | `cc6e33fe99572a2d433e82a49e8429678b70ca5a` | `c47ca445f08f13a27d4b9b9a98b4d4e0d22ed510613ca4ad1bd50836c48b28c2` |
 | Five-file follow-up `f0ca006` | `0c158597c6af5254c2d29422bda9ddd9b6b34065` | `fb1113a16121e61d9ec59e3cbcf5f01b05b01f684935c453417fe4616cc596ac` |
 | Three-file performance follow-up | `9087a7f7796671ddec0f176aa5931be73c514624` | `2bd39cdda0174091632022ad0e075510beaa91014fa397cd6d12932fba025d36` |
+| Small-buffer eligibility | `2806f9ebe7de5001094b06ee6f38a5ead98b81c1` | `d1e5ea6eafafc6794fb6903b768eb5fc80cfa12b5f97e37f6a6f944b9c1fafd0` |
 
 The five-file patch changes `crates/victory-gpu/src/descriptor/host.rs`, `shadow.rs`
 and `texture.rs` in the GPU crate, and `lower.rs` and `mod.rs` in
@@ -58,6 +60,26 @@ From a fresh destination or clean public pin, the wrapper reconstructs and
 verifies the Linux baseline and the published checkpoint in sequence. Each verified existing checkpoint receives the remaining layers. A finished
 checkout keeps its source intact. Extra arguments and edited build inputs
 were rejected before Cargo in the packaging checks.
+
+### Small-buffer eligibility on an RTX 5090
+
+Two cold replays used the same Windows diagnostics build, indexed GE-Proton
+11-14, checkpoint, scripted inputs and 1536 MiB buffer-copy budget. Each run
+used a separate cache. The sample contains presents 301–600 after the first
+world shader bind.
+
+| Eligibility floor | FPS | Median present interval | 95th percentile | Peak GPU-resident buffer copies |
+| --- | ---: | ---: | ---: | ---: |
+| 1 MiB (default) | 2.61 | 330 ms | 687 ms | 98 |
+| 64 KiB | 3.24 | 272.5 ms | 498 ms | 3,726 |
+
+The observed difference was 0.63 FPS (+24%) in this part of the replay.
+The 64 KiB run presented more slowly during the first 90 seconds after the
+bind (0.64 FPS vs 1.14 FPS). Both runs showed the same cell, with the wire
+mesh and yard visible in overlapping views. Over the sample, the default run
+turned toward the door and bunks, while the 64 KiB run remained window-facing.
+The different visual workload limits what this pair can say about the setting's
+effect. The 1 MiB floor remains the default. [Contributor measurements on the separate fork](../linux-notes-5090.md)
 
 ### Published checkpoint provenance
 

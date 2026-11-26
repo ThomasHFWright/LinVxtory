@@ -1,7 +1,7 @@
 # PR995 Linux candidate: source and reproduction kit
 
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
-The finished source tree is `9087a7f7796671ddec0f176aa5931be73c514624`.
+The finished source tree is `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
 It retains the published `91b6968` checkpoint, where a player confirmed
 walking, camera control, conversation and mouth movement on an Xbox Wireless
 Controller. The texture and scheduling update changed five files. The latest
@@ -189,41 +189,17 @@ with the original source patch at commit `4331d2b`. Its matched checkpoint
 runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
 [Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
 
-## Optional frame-rate patches
+## Small buffer copies in GPU memory
 
-These patches apply to the finished source that `build.sh` leaves in
-the external directory. All three switches are off by default, so a build with
-none of them set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
-for the measurements.
+The standard build includes the small-buffer threshold port from fxceless.
+The default floor stays at 1 MiB. For an opt-in run, set
+`VICTORY_CARD_BUFFERS_MIN_KB=64` and `VICTORY_CARD_BUFFERS_MB=1536` in the
+launch environment. Smaller copies then qualify for GPU memory within the
+renderer’s residency budget. The build verifies the patched source before
+invoking Cargo. [Upstream threshold port](https://github.com/fxceless/victory-fork/commit/c36971b213770e48f513f0d6e3ced3f1f65a32b2)
 
-```sh
-src=../linvxtory-renderer   # the directory given to build.sh
-git -C "$src" apply --check docs/pr995-candidate/back-quiet.patch.txt
-git -C "$src" apply docs/pr995-candidate/back-quiet.patch.txt
-git -C "$src" apply --check docs/pr995-candidate/dynamic-slots.patch.txt
-git -C "$src" apply docs/pr995-candidate/dynamic-slots.patch.txt
-git -C "$src" apply --check docs/pr995-candidate/card-buffers-min-kb.patch.txt
-git -C "$src" apply docs/pr995-candidate/card-buffers-min-kb.patch.txt
-```
-
-Then run the same `cargo build` command as the last line of `build.sh`, from the source directory.
-Rerunning `build.sh` stops at `verify.sh`, because the patched files
-no longer match the lock.
-
-- `back-quiet.patch.txt`: `VICTORY_BACK_QUIET=1` from
-  [fork PR 1188](https://github.com/fxceless/victory-fork/pull/1188) by Yorivel.
-  After a copy-back, the pages' write-watch bits are reset, so the copy-back's
-  own writes no longer count as title writes.
-- `dynamic-slots.patch.txt`: `VICTORY_DYNAMIC_SLOTS=<n>` (2^18 up to half the
-  heap; we use 524288). NVIDIA caps the host view heap at 1,000,000 slots, and
-  the 2^18 dynamic slots can run full, which drops draws. This patch enlarges
-  that ring and takes the extra slots from the title's slots kept in place. The
-  idea comes from [trustno1-coder/VIctory-NVIDIA a9632bc](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/a9632bc8de343aa20adf4f1123f16445f5b1b21b).
-- `card-buffers-min-kb.patch.txt`: `VICTORY_CARD_BUFFERS_MIN_KB=<KiB>`, from
-  fxceless's [c36971b](https://github.com/fxceless/victory-fork/commit/c36971b213770e48f513f0d6e3ced3f1f65a32b2).
-  It lowers the 1 MiB floor for title-buffer copies in the card's memory, so
-  small buffers that shaders hammer stop crossing the bus. We use `64` together
-  with `VICTORY_CARD_BUFFERS_MB=1536`.
+OctoAlgo measured the threshold on their fork and ran a combined experiment
+on PR995. [RTX 5090 measurements](../linux-notes-5090.md) · [Local RTX 5090 comparison](validation.md#small-buffer-eligibility-on-an-rtx-5090)
 
 ## Linux preset and runtime
 

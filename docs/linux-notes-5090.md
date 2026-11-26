@@ -8,8 +8,8 @@ promises for this tree. No binaries, game data or captures are included.
 
 ## Biggest single win: small buffers in the card's memory
 
-`VICTORY_CARD_BUFFERS_MIN_KB=64` with `VICTORY_CARD_BUFFERS_MB=1536` keeps the
-copies of *all* title buffers in the card's memory. Without it, buffers under
+`VICTORY_CARD_BUFFERS_MIN_KB=64` with `VICTORY_CARD_BUFFERS_MB=1536` makes
+all title-buffer copies eligible for GPU memory within the residency budget. Without it, buffers under
 1 MiB stay in PC memory: thousands of small buffers, and every shader access
 to them crosses the bus. On our RTX 5090 (fork main, release, desktop, world
 frames 300–600 of our cell save):
@@ -20,13 +20,12 @@ frames 300–600 of our cell save):
 | `CARD_BUFFERS_MIN_KB=64`, `CARD_BUFFERS_MB=1536` | **8.19 (+33.5 % ± 6.4 %)** | 23 ms | 62 ms |
 
 Keep `CARD_BUFFERS_MB` at 1536: with `MIN_KB=64` and 1024 MB, our runs were
-about 50 % slower. The PR995 renderer has `CARD_BUFFERS_MB` but not `MIN_KB`.
-[card-buffers-min-kb.patch.txt](pr995-candidate/card-buffers-min-kb.patch.txt)
-adds `MIN_KB` from fxceless's
+about 50 % slower on our setup. The [standard source build](pr995-candidate/README.md#small-buffer-copies-in-gpu-memory)
+includes the threshold from fxceless's
 [c36971b](https://github.com/fxceless/victory-fork/commit/c36971b213770e48f513f0d6e3ced3f1f65a32b2).
 
-On this repository's renderer (`438872d` + the three kit patches, RTX 5090,
-Xvfb, release, one run each), setting `MIN_KB=64`, `CARD_BUFFERS_MB=1536`,
+In our earlier PR995 experiment (`438872d` plus three experimental patches,
+RTX 5090, Xvfb, release, one run each), setting `MIN_KB=64`, `CARD_BUFFERS_MB=1536`,
 `BACK_QUIET=1` and `DYNAMIC_SLOTS=524288` together gave 4.91 FPS. With nothing
 set, it gave 4.34 FPS. That's +13 %, with copy-back down from 84 to 61 ms a
 frame. The switched run paid for the cold shader translations. Neither run
@@ -101,21 +100,23 @@ With the combined set, the submitting thread spends 19 ms in heap sync instead
 of 34 ms, and 23 ms instead of 31–36 ms on write-watch queries. The rest of
 each frame now goes to waiting for the GPU.
 
-Only two of these fit the PR995 renderer as small patches. Both are included
-as optional kit patches, off by default (with `MIN_KB` above, three in all):
-
-- [back-quiet.patch.txt](pr995-candidate/back-quiet.patch.txt):
-  `VICTORY_BACK_QUIET=1` from
-  [fork PR 1188](https://github.com/fxceless/victory-fork/pull/1188) (Yorivel).
-  It resets the write-watch bits of pages that copy-back has just written, so
-  those writes are no longer read back as title writes. On GE-Proton with an
-  RTX 5080, BitWuehler reported 122 → 51 ms of CPU preparation.
-- [dynamic-slots.patch.txt](pr995-candidate/dynamic-slots.patch.txt):
-  `VICTORY_DYNAMIC_SLOTS=<n>`. NVIDIA caps the host view heap at 1,000,000
-  slots, and the 2^18 dynamic slots can run full, which drops draws. This
-  switch enlarges that ring, up to half the heap. The idea comes from
-  [trustno1-coder/VIctory-NVIDIA a9632bc](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/a9632bc8de343aa20adf4f1123f16445f5b1b21b).
+The combined run included two experimental renderer changes. The copy-back
+experiment can clear a concurrent title write from write-watch before the
+renderer sees it. The enlarged dynamic ring can let a direct shader read
+select a temporary view. These switches are recorded to describe our
+measurements. The source build ships the small-buffer threshold.
 
 `CARD_HASH_WIDE` (344 lines) and `TABLE_STAGES` (226 lines) do not apply to the
 candidate without larger rework. They are listed here in case you rebase onto
 fork main.
+
+## Face rendering on the separate fork build
+
+OctoAlgo reported visible facial skin, eyes and a closed jaw in the diner and
+bar close-ups on a separate [fxceless build at `46bf535`](https://github.com/fxceless/victory-fork/tree/46bf5351707b1697c04e5d871c30973ebaa3e973).
+Their build also included full [#854/#993 shader pairing](https://github.com/fxceless/victory-fork/pull/993),
+[#938](https://github.com/fxceless/victory-fork/pull/938),
+[#1002](https://github.com/fxceless/victory-fork/pull/1002) and
+[#927](https://github.com/fxceless/victory-fork/pull/927). Face recovery was
+observed with the combined renderer. The contributor did not bisect it.
+[Original test report](https://github.com/ThomasHFWright/LinVxtory/pull/1)
