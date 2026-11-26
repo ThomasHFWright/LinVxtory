@@ -36,8 +36,13 @@ Supply your own game files at runtime. The default target path in the external c
 
 ## Gameplay status
 
+The Linux preset enables descriptor slot caching. On our RTX 5090, two cold
+room replays with this preset delivered **3.89 and 4.07 FPS** against **3.57 FPS**
+with caching off on the same executable. The wall, window mesh and yard posts
+were visible in the sampled frames. [Repeated cache measurements](docs/pr995-candidate/validation.md#descriptor-slot-cache)
+
 On CachyOS with an RTX 5090, the current build ran for 30 minutes and
-stopped at the scheduled limit. It averaged **4.24 FPS** over the last
+stopped at the scheduled limit. With descriptor slot caching off, it averaged **4.24 FPS** over the last
 25.9 measured minutes. In the fixed world +180 to +330 second interval,
 it delivered **3.57 FPS**, versus **3.15 FPS** for `f0ca006` in one replay
 per build. The player turned the camera later in the long run. The frontal

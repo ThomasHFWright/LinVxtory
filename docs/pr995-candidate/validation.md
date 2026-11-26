@@ -163,3 +163,35 @@ including shutdown). From world +181.35 to +1734.41 the renderer delivered
 slices averaged 4.07, 4.20, 4.34, 4.39 and 4.67 FPS. The last slice spans
 204 seconds. The player’s camera turn changes the visible workload during
 this run. Only the fixed initial window has a matching control.
+
+### Facial rendering follow-up
+
+A separate ten-minute replay tested PiloteCode’s pixel helper-lane change
+from fxceless PR993. We verified that the shader bound to the skinned draw
+used the new translation. Both the old and new shaders passed the synthetic
+edge-pixel test under GE-Proton 11-14 on the RTX 5090. In both frontal
+intervals the helper build still showed exposed eyes and teeth and a gap
+down to the shirt collar. This experiment remains outside the published
+build. The captures leave the source of missing facial coverage open.
+[Upstream shader change](https://github.com/fxceless/victory-fork/commit/c0647e1232563ac1aa4787593913808d40d48f45)
+
+### Descriptor slot cache
+
+The Linux preset enables PR995’s `VICTORY_HEAP_SLOT_CACHE=1`. The renderer
+reuses the resolved buffer for a descriptor slot after checking the recorded
+descriptor, live view and host copy. We changed only this setting, using the
+same executable, private checkpoint, cold caches, capture frame and window
+size in all three trials. The two cache trials ran to their 390-second limits.
+
+| RTX 5090 world interval or counter | Off | On, first run | On, repeat |
+| --- | ---: | ---: | ---: |
+| +90 to +180 s | 2.42 FPS | 3.02 FPS | 3.09 FPS |
+| +180 to +300 s | 3.43 FPS | 3.77 FPS | 4.03 FPS |
+| +180 to +330 s | 3.57 FPS | 3.89 FPS | 4.07 FPS |
+| Median descriptor walk in the last interval | 35.25 ms | 24.20 ms | 22.75 ms |
+| Median slots reused per report | 0 | 4,333 | 4,400 |
+
+The first cache run and the control faced the yard window in frames 1820
+and 2048. Both showed the wall, uprights, window mesh, bunk rail and distant
+watchtower. The 30-minute endurance result above used the same executable
+with this setting off. [Upstream performance work](https://github.com/fxceless/victory-fork/pull/995)
