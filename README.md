@@ -16,9 +16,11 @@ the inputs, crashes and remaining rendering defects alongside the results.
 
 ## What this kit builds
 
-The kit reconstructs the source of the tested `three-pr.exe`. It combines the
-PR995 Linux renderer with the PR1722 Wine pipeline-library fix, PR2026 CPU
-detiling and PR2398 whole-row mesh/pixel linking. [Source and measurements](docs/pr995-candidate/README.md)
+This kit builds one renderer on top of the controller-tested `91b6968`
+checkpoint. It adds per-batch copy completion, bounded texture-queue selection,
+a compute-only diagnostic loop limit and recovery when the first texture read
+fails during a remap. The checkpoint’s pipeline library, CPU detiling and
+mesh/pixel linkage are included. [Port scope and CPU measurements](docs/pr995-candidate/README.md#changes-since-91b6968)
 
 ## Build the renderer
 
@@ -30,10 +32,18 @@ sh build.sh "../linvxtory-renderer"
 
 The wrapper fetches the pinned public source for a new directory or reuses an
 existing pinned checkout. It accepts the reconstructed Linux baseline and the
-finished three-PR tree. It checks all 190 build inputs before invoking Cargo.
+published `91b6968` source as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 190 build inputs before invoking Cargo.
 Supply your own game files at runtime. The default target path in the external checkout is `target/x86_64-pc-windows-msvc/diag/victory.exe`. [Toolchain and preset](docs/pr995-candidate/README.md) · [Proton runtime setup](docs/linux-runtime.md) · [Indexed wineserver source kit](docs/runtime/indexed-server/README.md)
 
 ## Gameplay status
+
+The current build reached the cell on our RTX 5090. In one cold, windowed
+comparison it delivered 3.15 FPS against 3.11 FPS for the previous build over
+world seconds +180 to +330. It was slower earlier in loading. The first-read
+fix recovered real texture uploads. The character’s cheek still has a gap before lighting. The two camera
+angles differed, so hair quality could not be compared directly. [Checkpoint results](docs/pr995-candidate/validation.md#current-build-on-the-rtx-5090)
+
+The following controller observations are from the published `91b6968` checkpoint.
 
 On CachyOS and GE-Proton 11-14 with an RTX 5090, a player used an Xbox Wireless Controller to turn the camera in both directions, walk through the cell, and start a conversation with an NPC. The player saw mouth movement during the conversation. This run used four automated Enter presses during startup. All camera movement and interaction in the room came from the controller. Hair and facial skin still have rendering defects.
 
@@ -47,6 +57,8 @@ The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the w
 - **Impre-visible** contributed the empty D3D12 pipeline-library fix under Wine. Independent Linux testers verified cache creation and reuse on NVIDIA and AMD. [Marvisak PR1722](https://github.com/Marvisak/VIctory/pull/1722) · [Tester details](docs/pr995-candidate/README.md#pr1722-host-pipeline-library)
 - **0xkn0wh3r3** developed the row-bounds optimization for texture copying. The PR995 port uses it for CPU detiling of swizzled textures. [PR2026](https://github.com/Marvisak/VIctory/pull/2026)
 - **Texbirds** developed over-budget mesh/pixel linking. The PR995 port selectively drops unread whole semantics on colored mesh pipelines. [PR2398](https://github.com/Marvisak/VIctory/pull/2398)
+- **UwUCammie** contributed the copy-worker completion change. **Lkxex** contributed the bounded queue selection used here. [Copy workers, PR1172](https://github.com/fxceless/victory-fork/pull/1172) · [Texture queue, PR1031](https://github.com/fxceless/victory-fork/pull/1031)
+- **Danigamer05** contributed the compute-only loop-limit option. **HLVM04** identified the failed first texture read on an RTX 5070 Ti and tested sparse recovery at the G-buffer stage. [Compute limit, PR683](https://github.com/fxceless/victory-fork/pull/683) · [First-read report, issue 923](https://github.com/fxceless/victory-fork/issues/923#issuecomment-7185648172)
 - **errusso** contributed the Wine/DXC compiler fallback. **ruvenesh** contributed the opt-in watchdog hook. [PR20](https://github.com/fxceless/victory-fork/pull/20) · [PR454](https://github.com/Marvisak/VIctory/pull/454)
 - **desplmfao** developed the code-table trimming fix and **OctoAlgo** investigated and ported it for Proton. The LinVictory paired-wave fallback adapts the approach from upstream shader work for 32-lane GPUs. [PR1006](https://github.com/fxceless/victory-fork/pull/1006) · [PR854](https://github.com/fxceless/victory-fork/pull/854) · [PR993](https://github.com/fxceless/victory-fork/pull/993)
 - **datingesp-hash** reported the mapped-view bottleneck and an indexed solution. **UwUCammie** published the patch used in our indexed wineserver adaptation. The runtime builds on **Wine, Valve and GE-Proton contributors’** work. [Runtime credits and provenance](docs/runtime/indexed-server/README.md)

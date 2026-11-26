@@ -20,10 +20,11 @@ test "$(git -C "$src" rev-parse HEAD)" = "$commit" || {
 if [ -z "$(git -C "$src" status --porcelain)" ]; then
     git -C "$src" apply --unidiff-zero "$kit/candidate.patch.txt"
 fi
-# The original Linux patch leaves library.rs identical to the public pin.
-if git -C "$src" diff --quiet HEAD -- crates/victory-gpu/src/pipeline/library.rs; then
-    python3 "$kit/check_inputs.py" "$src"
+if python3 "$kit/check_inputs.py" "$src" >/dev/null 2>&1; then
     git -C "$src" apply --unidiff-zero "$kit/upstream.patch.txt"
+fi
+if python3 "$kit/check_inputs.py" "$src" "$kit/upstream-files.json" >/dev/null 2>&1; then
+    git -C "$src" apply --unidiff-zero "$kit/next.patch.txt"
 fi
 sh "$kit/verify.sh" "$src"
 cd "$src"

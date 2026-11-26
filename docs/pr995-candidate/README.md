@@ -1,10 +1,11 @@
 # PR995 Linux candidate: source and reproduction kit
 
-This kit reconstructs the source of the tested standalone candidate from
-public [PR995](https://github.com/fxceless/victory-fork/pull/995), pinned at
-`7406afbbd9cef0dcddef0b0a23b4855437715eb5`. The tested three-PR renderer adds the PR1722 cache fix, the PR2026 CPU detile port and the PR2398 whole-row mesh port to the frozen Linux baseline.
-
-The final tree is `cc6e33fe99572a2d433e82a49e8429678b70ca5a`. Its 190 locked inputs reproduce the source of the executable on which mouth movement was observed. [Source verification and tested executable digest](validation.md#updated-source-verification)
+The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
+The finished source tree is `0c158597c6af5254c2d29422bda9ddd9b6b34065`.
+It retains the published `91b6968` checkpoint, where a player confirmed
+walking, camera control, conversation and mouth movement on an Xbox Wireless
+Controller. Five existing source files change after that checkpoint.
+[PR995](https://github.com/fxceless/victory-fork/pull/995) · [Source verification and checkpoint results](validation.md#updated-source-verification)
 
 ## Historical PR995 Linux baseline
 
@@ -38,7 +39,7 @@ byte claim: build paths and compiler/linker metadata can differ.
 
 From the repository root, give the wrapper one external source directory.
 Use a new path, a clean checkout at the pinned commit, the reconstructed Linux
-baseline or the finished three-PR source. Keep this directory outside game,
+baseline, the verified `91b6968` source or the finished source. Keep this directory outside game,
 cache and data folders. Configure the toolchain and cache dependencies before
 building offline.
 
@@ -48,8 +49,9 @@ sh build.sh "../linvxtory-renderer"
 
 To verify the finished source without building, run
 `sh docs/pr995-candidate/verify.sh "../linvxtory-renderer"`. The wrapper
-uses the original 188-input lock before applying the three-PR delta, then
-checks all 190 final inputs before invoking Cargo.
+verifies the 188-input Linux baseline before applying the published three-PR
+delta. At the exact `91b6968` checkpoint it applies the five-file follow-up.
+Every path verifies all 190 final inputs before Cargo.
 
 The zero-context patch deliberately excludes untouched upstream text; use
 `--unidiff-zero` only after checking the pinned clean base. All patch content is
@@ -73,8 +75,33 @@ cargo test -p victory-shader --lib --all-features --offline --locked
 ```
 
 The historical PR995 source passed 187 native shader tests, with two ignored, including
-code-table boundaries, paired-wave guards and retained host annotations. Further GPU/title validation is separate from source reconstruction. Native exact-input tests can use a private external
+code-table boundaries, paired-wave guards and retained host annotations. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
+
+## Changes since 91b6968
+
+| Change | Scope of this port |
+| --- | --- |
+| Copy workers | Each job decrements its batch counter. The last job wakes the waiter. A submitting thread can stop helping once its own batch finishes. The copy and texture pools remain separate. [UwUCammie, PR1172](https://github.com/fxceless/victory-fork/pull/1172) |
+| Indexed texture queue | Partition entries by write serial before sorting only the retries and fresh slots this pass can serve. The returned slot IDs and order match the original full sort. Only queue selection was ported. Mip residency, view selection and tile mappings retain checkpoint behavior. [Lkxex, PR1031](https://github.com/fxceless/victory-fork/pull/1031) |
+| Compute loops | In diagnostics builds, `VICTORY_SHADER_LOOP_LIMIT_CS` accepts a positive decimal or hexadecimal override. The effective compute limit enters the shader-cache fingerprint. With both loop settings unset, compute retains 4,096 iterations, pixel 128 and other stages 256. The kit preset leaves the compute override unset. [Danigamer05, PR683](https://github.com/fxceless/victory-fork/pull/683) |
+| First texture read | Under no-wait refresh, a failed first bulk read retries with stable mappings. Mapped pages supply their bytes and holes read as zero. A later failed read preserves the previous image, including after invalidation. HLVM04’s RTX 5070 Ti Series S report measured neck base colour at the G-buffer stage. The final backlit frame remained dark in that comparison. [HLVM04, issue 923 follow-up](https://github.com/fxceless/victory-fork/issues/923#issuecomment-7185648172) |
+
+### CPU measurements
+
+| Synthetic workload | Checkpoint | Port |
+| --- | ---: | ---: |
+| Copy batches, one caller | 3.646 ms | 2.674 ms |
+| Copy batches, two concurrent callers | 6.110 ms | 2.795 ms |
+| Texture queue, half of due slots are retries | 808 µs | 274 µs |
+| Texture queue, one retry per 17 due slots | 681 µs | 223 µs |
+
+The native optimized copy harness measured 10 alternating process pairs after
+warm-up. Each caller submitted 64 batches of 128 jobs copying 4 KiB each.
+The medians include worker startup and job construction. The queue harness
+alternated 15 paired samples after warm-up, selected 4,096 of 40,000 due slots
+and checked the exact returned sequence against the pre-port implementation.
+These are CPU timings for the isolated operations.
 
 ## PR1722 host pipeline library
 
@@ -87,7 +114,7 @@ change by the final PR head, `ee84a44859d4384ea5b945fa59e09ad9f9ac8d61`.
 
 PR1722 changes one build input, `crates/victory-gpu/src/pipeline/library.rs`.
 Its SHA-256 is `427c8eb03d1f96a88ebee05c5beb041fbe6ef160a85603ad2dbd2a4fb723942c`.
-The default lock combines the frozen lock with the eight full-file hashes for this round.
+The published checkpoint lock combines the frozen lock with eight full-file overrides.
 [Baseline lock](source-lock.json) · [Updated file hashes](upstream-files.json) · [Source verification](validation.md#updated-source-verification)
 
 | Independent Linux tester | Measured result |
@@ -220,25 +247,24 @@ Linux adaptation, regression tests and validation are AI-assisted with OpenAI
 Codex. Exact file hashes and patch provenance are supplied so these changes can
 be reviewed independently.
 
-## Remaining differences and validation limits
+## Historical PR995 comparison and validation limits
 
-This is not OctoAlgo's unpublished combined 3.54-FPS source tree. It lacks #938's
-loop-latch normalization and early-pipeline-list fallback, and does not import
-the full #854/#993 stack, #1002/#683/#917, ambient changes or current LinVictory host
-optimizations. The frozen PR995 baseline retains the empty pipeline-library pointer behavior.
-The default includes the PR1722 fix for that call. No shader-table provenance
-or unsupported fixture is inferred from the four passing cases.
+The original Linux baseline used a narrow paired-wave fallback derived from
+#854 and #993. OctoAlgo’s reported 3.54 FPS came from a separate, unpublished
+combined tree. The Linux baseline omitted #938’s loop-latch normalization and
+early-pipeline-list fallback, #1002, #683 and #917. The current renderer
+includes Danigamer05’s compute-only loop-limit option from #683 and the
+empty pipeline-library fix from #1722. [Changes since 91b6968](#changes-since-91b6968)
 
-The default PR995 selection retains earlier successful paths for two inputs;
-their group dimensions differ from all-paired lowering. Paired fallback is on
-by default and can be disabled with VICTORY_WAVE_PAIRS=0. CPU checks with
-VICTORY_WAVE_LOCAL=0 and VICTORY_WAVE_WIDE=0 also pass all four using paired
-lowering, but those settings are not the measured room preset.
+In the historical four-input shader check, two inputs succeeded on earlier
+PR995 paths and produced different group dimensions under all-paired lowering.
+Paired fallback is enabled by default and can be disabled with
+`VICTORY_WAVE_PAIRS=0`. A separate CPU check with `VICTORY_WAVE_LOCAL=0` and
+`VICTORY_WAVE_WIDE=0` passed all four inputs using paired lowering. The room
+benchmark used the measured Linux preset.
 
-The frozen build has one inherited unused-function warning, and native tests
-have four Windows-specific unused import/variable warnings. This kit preserves
-source equivalence rather than changing unrelated code to suppress warnings.
-The independent offline Windows build passed. Strict application Clippy with
-`-D warnings` reports 34 diagnostics in this exact candidate; no lint suppression
-or source cleanup was added. See [validation](validation.md). No push, publication, title launch or new GPU job was performed
-while preparing this kit.
+The historical PR995 baseline passed its independent offline Windows build
+with one unused-function warning. Its native tests emitted four warnings, and
+strict application Clippy with `-D warnings` reported 34 diagnostics. The
+current renderer has also run under GE-Proton in the matched checkpoint
+comparison. [Validation record](validation.md)

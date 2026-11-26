@@ -1,0 +1,541 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index c215b2c..1ac8331 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -651,2 +651,5 @@ impl TextureQueue {
+-        let mut again: Vec<(u64, u32, u64)> = Vec::new();
+-        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
++        if max == 0 {
++            return Vec::new();
++        }
++        let mut again = Vec::new();
++        let mut fresh = Vec::new();
+@@ -655 +658,8 @@ impl TextureQueue {
+-            class.push((w.written, index, w.write));
++            class.push((index, w.write));
++        }
++        // Write numbers are unique. Partition each end before sorting so a
++        // full queue sorts only the entries this pass can actually serve.
++        let newest_first = |a: &(u32, u64), b: &(u32, u64)| b.1.cmp(&a.1);
++        if again.len() > max {
++            again.select_nth_unstable_by(max, newest_first);
++            again.truncate(max);
+@@ -657,2 +666,0 @@ impl TextureQueue {
+-        // By the number of the write, counted over the run.
+-        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+@@ -660,9 +668,16 @@ impl TextureQueue {
+-        fresh.sort_unstable_by(newest_first);
+-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
+-        let (mut new, mut old) = (0, fresh.len());
+-        while new < old && order.len() < max {
+-            order.push((fresh[new].1, fresh[new].2));
+-            new += 1;
+-            if new < old && order.len() < max {
+-                old -= 1;
+-                order.push((fresh[old].1, fresh[old].2));
++        let take = (max - again.len()).min(fresh.len());
++        if take == 0 {
++            return again;
++        }
++        let new_count = take.div_ceil(2);
++        let old_count = take / 2;
++        if new_count < fresh.len() {
++            fresh.select_nth_unstable_by(new_count, newest_first);
++        }
++        let (newest, rest) = fresh.split_at_mut(new_count);
++        newest.sort_unstable_by(newest_first);
++        let mut oldest = &mut rest[..0];
++        if old_count > 0 {
++            let oldest_at = rest.len() - old_count;
++            if oldest_at > 0 {
++                rest.select_nth_unstable_by(oldest_at, newest_first);
+@@ -669,0 +685,2 @@ impl TextureQueue {
++            oldest = &mut rest[oldest_at..];
++            oldest.sort_unstable_by(|a, b| newest_first(b, a));
+@@ -671,2 +688,6 @@ impl TextureQueue {
+-        order.truncate(max);
+-        order
++        again.reserve(take);
++        for (position, &entry) in newest.iter().enumerate() {
++            again.push(entry);
++            again.extend(oldest.get(position).copied());
++        }
++        again
+@@ -4057,0 +4079,87 @@ mod tests {
++    fn due_full_sort(q: &TextureQueue, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        let mut again: Vec<(u64, u32, u64)> = Vec::new();
++        let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
++        for (&index, w) in q.slots.iter().filter(|(_, w)| w.due <= frame) {
++            let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
++            class.push((w.written, index, w.write));
++        }
++        // By the number of the write, counted over the run.
++        let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
++        again.sort_unstable_by(newest_first);
++        fresh.sort_unstable_by(newest_first);
++        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
++        let (mut new, mut old) = (0, fresh.len());
++        while new < old && order.len() < max {
++            order.push((fresh[new].1, fresh[new].2));
++            new += 1;
++            if new < old && order.len() < max {
++                old -= 1;
++                order.push((fresh[old].1, fresh[old].2));
++            }
++        }
++        order.truncate(max);
++        order
++    }
++
++    fn due_fixture(slots: u32, repeat_every: u32) -> TextureQueue {
++        let mut q = TextureQueue::default();
++        for i in 0..slots {
++            // An odd multiplier gives unique slots in the 64K table and
++            // puts write order out of slot order, as in a streamed heap.
++            let index = i.wrapping_mul(32749) & 0xffff;
++            q.written(index, u64::from(i), u64::from(i % 11 == 0), false);
++            if i.is_multiple_of(repeat_every) && i % 2 == 1 {
++                q.slots.get_mut(&index).unwrap().mapped = 4096;
++            } else if i.is_multiple_of(repeat_every) {
++                q.slots.get_mut(&index).unwrap().looks = 1;
++            }
++        }
++        q
++    }
++
++    #[test]
++    fn bounded_texture_selection_matches_full_sort() {
++        for repeat_every in [1, 3, 17] {
++            let q = due_fixture(73, repeat_every);
++            for frame in [0, 1] {
++                for max in 0..=75 {
++                    assert_eq!(q.due(frame, max), due_full_sort(&q, frame, max));
++                }
++            }
++        }
++    }
++
++    #[test]
++    #[ignore = "benchmark a full streaming queue"]
++    fn bench_bounded_texture_selection() {
++        use std::hint::black_box;
++        use std::time::Instant;
++
++        for repeat_every in [2, 17] {
++            let q = due_fixture(40_000, repeat_every);
++            assert_eq!(q.due(1, 4096), due_full_sort(&q, 1, 4096));
++            let mut samples = [Vec::new(), Vec::new()];
++            for pair in 0..16 {
++                for position in 0..2 {
++                    let i = (pair + position) % 2;
++                    let began = Instant::now();
++                    let order = if i == 0 {
++                        due_full_sort(black_box(&q), 1, 4096)
++                    } else {
++                        black_box(&q).due(1, 4096)
++                    };
++                    black_box(order);
++                    if pair != 0 {
++                        samples[i].push(began.elapsed());
++                    }
++                }
++            }
++            samples.iter_mut().for_each(|v| v.sort_unstable());
++            eprintln!(
++                "40,000 due slots, every {repeat_every}th a retry, 4,096 returned: full sort {:?}, bounded {:?}",
++                samples[0][7], samples[1][7],
++            );
++        }
++    }
++
++
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index 8e21c48..0ae00d4 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -2010,0 +2011,22 @@ type Job = Box<dyn FnOnce() + Send>;
++struct JobGroup {
++    left: std::sync::atomic::AtomicUsize,
++    lock: Mutex<()>,
++    done: std::sync::Condvar,
++}
++
++struct QueuedJob {
++    run: Job,
++    group: Arc<JobGroup>,
++}
++
++impl QueuedJob {
++    fn finish(self) {
++        (self.run)();
++        if self.group.left.fetch_sub(1, Ordering::AcqRel) == 1 {
++            // Take the same lock as the waiter between its last check and sleep.
++            let _guard = self.group.lock.lock().unwrap_or_else(|e| e.into_inner());
++            self.group.done.notify_one();
++        }
++    }
++}
++
+@@ -2014 +2036 @@ struct Workers {
+-    jobs: Mutex<std::collections::VecDeque<Job>>,
++    jobs: Mutex<std::collections::VecDeque<QueuedJob>>,
+@@ -2071 +2093 @@ fn pool(
+-                    job();
++                    job.finish();
+@@ -2100 +2122,5 @@ fn wide_on(workers: &'static Workers, jobs: Vec<Job>) {
+-    let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
++    let group = Arc::new(JobGroup {
++        left: std::sync::atomic::AtomicUsize::new(jobs.len()),
++        lock: Mutex::new(()),
++        done: std::sync::Condvar::new(),
++    });
+@@ -2103,11 +2129 @@ fn wide_on(workers: &'static Workers, jobs: Vec<Job>) {
+-        for job in jobs {
+-            let left = left.clone();
+-            queue.push_back(Box::new(move || {
+-                job();
+-                let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+-                *n -= 1;
+-                if *n == 0 {
+-                    left.1.notify_all();
+-                }
+-            }));
+-        }
++        queue.extend(jobs.into_iter().map(|run| QueuedJob { run, group: group.clone() }));
+@@ -2116 +2132 @@ fn wide_on(workers: &'static Workers, jobs: Vec<Job>) {
+-    loop {
++    while group.left.load(Ordering::Acquire) != 0 {
+@@ -2119 +2135 @@ fn wide_on(workers: &'static Workers, jobs: Vec<Job>) {
+-            Some(job) => job(),
++            Some(job) => job.finish(),
+@@ -2123,3 +2139,6 @@ fn wide_on(workers: &'static Workers, jobs: Vec<Job>) {
+-    let mut n = left.0.lock().unwrap_or_else(|e| e.into_inner());
+-    while *n > 0 {
+-        n = left.1.wait(n).unwrap_or_else(|e| e.into_inner());
++    if group.left.load(Ordering::Acquire) != 0 {
++        let guard = group.lock.lock().unwrap_or_else(|e| e.into_inner());
++        let _guard = group
++            .done
++            .wait_while(guard, |_| group.left.load(Ordering::Acquire) != 0)
++            .unwrap_or_else(|e| e.into_inner());
+@@ -3011,0 +3031,26 @@ mod wide_tests {
++    #[test]
++    fn overlapping_callers_each_wait_for_their_own_jobs() {
++        let start = std::sync::Barrier::new(3);
++        std::thread::scope(|scope| {
++            for n in [23, 311, 1024] {
++                let start = &start;
++                scope.spawn(move || {
++                    start.wait();
++                    for _ in 0..12 {
++                        let ran = Arc::new(AtomicUsize::new(0));
++                        let jobs = (0..n)
++                            .map(|_| {
++                                let ran = ran.clone();
++                                Box::new(move || {
++                                    ran.fetch_add(1, Ordering::Relaxed);
++                                }) as super::Job
++                            })
++                            .collect();
++                        super::wide(jobs);
++                        assert_eq!(ran.load(Ordering::Relaxed), n);
++                    }
++                });
++            }
++        });
++    }
++
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 8401c22..59a5f4c 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -137,0 +138,3 @@ struct Last {
++    /// Survives invalidation. Even a write-watched snapshot without a hash
++    /// must survive a later failed bulk read.
++    filled: bool,
+@@ -143,0 +147,34 @@ struct Last {
++impl Last {
++    fn forget_changes(&mut self) {
++        *self = Self { filled: self.filled, ..Self::default() };
++    }
++
++    /// The failed bulk read may have left scratch partially overwritten.
++    /// Read again with stable mappings; the sparse copy zeroes every hole.
++    fn recover_first(&mut self, memory: *const u8, read: &mut [u8], fill: impl FnOnce(&[u8]) -> bool) -> usize {
++        self.asked = 0;
++        if self.filled {
++            return 0;
++        }
++        // Plain diagnostic copies require mapped memory; no-copy mode
++        // leaves scratch untouched. Neither can produce a sparse snapshot.
++        #[cfg(feature = "diagnostics")]
++        if crate::copystat::mode() != 0 {
++            return 0;
++        }
++        let _mapped = wait_for_title_memory();
++        crate::host::copy_mapped(read.as_mut_ptr(), memory, read.len(), false);
++        if read.iter().all(|&b| b == 0) {
++            return 0;
++        }
++        if !fill(read) {
++            return 0;
++        }
++        self.filled = true;
++        // No whole-image hash or partial-read cooldown for a first sparse fill.
++        self.hash = None;
++        self.partial = None;
++        read.len()
++    }
++}
++
+@@ -367,2 +404,2 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+-/// needs no lock: it fails if a page is not there, and then the texture is
+-/// left as it is and read at its next refresh, a frame later. A read
++/// needs no lock. On failure a never-filled staging buffer retries under
++/// the mapping lock; an existing image is kept until its next refresh. A read
+@@ -370,3 +406,0 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+-///
+-/// What changes for the picture: a texture that arrives while the runtime
+-/// is remapping may show a frame later. It never shows partly read.
+@@ -1149 +1183 @@ impl Staging {
+-        *self.last.lock().unwrap_or_else(|e| e.into_inner()) = Last::default();
++        self.last.lock().unwrap_or_else(|e| e.into_inner()).forget_changes();
+@@ -1195 +1229 @@ impl Staging {
+-                self.detile(read);
++                last.filled |= self.detile(read);
+@@ -1279 +1313 @@ impl Staging {
+-                self.detile(read);
++                last.filled |= self.detile(read);
+@@ -1300 +1334 @@ impl Staging {
+-                self.detile(tiled);
++                last.filled |= self.detile(tiled);
+@@ -1318 +1352 @@ impl Staging {
+-        self.detile(tiled);
++        last.filled |= self.detile(tiled);
+@@ -1324,6 +1358,2 @@ impl Staging {
+-    /// A refresh while the runtime is remapping title memory ([`no_wait`]):
+-    /// the texture is read through the kernel, which fails if a page of it
+-    /// is not there at this moment. Then nothing is taken and the texture
+-    /// is looked at again at its next refresh (what was learnt about writes
+-    /// to it is forgotten, so that it is not passed over as unwritten).
+-    /// Returns the bytes read.
++    /// During a remap, keep the usual bulk read. Only a failed first fill
++    /// waits for stable mappings and retries through the sparse copy.
+@@ -1332 +1362 @@ impl Staging {
+-        let read = with_read(size, |read| {
++        with_read(size, |read| {
+@@ -1334 +1364,14 @@ impl Staging {
+-                return false;
++                UNLOCKED[1].fetch_add(1, Relaxed);
++                let recovered = last.recover_first(self.memory, read, |bytes| self.detile(bytes));
++                #[cfg(feature = "diagnostics")]
++                if recovered != 0 {
++                    static RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++                    let total = RECOVERIES.fetch_add(1, Relaxed) + 1;
++                    if total <= 8 {
++                        let desc = &self.layout.desc;
++                        let format = self.footprints.first().map(|f| f.Footprint.Format.0);
++                        tracing::info!(total, ?format, width = desc.width, height = desc.height,
++                            bytes = size, "texture sparse first fill");
++                    }
++                }
++                return recovered;
+@@ -1335,0 +1379 @@ impl Staging {
++            UNLOCKED[0].fetch_add(1, Relaxed);
+@@ -1337 +1381 @@ impl Staging {
+-            if last.hash != Some(hash) {
++            if last.hash != Some(hash) || !last.filled {
+@@ -1339 +1383 @@ impl Staging {
+-                self.detile(read);
++                last.filled |= self.detile(read);
+@@ -1341,4 +1384,0 @@ impl Staging {
+-            true
+-        });
+-        if read {
+-            UNLOCKED[0].fetch_add(1, Relaxed);
+@@ -1346,5 +1386 @@ impl Staging {
+-        } else {
+-            UNLOCKED[1].fetch_add(1, Relaxed);
+-            last.asked = 0;
+-            0
+-        }
++        })
+@@ -1354 +1390 @@ impl Staging {
+-    fn detile(&self, tiled: &[u8]) {
++    fn detile(&self, tiled: &[u8]) -> bool {
+@@ -1356 +1392 @@ impl Staging {
+-        self.detile_timed(tiled);
++        let filled = self.detile_timed(tiled);
+@@ -1357,0 +1394 @@ impl Staging {
++        filled
+@@ -1360 +1397 @@ impl Staging {
+-    fn detile_timed(&self, tiled: &[u8]) {
++    fn detile_timed(&self, tiled: &[u8]) -> bool {
+@@ -1403 +1440 @@ impl Staging {
+-                return;
++                return false;
+@@ -1405,0 +1443 @@ impl Staging {
++        held != 0
+@@ -1857,0 +1896,49 @@ mod title_memory_tests {
++    /// Exercise the same sparse copy and mapping guard as a failed first
++    /// bulk read, with inaccessible pages bracketing a committed page.
++    #[test]
++    fn failed_first_read_recovers_mapped_pages_and_leaves_freshness_unset() {
++        use windows_sys::Win32::System::Memory::*;
++        const PAGE: usize = 4096;
++        let mut scratch = vec![0xa5; 3 * PAGE];
++        let mut last = super::Last { asked: 10, ..Default::default() };
++        // SAFETY: this test owns the reservation and writes only the committed middle page.
++        unsafe {
++            let base = VirtualAlloc(std::ptr::null(), scratch.len(), MEM_RESERVE, PAGE_NOACCESS).cast::<u8>();
++            assert!(!base.is_null());
++            assert!(!crate::host::read_into(base, &mut scratch));
++            assert_eq!(last.recover_first(base, &mut scratch, |_| panic!("unreadable")), 0);
++            assert!(!last.filled && last.hash.is_none() && last.asked == 0);
++
++            let middle = base.add(PAGE);
++            assert_eq!(VirtualAlloc(middle.cast(), PAGE, MEM_COMMIT, PAGE_READWRITE), middle.cast());
++            middle.write_bytes(0x53, PAGE);
++            assert!(!crate::host::read_into(base, &mut scratch));
++            assert_eq!(last.recover_first(base, &mut scratch, |_| false), 0);
++            assert!(!last.filled, "an unsuccessful detile must remain eligible");
++            let size = last.recover_first(base, &mut scratch, |bytes| {
++                assert!(bytes[..PAGE].iter().all(|&b| b == 0));
++                assert!(bytes[PAGE..2 * PAGE].iter().all(|&b| b == 0x53));
++                assert!(bytes[2 * PAGE..].iter().all(|&b| b == 0));
++                true
++            });
++            assert_eq!(size, 3 * PAGE);
++            assert!(last.filled && last.hash.is_none() && last.partial.is_none() && last.asked == 0);
++            assert_ne!(VirtualFree(base.cast(), 0, MEM_RELEASE), 0);
++        }
++    }
++
++    #[test]
++    fn failed_later_read_preserves_snapshot_even_after_invalidation() {
++        let hash = blake3::hash(b"previous image");
++        let mut last = super::Last { filled: true, hash: Some(hash), asked: 7, partial: None };
++        let mut scratch = [0x55; 128];
++        let source = [0x11; 128];
++        assert_eq!(last.recover_first(source.as_ptr(), &mut scratch, |_| panic!("overwrote snapshot")), 0);
++        assert_eq!(last.hash, Some(hash));
++        assert_eq!(last.asked, 0);
++        last.forget_changes();
++        assert!(last.hash.is_none() && last.filled);
++        assert_eq!(last.recover_first(source.as_ptr(), &mut scratch, |_| panic!("overwrote snapshot")), 0);
++        assert_eq!(scratch, [0x55; 128]);
++    }
++
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index ad407a1..2a65a92 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -11684,7 +11684 @@ impl<'a> Lower<'a> {
+-        let limit = match super::loop_limit() {
+-            LOOP_LIMIT if self.s.pixel => 1 << 7,
+-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+-            LOOP_LIMIT => 1 << 12,
+-            named => named,
+-        };
+-        let limit = self.s.m.i32(limit);
++        let limit = self.s.m.i32(super::loop_limit_for(self.x.native.stage));
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index f0c58ce..72f335e 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -137 +137 @@ pub use shader::{
+-/// The loop limit without an override: 2^20.
++/// General setting that selects the translator's per-stage defaults.
+@@ -140,9 +140,3 @@ pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
+-/// The iteration count after which a translated loop is left, per lane and
+-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+-///
+-/// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
+-/// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
+-/// every lane of a full-screen pass still runs for seconds (2^20 times a
+-/// 4K screen is about 10^13 iterations); a much lower limit shows whether
+-/// such loops are what makes a frame slow. The value is part of the
+-/// translation, so the shader cache must key on it (`victory-gpu`'s does).
++/// General diagnostic loop limit. With diagnostics enabled, a positive
++/// decimal or hexadecimal `VICTORY_SHADER_LOOP_LIMIT` overrides the stage
++/// defaults unless it equals [`DEFAULT_LOOP_LIMIT`].
+@@ -153 +147,2 @@ pub fn loop_limit() -> u32 {
+-            parse_loop_limit(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
++            parse_loop_count(std::env::var("VICTORY_SHADER_LOOP_LIMIT").ok().as_deref())
++                .unwrap_or(DEFAULT_LOOP_LIMIT)
+@@ -159,0 +155,24 @@ pub fn loop_limit() -> u32 {
++/// A compute override applies only to compute loop back edges. Without it
++/// the general setting and its per-stage defaults keep their original meaning.
++fn loop_limit_for(stage: HwStage) -> u32 {
++    static CS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
++    let compute = if stage == HwStage::Cs && cfg!(feature = "diagnostics") {
++        *CS.get_or_init(|| {
++            parse_loop_count(std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref())
++        })
++    } else {
++        None
++    };
++    stage_loop_limit(stage, loop_limit(), compute)
++}
++
++fn stage_loop_limit(stage: HwStage, general: u32, compute: Option<u32>) -> u32 {
++    match (stage, general, compute) {
++        (HwStage::Cs, _, Some(count)) => count,
++        (_, count, _) if count != DEFAULT_LOOP_LIMIT => count,
++        (HwStage::Cs, _, _) => 4096,
++        (HwStage::Ps, _, _) => 128,
++        _ => 256,
++    }
++}
++
+@@ -304,0 +324 @@ pub fn translation_fingerprint() -> Vec<u8> {
++    out.extend_from_slice(&loop_limit_for(HwStage::Cs).to_le_bytes());
+@@ -322,12 +342,6 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
+-/// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
+-/// unreadable or 0. Pure, for testing.
+-fn parse_loop_limit(value: Option<&str>) -> u32 {
+-    let parsed = value
+-        .map(str::trim)
+-        .and_then(|v| match v.strip_prefix("0x") {
+-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+-            None => v.parse().ok(),
+-        });
+-    match parsed {
+-        Some(n) if n > 0 => n,
+-        _ => lower::LOOP_LIMIT,
++/// A positive decimal or hexadecimal loop count.
++fn parse_loop_count(value: Option<&str>) -> Option<u32> {
++    let text = value?.trim();
++    match text.strip_prefix("0x") {
++        Some(hex) => u32::from_str_radix(hex, 16).ok(),
++        None => text.parse().ok(),
+@@ -334,0 +349 @@ fn parse_loop_limit(value: Option<&str>) -> u32 {
++    .filter(|&n| n > 0)
+@@ -1097 +1111,0 @@ mod tests {
+-    use super::parse_loop_limit;
+@@ -1112,4 +1126,4 @@ mod tests {
+-        assert_eq!(parse_loop_limit(None), LOOP_LIMIT);
+-        assert_eq!(parse_loop_limit(Some("4096")), 4096);
+-        assert_eq!(parse_loop_limit(Some(" 0x1000 ")), 4096);
+-        assert_eq!(parse_loop_limit(Some("1")), 1);
++        assert_eq!(parse_loop_count(None), None);
++        assert_eq!(parse_loop_count(Some("4096")), Some(4096));
++        assert_eq!(parse_loop_count(Some(" 0x1000 ")), Some(4096));
++        assert_eq!(parse_loop_count(Some("1")), Some(1));
+@@ -1117 +1131,13 @@ mod tests {
+-            assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
++            assert_eq!(parse_loop_count(Some(bad)), None, "{bad:?}");
++        }
++    }
++
++    #[test]
++    fn compute_loop_override_preserves_graphics_and_unset_defaults() {
++        for (stage, default) in [(HwStage::Cs, 4096), (HwStage::Ps, 128),
++                                 (HwStage::Vs, 256), (HwStage::Ms, 256)] {
++            assert_eq!(stage_loop_limit(stage, LOOP_LIMIT, None), default);
++            assert_eq!(stage_loop_limit(stage, 32, None), 32);
++            let compute = stage == HwStage::Cs;
++            assert_eq!(stage_loop_limit(stage, 32, Some(128)), if compute { 128 } else { 32 });
++            assert_eq!(stage_loop_limit(stage, LOOP_LIMIT, Some(512)), if compute { 512 } else { default });
+@@ -1118,0 +1145 @@ mod tests {
++        assert_eq!(stage_loop_limit(HwStage::Cs, 32, Some(LOOP_LIMIT)), LOOP_LIMIT);
