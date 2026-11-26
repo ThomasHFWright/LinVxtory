@@ -81,6 +81,35 @@ The frozen source passed 187 native shader tests, with two ignored, including
 code-table boundaries, paired-wave guards and retained host annotations. Further GPU/title validation is separate from source reconstruction. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
 
+## Optional PR927 facial-animation build
+
+To build the PR995 renderer with the half-precision buffer fix, first reconstruct
+the frozen source and run `verify.sh` above. Then apply this additional patch
+from the same kit and rebuild with the same diagnostics features and preset.
+
+```sh
+git -C "$candidate" apply --check --unidiff-zero "$kit/pr927.patch.txt"
+git -C "$candidate" apply --unidiff-zero "$kit/pr927.patch.txt"
+(cd "$candidate" && cargo build -p victory --profile diag --features diagnostics \
+  --target x86_64-pc-windows-msvc --offline --locked)
+```
+
+The patch ports tippythetaidum’s half-view changes and the Linux fork’s
+mixed-access and descriptor-cache safeguards. On the RTX 5090, the integer
+path preserved all 65,536 possible 16-bit patterns in GPU readback. The
+float-conversion control preserved one. All 12 targeted Windows regressions
+passed, and the native shader suite passed 193 tests with two ignored.
+[Original PR 927](https://github.com/fxceless/victory-fork/pull/927) ·
+[Linux integration notes](../pr927-integration.md)
+
+In matched offline checkpoint runs on the same RTX 5090, the original build
+averaged 5.17 FPS and the PR927 build averaged 5.19 FPS over seconds 180–330
+after the first world pipeline bind. Both runs started with empty shader and
+driver caches and ended at the 390-second harness limit. The PR927 run cached
+24 compute translations that selected half views. The cell still showed exposed
+eyes and detached jaw geometry in frontal views. Lip motion during speech
+remains visually unverified.
+
 ## Linux preset and runtime
 
 [linux-preset.sh](linux-preset.sh) records the measured candidate flags without
