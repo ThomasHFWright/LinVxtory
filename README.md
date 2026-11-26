@@ -31,11 +31,10 @@ The offline run completed 30 minutes before the test harness closed it. Across
 nearly 25 minutes of world rendering it averaged **4.87 FPS**, versus **0.70 FPS**
 on the comparison build. Hair, lighting and some surfaces still have rendering defects.
 
-Download the tested executable from the [PR995 Linux release](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-pr995-c24b8578).
-It uses the indexed GE-Proton 11-14 runtime and the supplied PR995 preset with
-default shader loop limits. The [source kit and preset](docs/pr995-candidate/README.md)
-reconstruct this renderer from its pinned upstream commit. Building the root
-workspace gives the mainline renderer used for comparison.
+LinVictory releases are source-only. Build the tested PR995 renderer locally and
+supply your own game files at runtime. The source kit includes the tested preset
+and the optional PR927 facial-animation patch. Building the root workspace gives
+the mainline renderer used for comparison. [PR995 build instructions](docs/pr995-candidate/README.md)
 
 ### Mainline build history
 

@@ -195,14 +195,12 @@ The indexed run closed itself after 393.28 seconds at `0x5149aec`. Its own
 report listed frame 1488, 1,586 streaming requests, 22,478 of 22,500 building
 slots and all 45,000 instance slots occupied. Both servers reached this
 breakpoint before the scheduled control test. The indexed server is a separate
-runtime experiment. The application release contains the same executable used
-for both runs.
+runtime experiment. Both runs used the same locally built application.
 
 The [source-only GE11-14 build kit](https://github.com/ThomasHFWright/LinVictory/releases/download/linux-edge-10532b2/ge1114-indexed-source-kit.tar.gz)
 contains source pins, build instructions and the parent/child mapping test.
 The three server variants produced identical results for all 94,376 records.
-The kit downloads the upstream patch at build time. The executable release and
-installed GE runtime can be used independently of the kit.
+The kit downloads the upstream patch at build time. The locally built application also runs with the installed GE runtime.
 
 A second indexed run traced five instance-culling compute shaders. All five
 recorded nonzero dispatches and had callbacks after GPU completion. All the

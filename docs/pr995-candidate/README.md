@@ -145,8 +145,10 @@ The original compatibility layer is by **Marvisak and VIctory contributors**;
 **fxceless/victory-fork contributors** supply the rendering base. **tunczzz's
 PR995** supplies this renderer revision. The base repository retains their
 history, notices and [GPL-3.0-or-later license](LICENSE); this kit keeps those
-terms. The upstream documented BCPack-format-table exception is not relicensed
-or redistributed here.
+terms. The pinned upstream checkout supplies 77,982 bytes of BCPack decoder tables,
+which are embedded when you build locally. Upstream identifies these format
+constants as an exception outside its repository license. The source kit
+contains the patches and build instructions. Supply your own game files at runtime.
 
 - Code table: **desplmfao's** original fix, **OctoAlgo's** public
   [PR1006](https://github.com/fxceless/victory-fork/pull/1006) commit
