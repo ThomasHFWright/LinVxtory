@@ -42,7 +42,9 @@ On the same executable, a private indexed GE-Proton 11-14 wineserver improved a
 instance list and closed before player control could be verified. With the
 Series S profile, the same executable generated a story save and ran for the full
 30-minute test. The screen was mostly white, so input could not be confirmed
-visually. The Series X reload uses a separate copy of that save.
+visually. Series X loaded a separate copy of that save into the cell, where
+opposite right-stick inputs turned the camera in both directions. Some textures
+are missing or striped, and walking remains unverified.
 
 The world-rendering observations below describe the preserved pre-merge build.
 

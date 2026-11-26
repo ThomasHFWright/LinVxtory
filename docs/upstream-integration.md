@@ -228,5 +228,11 @@ on indexed GE11-14. The harness stopped it at the time limit. The title wrote
 a new story slot about eight minutes in. The developer build used stock pool
 sizes and a private copy of the original settings. The picture was largely
 black or white with the title's own upscaler. A separate GPU integration test
-using the official PC upscaler passed for an FP16 output. Player control and
-the result of loading the new save on Series X require separate verification.
+using the official PC upscaler passed for an FP16 output.
+
+Series X loaded a private copy of that save on the same published 10532b2
+executable. The cell and character rendered. During a scripted right-stick hold
+the doorway moved across the frame, settled after release, and moved back during
+the opposite hold. This verifies camera control. Walking remains unverified.
+The 150-second window starting 180 seconds after the first world compute bind
+advanced 103 presents in 149.31 seconds (0.69 FPS).
