@@ -46,6 +46,15 @@ visually. Series X loaded a separate copy of that save into the cell, where
 opposite right-stick inputs turned the camera in both directions. Some textures
 are missing or striped, and walking remains unverified.
 
+On the same Series X checkpoint, the pipeline-library fix in `bb4d5e3`
+produced 0.70 and 0.71 FPS in consecutive 150-second windows. The previous
+build measured 0.69 and 0.77 FPS. The library persisted on disk and the frame
+rate remained within the earlier range.
+The [baa1330 build](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-baa1330)
+also avoids polling memory ranges already covered in a submission and supports
+RGB9E5 upscaler output. Its GPU packing test covered every half-float bit
+pattern on the RTX 5090. Its frame rate is still under evaluation.
+
 The world-rendering observations below describe the preserved pre-merge build.
 
 **Normal in-world visuals render on Linux; interactive gameplay is not yet
