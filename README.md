@@ -22,6 +22,20 @@ performance, controllable gameplay, then more complete textures and models.
 
 ## Current Linux status
 
+**The tested PR995 build sustained 5.36 and 5.51 FPS in the rendered cell on
+CachyOS with an RTX 5090.** The previous Linux build measured 0.71 and 0.72 FPS
+in the same two windows after loading a copy of the same story checkpoint.
+The camera turned from the window to the bunks and back in response to opposite
+controller inputs. Hair and some surfaces still have rendering defects.
+
+Download the tested executable from the [PR995 Linux release](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-pr995-c24b8578).
+It uses the indexed GE-Proton 11-14 runtime and the supplied PR995 preset with
+default shader loop limits. The [source kit and preset](docs/pr995-candidate/README.md)
+reconstruct this renderer from its pinned upstream commit. Building the root
+workspace gives the mainline renderer used for comparison.
+
+### Mainline build history
+
 The [Linux diagnostic build](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-edge-cbe8b3b) includes Marvisak/VIctory through `13f91ca` (2026-11-25).
 The merged build now passes its initial loading crash after correcting shader
 handle annotations and restoring host wave-width discovery. The failing shader
