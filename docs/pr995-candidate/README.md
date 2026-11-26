@@ -189,6 +189,27 @@ with the original source patch at commit `4331d2b`. Its matched checkpoint
 runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
 [Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
 
+## Optional frame-rate patches
+
+This patch applies to the finished three-PR source that `build.sh` leaves in
+the external directory. The switch is off by default, so a build without
+it set behaves like the tested renderer. See [Linux notes from a second RTX 5090](../linux-notes-5090.md)
+for the measurements.
+
+```sh
+src=../linvxtory-renderer   # the directory given to build.sh
+git -C "$src" apply --check docs/pr995-candidate/back-quiet.patch.txt
+git -C "$src" apply docs/pr995-candidate/back-quiet.patch.txt
+```
+
+Then run the same `cargo build` command as the last line of `build.sh`, from the source directory.
+Rerunning `build.sh` stops at `verify.sh`, because shadow.rs and descriptor/host.rs
+no longer match the lock.
+
+- `back-quiet.patch.txt`: `VICTORY_BACK_QUIET=1` from
+  [fork PR 1188](https://github.com/fxceless/victory-fork/pull/1188) by Yorivel.
+  After a copy-back, the pages' write-watch bits are reset, so the copy-back's
+  own writes no longer count as title writes.
 ## Linux preset and runtime
 
 [linux-preset.sh](linux-preset.sh) records the measured candidate flags without
