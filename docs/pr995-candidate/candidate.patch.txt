@@ -1,0 +1,2406 @@
+diff --git a/crates/victory-gpu/Cargo.toml b/crates/victory-gpu/Cargo.toml
+index e6d8445..798f592 100644
+--- a/crates/victory-gpu/Cargo.toml
++++ b/crates/victory-gpu/Cargo.toml
+@@ -17 +17 @@
+-victory-shader.workspace = true
++victory-shader = { workspace = true, features = ["host"] }
+@@ -33,0 +34 @@
++    "Win32_Graphics_Direct3D_Dxc",
+diff --git a/crates/victory-gpu/src/dxc.rs b/crates/victory-gpu/src/dxc.rs
+new file mode 100644
+index 0000000..445581b
+--- /dev/null
++++ b/crates/victory-gpu/src/dxc.rs
+@@ -0,0 +1,458 @@
++//! Compiling our own HLSL at run time.
++//!
++//! A few of the host's passes are written in HLSL and compiled when the host
++//! starts: the indirect-argument clamp ([`crate::indirect`]), the compare of
++//! copies in the card's memory and the depth-plane twins ([`crate::host`]),
++//! and the in-place probe ([`crate::inplace`]). The system's compiler
++//! (`D3DCompile`, `d3dcompiler_47`) is tried first, as it always was. Under
++//! Wine and Proton that is vkd3d-shader, which refuses some of this source
++//! outright (`E5005: Method 'Load' is not defined on type
++//! 'RWByteAddressBuffer'`), and every caller then gives up: no argument
++//! clamp, so indirect executions are dropped; no card compare, so card
++//! buffers silently switch off; no twins. It also compiles the rest of the
++//! source but drops the root signature the shader asks for, so
++//! `CreateRootSignature` over its bytes fails and the twins still have no
++//! pipeline. So the same source is compiled with DXC (`dxcompiler.dll`) as
++//! shader model 6.0 when the system compiler refuses it, or leaves the root
++//! signature out of a shader that asked for one. The root signature stays
++//! inside the shader, so the callers see only bytes, and on Windows, where
++//! `D3DCompile` succeeds and keeps the root signature, nothing changes.
++//!
++//! DXC is looked for in `VICTORY_DXC` (the DLL or its folder), beside the
++//! `dxil.dll` that shader validation uses (the Windows SDK ships the two
++//! together), then the executable's folder and System32. A container DXC
++//! compiled without finding `dxil.dll` carries a zero digest, which D3D12
++//! refuses: such containers are signed here (`sign`), `VICTORY_DXIL` naming
++//! the validator if it is somewhere else.
++
++use std::path::PathBuf;
++
++use windows::Win32::Foundation::HMODULE;
++use windows::Win32::Graphics::Direct3D::Dxc::{
++    CLSID_DxcCompiler, DXC_CP_UTF8, DxcBuffer, IDxcCompiler3, IDxcIncludeHandler, IDxcResult,
++};
++use windows::Win32::System::LibraryLoader::{
++    GetModuleFileNameW, GetProcAddress, LOAD_LIBRARY_SEARCH_APPLICATION_DIR,
++    LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
++    LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
++};
++use windows::core::{GUID, HSTRING, Interface, PCWSTR, s, w};
++
++/// Compiles function `entry` of `source` for `target` (e.g. `cs_5_1`), with
++/// the system's compiler or, if it refuses or leaves the root signature out,
++/// with DXC (see the module docs).
++pub(crate) fn compile(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
++    let bytes = match system(source, entry, target) {
++        Ok(bytes) => bytes,
++        Err(e) => {
++            tracing::info!(
++                error = %e,
++                entry,
++                target,
++                "the system compiler refused one of our shaders: trying DXC"
++            );
++            return dxc(source, entry, target)
++                .inspect_err(|e| tracing::warn!(error = %e, entry, target, "DXC failed too"));
++        }
++    };
++    // Wine's compiler takes the source but drops the root signature it asks
++    // for, and D3D12 refuses those bytes. A shader with no root signature of
++    // its own (a vertex shader whose pixel shader carries it) keeps the
++    // system's bytes: neither compiler has one to give.
++    if !asks_for_root_signature(source, entry) || carries_root_signature(&bytes) {
++        return Ok(bytes);
++    }
++    tracing::info!(
++        entry,
++        target,
++        "the system compiler left the root signature out of one of our shaders: trying DXC"
++    );
++    match dxc(source, entry, target) {
++        Ok(with_signature) if carries_root_signature(&with_signature) => Ok(with_signature),
++        Ok(_) => Ok(bytes),
++        Err(e) => {
++            tracing::warn!(error = %e, entry, target, "DXC failed too");
++            Ok(bytes)
++        }
++    }
++}
++
++/// Whether the container holds the root signature the shader asked for: both
++/// compilers store it as the chunk `RTS0`.
++fn carries_root_signature(bytes: &[u8]) -> bool {
++    bytes.windows(4).any(|chunk| chunk == b"RTS0")
++}
++
++/// Whether the declaration of `entry` asks for a root signature. A source can
++/// hold several entries (a test compiles `corner`, which carries the
++/// signature, and `lit`, which does not), and only the entry's own attribute
++/// should send it to DXC. An attribute this cannot tie to a declaration counts
++/// as the entry's: the answer only decides whether a second compile is
++/// attempted, so it errs towards compiling again.
++fn asks_for_root_signature(source: &str, entry: &str) -> bool {
++    if !source.contains("RootSignature") {
++        return false;
++    }
++    let mut from = 0;
++    let mut found = false;
++    while let Some(at) = source[from..].find("[RootSignature") {
++        let at = from + at;
++        from = at + 1;
++        found = true;
++        // Skip this attribute and any others between it and the declaration.
++        let mut decl = &source[at..];
++        while let Some(attribute) = decl.trim_start().strip_prefix('[') {
++            let Some(close) = attribute.find(']') else {
++                return true;
++            };
++            decl = &attribute[close + 1..];
++        }
++        // The declared function's name is the word before its `(`.
++        let name = decl
++            .trim_start()
++            .split_once('(')
++            .and_then(|(head, _)| head.split_whitespace().last());
++        match name {
++            Some(name) if name == entry => return true,
++            Some(_) => {}
++            None => return true,
++        }
++    }
++    // A mention outside an attribute (`#define`) keeps the conservative
++    // answer.
++    !found
++}
++
++/// `D3DCompile`: the system's compiler, which on Windows compiles all of
++/// this source.
++fn system(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
++    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
++    use windows::Win32::Graphics::Direct3D::ID3DBlob;
++    use windows::core::PCSTR;
++    // A `PCSTR` ends at its first zero: an interior zero truncates the name,
++    // which is what the compiler would read anyway.
++    let entry = format!("{entry}\0");
++    let target = format!("{target}\0");
++    let mut code: Option<ID3DBlob> = None;
++    let mut errors: Option<ID3DBlob> = None;
++    // SAFETY: the source and names live through the call; out pointers ours.
++    let compiled = unsafe {
++        D3DCompile(
++            source.as_ptr().cast(),
++            source.len(),
++            s!("victory"),
++            None,
++            None,
++            PCSTR(entry.as_ptr()),
++            PCSTR(target.as_ptr()),
++            0,
++            0,
++            &mut code,
++            Some(&mut errors),
++        )
++    };
++    if let Err(e) = compiled {
++        if let Some(errors) = errors {
++            // SAFETY: the blob's own bytes.
++            let text = unsafe {
++                std::slice::from_raw_parts(
++                    errors.GetBufferPointer().cast::<u8>(),
++                    errors.GetBufferSize(),
++                )
++            };
++            tracing::info!(
++                "one of our shaders: {}",
++                String::from_utf8_lossy(text).trim()
++            );
++        }
++        return Err(e);
++    }
++    let code = code.ok_or_else(windows::core::Error::empty)?;
++    // SAFETY: the blob's own bytes.
++    let bytes = unsafe {
++        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
++    };
++    Ok(bytes.to_vec())
++}
++
++/// Compiles with DXC: the same source as shader model 6.0 (5.1 is the
++/// oldest profile DXC knows, and 6.0 takes everything 5.1 does), root
++/// signature inside.
++fn dxc(source: &str, entry: &str, target: &str) -> windows::core::Result<Vec<u8>> {
++    type Create = unsafe extern "system" fn(
++        *const GUID,
++        *const GUID,
++        *mut *mut std::ffi::c_void,
++    ) -> windows::core::HRESULT;
++    let library = library()?;
++    let profile = match target.strip_suffix("_5_1") {
++        Some(kind) => format!("{kind}_6_0"),
++        None => target.to_string(),
++    };
++    let (target_flag, profile, entry) = (wide("-T"), wide(&profile), wide(entry));
++    let arguments = [
++        PCWSTR(target_flag.as_ptr()),
++        PCWSTR(profile.as_ptr()),
++        w!("-E"),
++        PCWSTR(entry.as_ptr()),
++        w!("-O3"),
++    ];
++    // SAFETY: loading the compiler and calling its documented entry point
++    // with out pointers of ours; the source, the arguments and the strings
++    // they point at outlive the calls.
++    unsafe {
++        let create: Create = std::mem::transmute(
++            GetProcAddress(library, s!("DxcCreateInstance"))
++                .ok_or_else(windows::core::Error::from_thread)?,
++        );
++        let mut compiler = std::ptr::null_mut();
++        create(&CLSID_DxcCompiler, &IDxcCompiler3::IID, &mut compiler).ok()?;
++        let compiler = IDxcCompiler3::from_raw(compiler);
++        let buffer = DxcBuffer {
++            Ptr: source.as_ptr().cast(),
++            Size: source.len(),
++            Encoding: DXC_CP_UTF8.0,
++        };
++        let result: IDxcResult =
++            compiler.Compile(&buffer, Some(&arguments), None::<&IDxcIncludeHandler>)?;
++        if let Err(e) = result.GetStatus()?.ok() {
++            if let Ok(errors) = result.GetErrorBuffer() {
++                // SAFETY: the blob's own bytes.
++                let text = std::slice::from_raw_parts(
++                    errors.GetBufferPointer().cast::<u8>(),
++                    errors.GetBufferSize(),
++                );
++                tracing::warn!(
++                    "one of our shaders: DXC: {}",
++                    String::from_utf8_lossy(text).trim()
++                );
++            }
++            return Err(e);
++        }
++        let blob = result.GetResult()?;
++        // SAFETY: the blob's own bytes.
++        let mut bytes =
++            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize())
++                .to_vec();
++        sign(library, &mut bytes)?;
++        Ok(bytes)
++    }
++}
++
++/// Where `dxcompiler.dll` is looked for: `VICTORY_DXC` (the DLL or its
++/// folder), beside the `dxil.dll` shader validation uses (the SDK ships
++/// them together), then the executable's folder and System32.
++fn library() -> windows::core::Result<HMODULE> {
++    let mut paths: Vec<PathBuf> = Vec::new();
++    if let Some(p) = std::env::var_os("VICTORY_DXC").map(PathBuf::from) {
++        paths.push(if p.is_dir() {
++            p.join("dxcompiler.dll")
++        } else {
++            p
++        });
++    }
++    if let Some(dir) = victory_shader::emit::validator::Validator::default_path()
++        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
++    {
++        paths.push(dir.join("dxcompiler.dll"));
++    }
++    for path in paths.iter().filter(|p| p.is_file()) {
++        // SAFETY: a NUL-terminated path; its folder (`dxil.dll`) is searched
++        // first.
++        if let Ok(module) = unsafe {
++            LoadLibraryExW(
++                &HSTRING::from(path.as_path()),
++                None,
++                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
++            )
++        } {
++            return Ok(module);
++        }
++    }
++    // SAFETY: a bare name, searched only in the executable's folder and
++    // System32.
++    unsafe {
++        LoadLibraryExW(
++            w!("dxcompiler.dll"),
++            None,
++            LOAD_LIBRARY_SEARCH_APPLICATION_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
++        )
++    }
++}
++
++/// Older DXC DLLs compile without finding `dxil.dll`, and the container then
++/// carries a zero digest, which D3D12 refuses: such a container is validated
++/// (and signed) here.
++fn sign(compiler: HMODULE, bytes: &mut [u8]) -> windows::core::Result<()> {
++    use std::os::windows::ffi::OsStringExt;
++
++    use victory_shader::emit::validator::Validator;
++    use windows::Win32::Foundation::E_FAIL;
++
++    if bytes
++        .get(4..20)
++        .is_some_and(|digest| digest.iter().any(|&b| b != 0))
++    {
++        return Ok(());
++    }
++    let beside_compiler = || {
++        let mut path = vec![0; 32_768];
++        // SAFETY: the compiler's module is loaded and the buffer is ours.
++        let len = unsafe { GetModuleFileNameW(Some(compiler), &mut path) } as usize;
++        if len == 0 || len >= path.len() {
++            return None;
++        }
++        let compiler = PathBuf::from(std::ffi::OsString::from_wide(&path[..len]));
++        let validator = compiler.with_file_name("dxil.dll");
++        validator.is_file().then_some(validator)
++    };
++    let explicit = std::env::var_os("VICTORY_DXIL").map(PathBuf::from);
++    let path = explicit
++        .or_else(beside_compiler)
++        .or_else(Validator::default_path);
++    Validator::load(path.as_deref())
++        .and_then(|mut validator| validator.validate(bytes))
++        .map_err(|error| {
++            windows::core::Error::new(E_FAIL, format!("cannot sign a DXC shader: {error}"))
++        })
++}
++
++/// A NUL-terminated UTF-16 copy of `text`, for DXC's arguments.
++fn wide(text: &str) -> Vec<u16> {
++    text.encode_utf16().chain([0]).collect()
++}
++
++#[cfg(test)]
++mod tests {
++    //! The fallback, and the bytes it makes: under Wine the system compiler
++    //! refuses this source and DXC compiles it; on Windows `D3DCompile`
++    //! compiles it, and either way D3D12 must take what comes out.
++
++    use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
++    use windows::Win32::Graphics::Direct3D12::{
++        D3D12_COMPUTE_PIPELINE_STATE_DESC, D3D12_SHADER_BYTECODE, D3D12CreateDevice, ID3D12Device,
++        ID3D12PipelineState, ID3D12RootSignature,
++    };
++
++    use super::*;
++
++    /// A shader that loads through an `RWByteAddressBuffer` (vkd3d-shader
++    /// refuses the `Load`) and asks for a root signature (which vkd3d-shader
++    /// would drop): the shape the in-place probe has.
++    const SOURCE: &str = r#"
++#define RS "UAV(u0)"
++RWByteAddressBuffer b : register(u0);
++[RootSignature(RS)]
++[numthreads(1, 1, 1)]
++void main() { b.Store(8, b.Load(0) + b.Load(4)); }
++"#;
++
++    #[test]
++    fn a_shader_the_system_compiler_refuses_is_compiled_by_dxc() {
++        match system(SOURCE, "main", "cs_5_1") {
++            Ok(_) => println!("the system compiler compiled it: DXC is not exercised here"),
++            Err(e) => println!("the system compiler refused it: {e}"),
++        }
++        let bytes = compile(SOURCE, "main", "cs_5_1").expect("a compiler must take the shader");
++        let magic = std::str::from_utf8(&bytes[..4]).unwrap_or("?");
++        println!("container {magic}, {} bytes", bytes.len());
++        assert!(
++            matches!(magic, "DXIL" | "DXBC"),
++            "not a shader container: {magic}"
++        );
++        assert!(
++            bytes[4..20].iter().any(|&b| b != 0),
++            "the container carries no digest: D3D12 would refuse it"
++        );
++        assert!(
++            carries_root_signature(&bytes),
++            "the container carries no root signature, which the shader asks for"
++        );
++        let Some(device) = device() else {
++            println!("no D3D12 device here: the root signature and pipeline are not checked");
++            return;
++        };
++        // SAFETY: the root signature is inside the shader; the description
++        // points at live bytes and never releases its pointer.
++        unsafe {
++            let root: ID3D12RootSignature = device
++                .CreateRootSignature(0, &bytes)
++                .expect("D3D12 must take the root signature inside the shader");
++            device
++                .CreateComputePipelineState::<ID3D12PipelineState>(
++                    &D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                        pRootSignature: std::mem::transmute_copy(&root),
++                        CS: D3D12_SHADER_BYTECODE {
++                            pShaderBytecode: bytes.as_ptr().cast(),
++                            BytecodeLength: bytes.len(),
++                        },
++                        ..Default::default()
++                    },
++                )
++                .expect("the shader must make a compute pipeline");
++        }
++        println!("D3D12 took the root signature and made the pipeline");
++    }
++
++    #[test]
++    fn inflight_fetch_shader_keeps_its_root_signature_under_wine() {
++        let bytes = compile(crate::host::CARD_FETCH, "main", "cs_5_1")
++            .expect("the in-flight fetch shader must compile");
++        assert!(carries_root_signature(&bytes));
++        let device = device().expect("a D3D12 device for the fetch pipeline regression");
++        // SAFETY: the compiled shader owns its root signature; bytes stay live.
++        unsafe {
++            let root: ID3D12RootSignature = device.CreateRootSignature(0, &bytes).unwrap();
++            device.CreateComputePipelineState::<ID3D12PipelineState>(
++                &D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: bytes.as_ptr().cast(),
++                        BytecodeLength: bytes.len(),
++                    },
++                    ..Default::default()
++                },
++            ).expect("the fetch shader must create a pipeline");
++        }
++    }
++
++    /// A source can hold several entries: only the entry carrying the
++    /// attribute asks for a root signature, so only it is retried with DXC.
++    #[test]
++    fn a_root_signature_belongs_to_the_entry_it_sits_on() {
++        const TWO: &str = r#"
++#define RS "UAV(u0)"
++[RootSignature(RS)]
++[numthreads(1, 1, 1)]
++void main() { }
++float4 lit() : SV_Target { return 1.0; }
++"#;
++        assert!(asks_for_root_signature(TWO, "main"));
++        assert!(!asks_for_root_signature(TWO, "lit"));
++        assert!(!asks_for_root_signature(
++            "float4 lit() : SV_Target { return 1.0; }",
++            "lit"
++        ));
++    }
++
++    /// A shader with no root signature of its own keeps the system's bytes:
++    /// its root signature comes from another stage.
++    #[test]
++    fn a_shader_that_asks_for_no_root_signature_compiles() {
++        const CORNERS: &str = r#"
++float4 corner(uint i : SV_VertexID) : SV_Position {
++    return float4(float(i & 1) * 4.0 - 1.0, float(i >> 1) * 4.0 - 1.0, 0.0, 1.0);
++}
++"#;
++        let bytes = compile(CORNERS, "corner", "vs_5_1").expect("a compiler must take the shader");
++        assert!(!carries_root_signature(&bytes));
++    }
++
++    /// A D3D12 device (the default adapter; WARP counts), if there is one.
++    fn device() -> Option<ID3D12Device> {
++        let mut device: Option<ID3D12Device> = None;
++        // SAFETY: the out pointer is ours.
++        unsafe { D3D12CreateDevice(None, D3D_FEATURE_LEVEL_11_0, &mut device).ok()? };
++        device
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 311e395..eeb0be3 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1769,39 +1769,4 @@
+-    use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+-    use windows::Win32::Graphics::Direct3D::ID3DBlob;
+-    let mut code: Option<ID3DBlob> = None;
+-    let mut errors: Option<ID3DBlob> = None;
+-    // SAFETY: the source and names live through the call; out pointers ours.
+-    let compiled = unsafe {
+-        D3DCompile(
+-            source.as_ptr().cast(),
+-            source.len(),
+-            windows::core::s!("victory"),
+-            None,
+-            None,
+-            entry,
+-            target,
+-            0,
+-            0,
+-            &mut code,
+-            Some(&mut errors),
+-        )
+-    };
+-    if let Err(e) = compiled {
+-        if let Some(errors) = errors {
+-            // SAFETY: the blob's own bytes.
+-            let text = unsafe {
+-                std::slice::from_raw_parts(
+-                    errors.GetBufferPointer().cast::<u8>(),
+-                    errors.GetBufferSize(),
+-                )
+-            };
+-            tracing::warn!("a shader of ours: {}", String::from_utf8_lossy(text));
+-        }
+-        return Err(e);
+-    }
+-    let code = code.ok_or_else(windows::core::Error::empty)?;
+-    // SAFETY: the blob's own bytes.
+-    let bytes = unsafe {
+-        std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize())
+-    };
+-    Ok(bytes.to_vec())
++    // SAFETY: existing callers pass live, NUL-terminated entry/profile literals.
++    let (entry, target) = unsafe { (entry.to_string(), target.to_string()) };
++    let invalid = || windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG);
++    crate::dxc::compile(source, &entry.map_err(|_| invalid())?, &target.map_err(|_| invalid())?)
+@@ -7247,21 +7212 @@
+-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+-        let mut code: Option<ID3DBlob> = None;
+-        // SAFETY: the source and names live through the call; the out
+-        // pointer is ours.
+-        unsafe {
+-            D3DCompile(
+-                CARD_COMPARE.as_ptr().cast(),
+-                CARD_COMPARE.len(),
+-                windows::core::s!("card compare"),
+-                None,
+-                None,
+-                windows::core::s!("main"),
+-                windows::core::s!("cs_5_1"),
+-                0,
+-                0,
+-                &mut code,
+-                None,
+-            )?;
+-        }
+-        let code = code.ok_or_else(windows::core::Error::empty)?;
++        let code = crate::dxc::compile(CARD_COMPARE, "main", "cs_5_1")?;
+@@ -7277 +7222 @@
+-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
++            let bytes = code.as_slice();
+@@ -7306,2 +7250,0 @@
+-        use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+-        use windows::Win32::Graphics::Direct3D::ID3DBlob;
+@@ -7309,19 +7252 @@
+-            let mut code: Option<ID3DBlob> = None;
+-            // SAFETY: the source and names live through the call; the out
+-            // pointer is ours.
+-            unsafe {
+-                D3DCompile(
+-                    CARD_FETCH.as_ptr().cast(),
+-                    CARD_FETCH.len(),
+-                    windows::core::s!("card fetch in flight"),
+-                    None,
+-                    None,
+-                    windows::core::s!("main"),
+-                    windows::core::s!("cs_5_1"),
+-                    0,
+-                    0,
+-                    &mut code,
+-                    None,
+-                )?;
+-            }
+-            let code = code.ok_or_else(windows::core::Error::empty)?;
++            let code = crate::dxc::compile(CARD_FETCH, "main", "cs_5_1")?;
+@@ -7344 +7269 @@
+-                let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
++                let bytes = code.as_slice();
+diff --git a/crates/victory-gpu/src/indirect.rs b/crates/victory-gpu/src/indirect.rs
+index 94ed22b..0809a25 100644
+--- a/crates/victory-gpu/src/indirect.rs
++++ b/crates/victory-gpu/src/indirect.rs
+@@ -31,0 +32 @@
++#[cfg(test)]
+@@ -32,0 +34 @@
++#[cfg(test)]
+@@ -389,33 +391,2 @@
+-    let mut code: Option<ID3DBlob> = None;
+-    let mut errors: Option<ID3DBlob> = None;
+-    // SAFETY: the source and names live through the call; out pointers ours.
+-    let compiled = unsafe {
+-        D3DCompile(
+-            source.as_ptr().cast(),
+-            source.len(),
+-            s!("clamp"),
+-            None,
+-            None,
+-            entry,
+-            s!("cs_5_1"),
+-            0,
+-            0,
+-            &mut code,
+-            Some(&mut errors),
+-        )
+-    };
+-    if let Err(e) = compiled {
+-        if let Some(errors) = errors {
+-            // SAFETY: the blob's own bytes.
+-            let text = unsafe {
+-                std::slice::from_raw_parts(
+-                    errors.GetBufferPointer().cast::<u8>(),
+-                    errors.GetBufferSize(),
+-                )
+-            };
+-            tracing::warn!("argument clamp: {}", String::from_utf8_lossy(text));
+-        }
+-        return Err(e);
+-    }
+-    let code = code.ok_or_else(windows::core::Error::empty)?;
+-    // SAFETY: the blob's own bytes; the root signature is inside the shader.
++    let code = crate::host::compile(source, entry, s!("cs_5_1"))?;
++    // SAFETY: compiled bytes live through pipeline creation and contain its root signature.
+@@ -423,2 +394 @@
+-        let bytes =
+-            std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
++        let bytes = code.as_slice();
+diff --git a/crates/victory-gpu/src/inplace.rs b/crates/victory-gpu/src/inplace.rs
+index b34e92f..32c820b 100644
+--- a/crates/victory-gpu/src/inplace.rs
++++ b/crates/victory-gpu/src/inplace.rs
+@@ -44,2 +43,0 @@
+-use windows::Win32::Graphics::Direct3D::Fxc::D3DCompile;
+-use windows::Win32::Graphics::Direct3D::ID3DBlob;
+@@ -49 +47 @@
+-use windows::core::{Interface, s};
++use windows::core::Interface;
+@@ -910 +908 @@
+-        let mut code: Option<ID3DBlob> = None;
++        let code = crate::dxc::compile(SOURCE, "main", "cs_5_1")?;
+@@ -914,3 +912 @@
+-            D3DCompile(SOURCE.as_ptr().cast(), SOURCE.len(), s!("inplace"), None, None, s!("main"), s!("cs_5_1"), 0, 0, &mut code, None)?;
+-            let code = code.ok_or_else(windows::core::Error::empty)?;
+-            let bytes = std::slice::from_raw_parts(code.GetBufferPointer().cast::<u8>(), code.GetBufferSize());
++            let bytes = code.as_slice();
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index 72b7e63..cba2148 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -43,0 +44,2 @@
++#[cfg(windows)]
++mod dxc;
+diff --git a/crates/victory-gpu/src/pipeline/host.rs b/crates/victory-gpu/src/pipeline/host.rs
+index d0d9cd6..c854020 100644
+--- a/crates/victory-gpu/src/pipeline/host.rs
++++ b/crates/victory-gpu/src/pipeline/host.rs
+@@ -434 +434,3 @@
+-        if mesh.is_some() && !host()?.mesh_shaders() {
++        // Host wave width and heap limits must precede translation/cache lookup.
++        let host = host()?;
++        if mesh.is_some() && !host.mesh_shaders() {
+@@ -440 +441,0 @@
+-        let host = host()?;
+diff --git a/crates/victory-hle/src/modules/lifecycle.rs b/crates/victory-hle/src/modules/lifecycle.rs
+index b7a2445..98023be 100644
+--- a/crates/victory-hle/src/modules/lifecycle.rs
++++ b/crates/victory-hle/src/modules/lifecycle.rs
+@@ -160 +160,2 @@
+-    let fitted = fit_into(&area, width, height);
++    let limit = window_limit();
++    let fitted = fit_with_limit(&area, width, height, limit);
+@@ -164 +165 @@
+-    tracing::info!(width, height, to = ?fitted, "title window fitted to the screen");
++    tracing::info!(width, height, to = ?fitted, ?limit, "title window fitted to the screen");
+@@ -170,0 +172,39 @@
++fn parse_window_limit(value: &str) -> Option<(i32, i32)> {
++    let (width, height) = value.trim().split_once(['x', 'X'])?;
++    let (width, height) = (width.trim().parse().ok()?, height.trim().parse().ok()?);
++    (width > 0 && height > 0).then_some((width, height))
++}
++
++fn window_limit() -> Option<(i32, i32)> {
++    static LIMIT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
++    *LIMIT.get_or_init(|| {
++        let value = std::env::var_os("VICTORY_WINDOW_MAX")?;
++        let parsed = value.to_str().and_then(parse_window_limit);
++        if parsed.is_none() {
++            tracing::warn!(
++                ?value,
++                "ignoring invalid VICTORY_WINDOW_MAX; expected positive WIDTHxHEIGHT"
++            );
++        }
++        parsed
++    })
++}
++
++fn fit_with_limit(
++    area: &RECT,
++    width: i32,
++    height: i32,
++    limit: Option<(i32, i32)>,
++) -> (i32, i32) {
++    let Some((max_width, max_height)) = limit else {
++        return fit_into(area, width, height);
++    };
++    let bounded = RECT {
++        left: 0,
++        top: 0,
++        right: (area.right - area.left).min(max_width),
++        bottom: (area.bottom - area.top).min(max_height),
++    };
++    fit_into(&bounded, width, height)
++}
++
+diff --git a/crates/victory-loader/src/hooks.rs b/crates/victory-loader/src/hooks.rs
+new file mode 100644
+index 0000000..b34dc0d
+--- /dev/null
++++ b/crates/victory-loader/src/hooks.rs
+@@ -0,0 +1,88 @@
++//! Opt-in compatibility hooks for known title builds.
++//!
++//! Only per-build offsets and short byte signatures live here (asset policy:
++//! nothing of the title itself). Every hook checks the build's hash and the
++//! exact bytes it replaces, and does nothing otherwise.
++
++use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
++use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
++use windows_sys::Win32::System::Threading::GetCurrentProcess;
++
++/// First 16 hex digits of the BLAKE3 of the Series X 1.0.2.1 executable.
++const BUILD_1_0_2_1: &str = "b99f876b74d4a77f";
++
++/// Environment variable that turns the watchdog hook on.
++pub(crate) const NO_WATCHDOG_ENV: &str = "VICTORY_NO_WATCHDOG";
++
++/// One code patch: `rva` must hold exactly `expect` before `new` is written.
++struct Patch {
++    what: &'static str,
++    rva: usize,
++    expect: &'static [u8],
++    new: &'static [u8],
++}
++
++/// The title's watchdog thread ends the process on purpose when its main
++/// thread has not advanced for about 30 one-second ticks. Two places do it:
++/// the handler it calls (`mov dword ptr [0], imm32`) and, when the handler
++/// returns or is unset, a fallback right after the call (`mov dword ptr [0],
++/// 0; int3`). Jumping over the whole block returns the loop to its normal
++/// path; the first patch makes the handler harmless if something else calls it.
++const WATCHDOG: &[Patch] = &[
++    Patch {
++        what: "watchdog: skip the call and the fallback fault",
++        rva: 0x2215c27,
++        // mov rax, [rip + disp32] (the handler pointer)
++        expect: &[0x48, 0x8B, 0x05, 0x1A, 0x07, 0xFA, 0x04],
++        // jmp +0x18 (to the loop's normal continuation), then NOPs
++        new: &[0xEB, 0x18, 0x90, 0x90, 0x90, 0x90, 0x90],
++    },
++    Patch {
++        what: "watchdog: handler's deliberate fault",
++        rva: 0x23cf683,
++        expect: &[0xC7, 0x04, 0x25, 0, 0, 0, 0, 0x21, 0xD4, 0x8B, 0x4D],
++        // an eleven-byte NOP
++        new: &[0x66, 0x66, 0x2E, 0x0F, 0x1F, 0x84, 0, 0, 0, 0, 0],
++    },
++];
++
++/// Applies the watchdog patches whose bytes match. Returns how many applied.
++///
++/// # Safety
++/// `base` is the mapped image whose original BLAKE3 is `hash`, and no title
++/// code is running yet.
++pub(crate) unsafe fn disarm_watchdog(base: usize, hash: &blake3::Hash) -> usize {
++    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
++        return 0;
++    }
++    WATCHDOG
++        .iter()
++        // SAFETY: forwarded from this function's contract.
++        .filter(|p| unsafe { apply(base, p) })
++        .count()
++}
++
++/// # Safety
++/// See `disarm_watchdog`.
++unsafe fn apply(base: usize, p: &Patch) -> bool {
++    let at = (base + p.rva) as *mut u8;
++    // SAFETY: the offset is inside the mapped .text of this exact build.
++    let now = unsafe { std::slice::from_raw_parts(at, p.expect.len()) };
++    if now != p.expect || p.new.len() != p.expect.len() {
++        tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
++        return false;
++    }
++    let mut old = 0;
++    // SAFETY: changing the protection of those bytes only, restored below.
++    if unsafe { VirtualProtect(at as _, p.new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
++        return false;
++    }
++    // SAFETY: writable now; the bytes are the ones checked above.
++    unsafe {
++        std::ptr::copy_nonoverlapping(p.new.as_ptr(), at, p.new.len());
++        VirtualProtect(at as _, p.new.len(), old, &mut old);
++        FlushInstructionCache(GetCurrentProcess(), at as _, p.new.len());
++    }
++    tracing::info!(what = p.what, "hook applied");
++    true
++}
+diff --git a/crates/victory-loader/src/lib.rs b/crates/victory-loader/src/lib.rs
+index 28cabd6..187276d 100644
+--- a/crates/victory-loader/src/lib.rs
++++ b/crates/victory-loader/src/lib.rs
+@@ -26,0 +27,2 @@
++#[cfg(windows)]
++mod hooks;
+diff --git a/crates/victory-loader/src/windows.rs b/crates/victory-loader/src/windows.rs
+index e709d11..3640860 100644
+--- a/crates/victory-loader/src/windows.rs
++++ b/crates/victory-loader/src/windows.rs
+@@ -86,0 +87,5 @@
++    if std::env::var_os(crate::hooks::NO_WATCHDOG_ENV).is_some_and(|v| !v.is_empty() && v != "0") {
++        // SAFETY: just mapped, and no title code has run.
++        let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
++        tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
++    }
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 0c423e8..6be180c 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -26,0 +27,3 @@
++mod paired;
++pub(super) use paired::with_paired_lanes;
++use paired::{LaneState, PAIRED, lane_scalars};
+@@ -180,0 +184,4 @@
++    twin: Option<Box<LaneState>>,
++    upper: bool,
++    lds_last: Option<bool>,
++    lane_scalars: HashSet<Value>,
+@@ -1427,0 +1435,17 @@
++/// Where a program's constant table starts in its code: where its
++/// instructions end, unless a load at a fixed offset reads below that (then
++/// at `lowest`, the lowest offset any load or descriptor names). The
++/// program's constants follow its instructions, and a load at a computed
++/// offset reads them, not instruction bytes.
++fn code_table_start(p: &crate::ir::Program, addresses: &[&crate::resource::Address], lowest: u32) -> u32 {
++    let code_end = p
++        .blocks
++        .iter()
++        .flat_map(|b| &b.insts)
++        .map(|i| i.machine.offset + 4 * i.machine.words.len())
++        .max()
++        .unwrap_or(0) as u32;
++    let fixed_below = addresses.iter().any(|a| a.dynamic.is_none() && a.offset < code_end);
++    if fixed_below { lowest } else { lowest.max(code_end & !3) }
++}
++
+@@ -1455 +1479,19 @@
+-        if let StageIo::Cs(cs) = x.native.io {
++        let paired = PAIRED.get() && x.native.wave64 && host_max_wave() == 32;
++        if let StageIo::Cs(cs) = x.native.io
++            && paired
++        {
++            // (`with_paired_lanes`) a host wave of 32 for each console wave of the group, its
++            // threads in a row; the caller has checked that the console's waves are full
++            let waves = cs.threads.iter().product::<u32>().div_ceil(64);
++            s.threads = Some([32 * waves, 1, 1]);
++            s.lds_dwords = cs.lds_bytes() / 4;
++            if waves > 1 {
++                // `wave_base`'s counter: a dword past the program's LDS, or the program's
++                // first where it takes all a host group has (32 KiB)
++                let slot = if s.lds_dwords < 8192 { s.lds_dwords } else { 0 };
++                s.lds_dwords = s.lds_dwords.max(slot + 1);
++                halves = Some(slot);
++            }
++            console_lanes = true;
++            s.wave_size = Some(32);
++        } else if let StageIo::Cs(cs) = x.native.io {
+@@ -1780,0 +1823,4 @@
++            twin: paired.then(Box::default),
++            upper: false,
++            lds_last: None,
++            lane_scalars: if paired { lane_scalars(p, x.res) } else { HashSet::new() },
+@@ -1817 +1863 @@
+-                let first = self
++                let addresses: Vec<&crate::resource::Address> = self
+@@ -1822 +1868 @@
+-                    .map(|s| s.1)
++                    .map(|s| &s.1)
+@@ -1825 +1871 @@
+-                            Source::Built { address, .. } => Some(*address),
++                            Source::Built { address, .. } => Some(address),
+@@ -1830,3 +1876,3 @@
+-                    .map(|a| a.offset & !3)
+-                    .min()
+-                    .ok_or("a code table")?;
++                    .collect();
++                let lowest = addresses.iter().map(|a| a.offset & !3).min().ok_or("a code table")?;
++                let first = code_table_start(self.x.p, &addresses, lowest);
+@@ -2434,0 +2481,6 @@
++        if self.twin.is_some() {
++            self.swap_lanes();
++            let r = self.inputs();
++            self.swap_lanes();
++            r?;
++        }
+@@ -2449,16 +2501,5 @@
+-            for (i, phi) in p.blocks[b].phis.iter().enumerate() {
+-                let val = match phi.reg {
+-                    Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
+-                    _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
+-                    Reg::Scc => {
+-                        let v = self.s.m.phi(self.cur, self.s.t.i1);
+-                        self.data_phis.push((v, b, i));
+-                        Val::Bit(v)
+-                    }
+-                    _ => {
+-                        let v = self.s.m.phi(self.cur, self.s.t.i32);
+-                        self.data_phis.push((v, b, i));
+-                        Val::I32(v)
+-                    }
+-                };
+-                self.vals.insert(phi.value, val);
++            self.block_phis(b);
++            if self.twin.is_some() {
++                self.swap_lanes();
++                self.block_phis(b);
++                self.swap_lanes();
+@@ -2465,0 +2507 @@
++            self.lds_last = None;
+@@ -2471 +2513,2 @@
+-                self.inst(b, i)?;
++                if self.twin.is_some() { self.paired_inst(b, i)?; }
++                else { self.inst(b, i)?; }
+@@ -2474 +2517,2 @@
+-                        self.section_inst(b, j, i);
++                        if self.twin.is_some() { self.paired_section_inst(b, j, i); }
++                        else { self.section_inst(b, j, i); }
+@@ -2488,0 +2533,9 @@
++        while self.twin.is_some() {
++            self.swap_lanes();
++            let r = self.fill_phis();
++            self.swap_lanes();
++            r?;
++            let left = self.twin.as_deref().is_some_and(|t| !t.pending_masks.is_empty());
++            if self.pending_masks.is_empty() && !left { break; }
++            self.fill_phis()?;
++        }
+@@ -3335 +3388 @@
+-        let whole = self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
++        let whole = self.twin.is_some() || self.exchange.is_some() && !self.local && made.is_none_or(|b| self.all_lanes(b));
+@@ -3354 +3407,5 @@
+-                let bit = self.boolean(m, at);
++                let bits = if self.twin.is_some() {
++                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
++                } else {
++                    self.boolean(m, at).map(|a| (a, None))
++                };
+@@ -3356 +3413 @@
+-                let bit = bit?;
++                let (bit, upper) = bits?;
+@@ -3364 +3421,6 @@
+-                if self.exchange.is_some() {
++                if let Some(upper) = upper {
++                    let r = self
++                        .s
++                        .op(at, "waveActiveBallot", Attr::NoUnwind, four, 116, &[upper]);
++                    xy.1 = self.s.m.extract(at, r, 0);
++                } else if self.exchange.is_some() {
+@@ -3479,7 +3541 @@
+-                match self.floats.get(&val) {
+-                    Some(&f) => f,
+-                    None => {
+-                        let x = self.i32_of(val)?;
+-                        self.as_float(x)
+-                    }
+-                }
++                self.float_of(val)?
+@@ -3917,2 +3973,2 @@
+-        let k32 = self.s.m.i32(32);
+-        let add = self.s.m.select(e, first, k32, zero);
++        let step = self.s.m.i32(if self.twin.is_some() { 64 } else { 32 });
++        let add = self.s.m.select(e, first, step, zero);
+@@ -3922,0 +3979,5 @@
++        // a counter in the program's own LDS (the paired form's, when it has no dword to
++        // spare): every wave has its base before any thread runs the program
++        if matches!(self.x.native.io, StageIo::Cs(cs) if slot < cs.lds_bytes() / 4) {
++            self.group_sync(e);
++        }
+@@ -3931 +3992,11 @@
+-        let lane = self.s.op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
++        let lane = self
++            .s
++            .op(e, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
++        if self.twin.is_some() {
++            let half = self.s.m.i32(if self.upper { 32 } else { 0 });
++            let t = self.s.m.bin(e, Bin::Add, lane, half);
++            return match self.wave_base() {
++                Some(base) => self.s.m.bin(e, Bin::Add, base, t),
++                None => t,
++            };
++        }
+@@ -3935,2 +4006,16 @@
+-        let flat = self.s.op(e, "flattenedThreadIdInGroup.i32", Attr::ReadNone, i32t, 96, &[]);
+-        let first = self.s.op(e, "waveReadLaneFirst.i32", Attr::NoUnwind, i32t, 118, &[flat]);
++        let flat = self.s.op(
++            e,
++            "flattenedThreadIdInGroup.i32",
++            Attr::ReadNone,
++            i32t,
++            96,
++            &[],
++        );
++        let first = self.s.op(
++            e,
++            "waveReadLaneFirst.i32",
++            Attr::NoUnwind,
++            i32t,
++            118,
++            &[flat],
++        );
+@@ -3946 +4031 @@
+-        if self.exchange.is_none() {
++        if self.exchange.is_none() && self.twin.is_none() {
+@@ -4040,0 +4126,20 @@
++        let made = self.def_block.get(&scc).copied();
++        let at = |l: &Self| match made {
++            None => Ok(l.s.entry),
++            Some(b) if b == l.cur_ir => Ok(l.cur),
++            Some(b) => l.tail[b].ok_or("a lane mask written after its use"),
++        };
++        if self.twin.is_some() {
++            let at = at(self)?;
++            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
++            let either = self.s.m.bin(at, Bin::Or, lo, hi);
++            self.s.flags |= flags::WAVE_OPS;
++            return Ok(self.s.op(
++                at,
++                "waveAnyTrue",
++                Attr::NoUnwind,
++                self.s.t.i1,
++                113,
++                &[either],
++            ));
++        }
+@@ -4045,6 +4150 @@
+-        let made = self.def_block.get(&scc).copied();
+-        let at = match made {
+-            None => self.s.entry,
+-            Some(b) if b == self.cur_ir => self.cur,
+-            Some(b) => self.tail[b].ok_or("a lane mask written after its use")?,
+-        };
++        let at = at(self)?;
+@@ -4071,2 +4171,34 @@
+-        let any = self.x.st.wave_any.get(b).copied().flatten().ok_or("a wave-wide branch on a scalar condition")?;
+-        if self.exchange.is_none() && self.halves.is_none() && self.console_lanes && self.mask_data == MaskData::Console {
++        let any = self
++            .x
++            .st
++            .wave_any
++            .get(b)
++            .copied()
++            .flatten()
++            .ok_or("a wave-wide branch on a scalar condition")?;
++        if self.twin.is_some() {
++            // The paired form: the host wave is the console's, each thread with two of its
++            // lanes; every lane is here (control flow is the wave's), and a lane outside EXEC
++            // says what it says on the console (no set bit for "some lane", no objection to
++            // "every lane").
++            let c = self.cur;
++            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
++            let pair = self
++                .s
++                .m
++                .bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
++            self.s.flags |= flags::WAVE_OPS;
++            let (name, code) = if any {
++                ("waveAnyTrue", 113)
++            } else {
++                ("waveAllTrue", 114)
++            };
++            return Ok(self
++                .s
++                .op(c, name, Attr::NoUnwind, self.s.t.i1, code, &[pair]));
++        }
++        if self.exchange.is_none()
++            && self.halves.is_none()
++            && self.console_lanes
++            && self.mask_data == MaskData::Console
++        {
+@@ -4080 +4212,5 @@
+-            let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
++            let (name, code) = if any {
++                ("waveAnyTrue", 113)
++            } else {
++                ("waveAllTrue", 114)
++            };
+@@ -4102 +4238,3 @@
+-        let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
++        let some = self
++            .s
++            .op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
+@@ -4109 +4247,4 @@
+-        Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
++        Ok(self
++            .s
++            .m
++            .cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+@@ -4120 +4261 @@
+-        let lane = if self.exchange.is_some() {
++        let lane = if self.exchange.is_some() || self.twin.is_some() {
+@@ -4359 +4500,4 @@
+-        let [x, y, _] = self.s.threads.expect("compute");
++        let [x, y, _] = match self.x.native.io {
++            StageIo::Cs(cs) => cs.threads,
++            _ => self.s.threads.expect("compute"),
++        };
+@@ -4362 +4506 @@
+-        if self.halves.is_some() {
++        if self.halves.is_some() || self.twin.is_some() {
+@@ -6781,0 +6926,3 @@
++            Source::LanePhi { .. } if self.twin.is_some() => {
++                Err("a per-lane descriptor chosen by the lanes' ways, in paired lanes")
++            }
+@@ -7053 +7200,6 @@
+-            let ri = self.s.m.bin(c, Bin::LShr, lane, four);
++            let row_lane = if self.twin.is_some() {
++                self.console_lane()
++            } else {
++                lane
++            };
++            let ri = self.s.m.bin(c, Bin::LShr, row_lane, four);
+@@ -7482,7 +7634 @@
+-                let acc = match self.floats.get(&acc) {
+-                    Some(&x) => x,
+-                    None => {
+-                        let x = self.i32_of(acc)?;
+-                        self.as_float(x)
+-                    }
+-                };
++                let acc = self.float_of(acc)?;
+@@ -7902,0 +8049,6 @@
++                let lane = if self.twin.is_some() {
++                    let k63 = self.s.m.i32(63);
++                    self.s.m.bin(c, Bin::And, lane, k63)
++                } else {
++                    lane
++                };
+@@ -11410,0 +11563,10 @@
++                    _ if self.twin.is_some()
++                        && !self.x.st.bools.support(when).iter().all(
++                            |a| matches!(a, Atom::Uniform(v) if !self.lane_scalars.contains(v)),
++                        ) =>
++                    {
++                        return Err(unsupported(
++                            offset,
++                            "a branch the two lanes of a thread may not take together",
++                        ));
++                    }
+@@ -11714 +11876 @@
+-    use super::{Lowered, Numeric, Parts, buffer_format, half_shift, lower};
++    use super::{Lowered, Numeric, Parts, buffer_format, code_table_start, half_shift, lower};
+@@ -11721,0 +11884,25 @@
++    /// A program's constant table starts after its instructions, unless a
++    /// load at a fixed offset reads below that.
++    #[test]
++    fn the_code_table_starts_after_the_instructions() {
++        // s_nop 0, s_endpgm, then 1,000 dwords of constants.
++        let mut words = vec![0xBF80_0000, S_ENDPGM];
++        words.extend(0..1000u32);
++        let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++        let p = ir::build(&code, false, 256).unwrap();
++        let at = |offset: u32, dynamic: bool| resource::Address {
++            param: resource::CODE,
++            offset,
++            dynamic: dynamic.then_some(ir::Value(0)),
++        };
++        let (computed, fixed_after, fixed_inside) = (at(0, true), at(12, false), at(4, false));
++        // A load at a computed offset from the code's start: the table is
++        // the constants only, not the whole program.
++        assert_eq!(code_table_start(&p, &[&computed], 0), 8);
++        assert_eq!(code_table_start(&p, &[&computed, &fixed_after], 0), 8);
++        // A load at a fixed offset inside the instructions keeps the start.
++        assert_eq!(code_table_start(&p, &[&computed, &fixed_inside], 0), 0);
++        // Loads past the instructions only: from the lowest of them.
++        assert_eq!(code_table_start(&p, &[&fixed_after], 12), 12);
++    }
++
+diff --git a/crates/victory-shader/src/emit/lower/paired.rs b/crates/victory-shader/src/emit/lower/paired.rs
+new file mode 100644
+index 0000000..7c4f54f
+--- /dev/null
++++ b/crates/victory-shader/src/emit/lower/paired.rs
+@@ -0,0 +1,550 @@
++//! A wave64 compute wave in one host wave32: each thread holds lanes n and n+32.
++use super::*;
++
++thread_local! {
++    pub(super) static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// The caller must widen lane branches and require full console waves.
++pub(crate) fn with_paired_lanes<R>(f: impl FnOnce() -> R) -> R {
++    struct Restore(bool);
++    impl Drop for Restore {
++        fn drop(&mut self) {
++            PAIRED.set(self.0);
++        }
++    }
++    let _restore = Restore(PAIRED.replace(true));
++    f()
++}
++
++#[derive(Default)]
++pub(super) struct LaneState {
++    pub(super) read_phis: HashSet<Value>,
++    pub(super) vals: HashMap<Value, Val>,
++    pub(super) floats: HashMap<Value, V>,
++    pub(super) bools: HashMap<(usize, Bool), V>,
++    pub(super) lane_bits: HashMap<Value, V>,
++    pub(super) lane_fail: HashMap<Value, Why>,
++    pub(super) mask_phis: HashMap<Value, V>,
++    pub(super) pending_masks: Vec<(V, usize, usize)>,
++    pub(super) data_phis: Vec<(V, usize, usize)>,
++    pub(super) handles: HashMap<(usize, Site, u8, bool, (u32, u32)), V>,
++    pub(super) strides: HashMap<(usize, Site, u8), V>,
++    pub(super) clane: Option<V>,
++}
++
++pub(super) fn lane_scalars(p: &Program, res: &Resources) -> HashSet<Value> {
++    let mut own: HashSet<Value> = res.waterfall.reads.iter().copied().collect();
++    if own.is_empty() {
++        return own;
++    }
++    let order = crate::ir::reverse_postorder(&p.blocks);
++    loop {
++        let before = own.len();
++        for &b in &order {
++            let block = &p.blocks[b];
++            for phi in &block.phis {
++                if !matches!(phi.reg, Reg::V(_)) && phi.args.iter().any(|a| own.contains(a)) {
++                    own.insert(phi.value);
++                }
++            }
++            for inst in &block.insts {
++                if matches!(inst.fields, Fields::Sop { .. } | Fields::Smem { .. })
++                    && inst.reads.iter().any(|r| own.contains(&r.1))
++                {
++                    own.extend(inst.writes.iter().map(|w| w.1));
++                }
++            }
++        }
++        if own.len() == before {
++            return own;
++        }
++    }
++}
++
++impl<'a> Lower<'a> {
++    pub(super) fn swap_lanes(&mut self) {
++        let Some(t) = self.twin.as_deref_mut() else {
++            return;
++        };
++        std::mem::swap(&mut self.vals, &mut t.vals);
++        std::mem::swap(&mut self.floats, &mut t.floats);
++        std::mem::swap(&mut self.bools, &mut t.bools);
++        std::mem::swap(&mut self.lane_bits, &mut t.lane_bits);
++        std::mem::swap(&mut self.lane_fail, &mut t.lane_fail);
++        std::mem::swap(&mut self.mask_phis, &mut t.mask_phis);
++        std::mem::swap(&mut self.pending_masks, &mut t.pending_masks);
++        std::mem::swap(&mut self.data_phis, &mut t.data_phis);
++        std::mem::swap(&mut self.handles, &mut t.handles);
++        std::mem::swap(&mut self.strides, &mut t.strides);
++        std::mem::swap(&mut self.clane, &mut t.clane);
++        std::mem::swap(&mut self.read_phis, &mut t.read_phis);
++        self.upper = !self.upper;
++    }
++
++    pub(super) fn both<T>(
++        &mut self,
++        mut f: impl FnMut(&mut Self) -> Result<T, Why>,
++    ) -> Result<[T; 2], Why> {
++        let was = self.upper;
++        if was {
++            self.swap_lanes();
++        }
++        let lo = f(self);
++        self.swap_lanes();
++        let hi = f(self);
++        if !was {
++            self.swap_lanes();
++        }
++        Ok([lo?, hi?])
++    }
++
++    pub(super) fn put_lanes(&mut self, v: Value, lo: Val, hi: Val) {
++        let (mine, other) = if self.upper { (hi, lo) } else { (lo, hi) };
++        self.vals.insert(v, mine);
++        if let Some(t) = self.twin.as_deref_mut() {
++            t.vals.insert(v, other);
++        }
++    }
++
++    pub(super) fn block_phis(&mut self, b: usize) {
++        let p = self.x.p;
++        for (i, phi) in p.blocks[b].phis.iter().enumerate() {
++            let val = match phi.reg {
++                Reg::S(c) if c == EXEC || c == EXEC + 1 => Val::Missing("a lane mask"),
++                _ if self.bad.contains_key(&phi.value) => Val::Missing(self.bad[&phi.value]),
++                Reg::Scc => {
++                    let v = self.s.m.phi(self.cur, self.s.t.i1);
++                    self.data_phis.push((v, b, i));
++                    Val::Bit(v)
++                }
++                _ => {
++                    let v = self.s.m.phi(self.cur, self.s.t.i32);
++                    self.data_phis.push((v, b, i));
++                    Val::I32(v)
++                }
++            };
++            self.vals.insert(phi.value, val);
++        }
++    }
++
++    pub(super) fn paired_section_inst(&mut self, b: usize, i: usize, start: usize) {
++        use super::super::wave::Shape;
++        const UNKNOWN: Why = "a whole-wave section step the simulation does not follow";
++        let inst = &self.x.p.blocks[b].insts[i];
++        for &(_, w) in &inst.writes {
++            let shape = match self.section_out.contains(&w) {
++                true => self.sections[&b][&start].shapes.get(&w).copied(),
++                false => None,
++            };
++            let made = match shape {
++                None => Err(UNKNOWN),
++                Some(
++                    sh @ (Shape::Active(..)
++                    | Shape::Prefix(..)
++                    | Shape::ActiveF64(..)
++                   ),
++                ) => self.paired_shape(sh),
++                Some(sh) => self.both(|l| l.shape(sh, false)),
++            };
++            match made {
++                Ok([lo, hi]) => self.put_lanes(w, Val::I32(lo), Val::I32(hi)),
++                Err(why) => self.put_lanes(w, Val::Missing(why), Val::Missing(why)),
++            }
++        }
++    }
++
++    pub(super) fn paired_shape(&mut self, shape: super::super::wave::Shape) -> Result<[V; 2], Why> {
++        use super::super::wave::{Op, Shape};
++        if let Shape::ActiveF64(lo, hi, mask, high) = shape {
++            return self.paired_sum64(high, lo, hi, mask);
++        }
++        let (op, src, mask, ident, prefix) = match shape {
++            Shape::Active(op, src, mask, ident) => (op, src, mask, ident, None),
++            Shape::Prefix(op, src, mask, ident, inclusive) => {
++                (op, src, mask, ident, Some(inclusive))
++            }
++            _ => return Err("a whole-wave section value of another shape"),
++        };
++        let &m = self
++            .x
++            .st
++            .masks
++            .get(&mask)
++            .ok_or("a wave reduction's untracked mask")?;
++        let c = self.cur;
++        let [lo, hi] = self.both(|l| {
++            let on = l.boolean(m, c)?;
++            let x = l.i32_of(src)?;
++            let id = l.s.m.i32(ident);
++            Ok(l.s.m.select(c, on, x, id))
++        })?;
++        self.s.flags |= flags::WAVE_OPS;
++        if op == Op::AddH {
++            if prefix.is_some() {
++                return Err("a wave prefix of an operation other than a sum");
++            }
++            let (lo, hi) = (self.half_tree(lo, 5), self.half_tree(hi, 5));
++            let r = self.join_half_sums(lo, hi);
++            return Ok([r, r]);
++        }
++        let float = matches!(op, Op::AddF | Op::MinF | Op::MaxF);
++        let (lo, hi) = if float {
++            (self.as_float(lo), self.as_float(hi))
++        } else {
++            (lo, hi)
++        };
++        let r = match prefix {
++            Some(inclusive) => {
++                let mine = self.host_wave_op(op, lo, float, Some(inclusive))?;
++                let theirs = self.host_wave_op(op, hi, float, Some(inclusive))?;
++                let below = self.host_wave_op(op, lo, float, None)?;
++                [mine, self.s.m.bin(c, Bin::Add, theirs, below)]
++            }
++            None => {
++                let lo = self.host_wave_op(op, lo, float, None)?;
++                let hi = self.host_wave_op(op, hi, float, None)?;
++                let r = self.join_halves(op, lo, hi, float);
++                [r, r]
++            }
++        };
++        Ok(if float { r.map(|x| self.as_int(x)) } else { r })
++    }
++
++    pub(super) fn host_wave_op(
++        &mut self,
++        op: super::super::wave::Op,
++        arg: V,
++        float: bool,
++        prefix: Option<bool>,
++    ) -> Result<V, Why> {
++        use super::super::wave::Op;
++        let c = self.cur;
++        let (i32t, f32t) = (self.s.t.i32, self.s.t.f32);
++        let ty = if float { f32t } else { i32t };
++        let sfx = if float { "f32" } else { "i32" };
++        Ok(match (op, prefix) {
++            (Op::AddU | Op::AddF, Some(inclusive)) => {
++                let (k0, k1) = (self.s.m.i8(0), self.s.m.i8(1));
++                let r = self.s.op(
++                    c,
++                    &format!("wavePrefixOp.{sfx}"),
++                    Attr::NoUnwind,
++                    ty,
++                    121,
++                    &[arg, k0, k1],
++                );
++                if inclusive {
++                    self.s.m.bin(c, Bin::Add, r, arg)
++                } else {
++                    r
++                }
++            }
++            (_, Some(_)) => return Err("a wave prefix of an operation other than a sum"),
++            (Op::Or | Op::And | Op::Xor, None) => {
++                let k = self.s.m.i8(match op {
++                    Op::And => 0,
++                    Op::Or => 1,
++                    _ => 2,
++                });
++                self.s
++                    .op(c, "waveActiveBit.i32", Attr::NoUnwind, i32t, 120, &[arg, k])
++            }
++            (_, None) => {
++                let (code, unsigned) = match op {
++                    Op::AddU => (0, 1),
++                    Op::AddF => (0, 0),
++                    Op::MinU => (2, 1),
++                    Op::MaxU => (3, 1),
++                    Op::MinI | Op::MinF => (2, 0),
++                    _ => (3, 0),
++                };
++                let (k, u) = (self.s.m.i8(code), self.s.m.i8(unsigned));
++                self.s.op(
++                    c,
++                    &format!("waveActiveOp.{sfx}"),
++                    Attr::NoUnwind,
++                    ty,
++                    119,
++                    &[arg, k, u],
++                )
++            }
++        })
++    }
++
++    pub(super) fn join_halves(
++        &mut self,
++        op: super::super::wave::Op,
++        lo: V,
++        hi: V,
++        float: bool,
++    ) -> V {
++        use super::super::wave::Op;
++        let c = self.cur;
++        let ty = if float { self.s.t.f32 } else { self.s.t.i32 };
++        let sfx = if float { "f32" } else { "i32" };
++        match op {
++            Op::AddU | Op::AddF => self.s.m.bin(c, Bin::Add, lo, hi),
++            Op::Or => self.s.m.bin(c, Bin::Or, lo, hi),
++            Op::And => self.s.m.bin(c, Bin::And, lo, hi),
++            Op::Xor => self.s.m.bin(c, Bin::Xor, lo, hi),
++            _ => {
++                // FMax 35, FMin 36, IMax 37, IMin 38, UMax 39, UMin 40
++                let code = match op {
++                    Op::MaxF => 35,
++                    Op::MinF => 36,
++                    Op::MinU => 40,
++                    Op::MaxU => 39,
++                    Op::MinI => 38,
++                    _ => 37,
++                };
++                self.s.op(
++                    c,
++                    &format!("binary.{sfx}"),
++                    Attr::ReadNone,
++                    ty,
++                    code,
++                    &[lo, hi],
++                )
++            }
++        }
++    }
++
++    pub(super) fn half_tree(&mut self, x: V, steps: u32) -> V {
++        let c = self.cur;
++        let i32t = self.s.t.i32;
++        let lane = self
++            .s
++            .op(c, "waveGetLaneIndex", Attr::ReadOnly, i32t, 111, &[]);
++        let mut sum = x;
++        for step in 0..steps {
++            let bit = self.s.m.i32(1 << step);
++            let partner = self.s.m.bin(c, Bin::Xor, lane, bit);
++            let theirs = self.read_lane(sum, partner);
++            sum = self.add_halves(sum, theirs);
++        }
++        let (high, low, zero) = (
++            self.s.m.i32(0xFFFF_0000),
++            self.s.m.i32(0xFFFF),
++            self.s.m.i32(0),
++        );
++        let first = self.read_lane(x, zero);
++        let first = self.s.m.bin(c, Bin::And, first, high);
++        let sum = self.s.m.bin(c, Bin::And, sum, low);
++        self.s.m.bin(c, Bin::Or, first, sum)
++    }
++
++    pub(super) fn join_half_sums(&mut self, lo: V, hi: V) -> V {
++        let c = self.cur;
++        let total = self.add_halves(lo, hi);
++        let (high, low) = (self.s.m.i32(0xFFFF_0000), self.s.m.i32(0xFFFF));
++        let total = self.s.m.bin(c, Bin::And, total, low);
++        let first = self.s.m.bin(c, Bin::And, lo, high);
++        self.s.m.bin(c, Bin::Or, first, total)
++    }
++
++    pub(super) fn paired_inst(&mut self, b: usize, i: usize) -> Result<(), Stop> {
++        let inst: &'a Inst = &self.x.p.blocks[b].insts[i];
++        let name = inst.name();
++        let once = matches!(inst.fields, Fields::Sopp { .. })
++            || matches!(inst.fields, Fields::Smem { .. })
++                && (name.contains("store") || name.contains("atomic"));
++        if once {
++            self.inst(b, i)?;
++            self.mirror(inst);
++            return Ok(());
++        }
++        let cross = match name {
++            "v_readlane_b32" | "ds_bpermute_b32" => true,
++            // (not a waterfall loop's read, the lane's own dword: `Self::valu`)
++            "v_readfirstlane_b32" => !inst
++                .writes
++                .first()
++                .is_some_and(|w| self.x.res.waterfall.reads.contains(&w.1)),
++            _ => false,
++        };
++        if cross {
++            if let Err(why) = self.paired_cross(inst, b, i) {
++                for &(_, w) in &inst.writes {
++                    self.put_lanes(w, Val::Missing(why), Val::Missing(why));
++                }
++            }
++            return Ok(());
++        }
++        if matches!(inst.fields, Fields::Ds { .. })
++            && !name.starts_with("ds_swizzle")
++            && !name.contains("permute")
++        {
++            let write = !name.starts_with("ds_read");
++            if write || self.lds_last != Some(false) {
++                let (mode, void) = (self.s.m.i32(8), self.s.t.void);
++                self.s
++                    .op(self.cur, "barrier", Attr::NoDuplicate, void, 80, &[mode]);
++            }
++            self.lds_last = Some(write);
++        }
++        self.inst(b, i)?;
++        self.swap_lanes();
++        let r = self.inst(b, i);
++        self.swap_lanes();
++        r
++    }
++
++    pub(super) fn mirror(&mut self, inst: &Inst) {
++        let Some(t) = self.twin.as_deref_mut() else {
++            return;
++        };
++        for &(_, w) in &inst.writes {
++            if let Some(&v) = self.vals.get(&w) {
++                t.vals.insert(w, v);
++            }
++        }
++    }
++
++    pub(super) fn paired_cross(&mut self, inst: &Inst, b: usize, i: usize) -> Result<(), Why> {
++        self.cross_lane(false)?;
++        let c = self.cur;
++        let (k31, k32, z) = (self.s.m.i32(31), self.s.m.i32(32), self.s.m.i32(0));
++        // a lane's value from the lower or upper value of the host lane `at` (of 0..63)
++        let pick = |l: &mut Self, lo: V, hi: V, at: V| {
++            let host = l.s.m.bin(c, Bin::And, at, k31);
++            let upper = l.s.m.bin(c, Bin::And, at, k32);
++            let upper = l.s.m.cmp(c, pred::NE, upper, z);
++            let (lo, hi) = (l.read_lane(lo, host), l.read_lane(hi, host));
++            l.s.m.select(c, upper, hi, lo)
++        };
++        match inst.name() {
++            "v_readlane_b32" => {
++                // the lane: a scalar or a constant
++                let lane = self.src(inst, 1)?;
++                let [lo, hi] = self.both(|l| l.src(inst, 0))?;
++                let r = pick(self, lo, hi, lane);
++                self.write_i(inst, r, None)?;
++            }
++            "v_readfirstlane_b32" => {
++                let [(lo, in_lo), (hi, in_hi)] = self.both(|l| {
++                    let x = l.src(inst, 0)?;
++                    let guard = l.guard(b, i)?;
++                    Ok(l.first_lane(x, guard))
++                })?;
++                // the first lane in EXEC is a lower one if there is one; with none, lane 0
++                let hi = self.s.m.select(c, in_hi, hi, lo);
++                let r = self.s.m.select(c, in_lo, lo, hi);
++                self.write_i(inst, r, None)?;
++            }
++            _ => {
++                // `ds_bpermute_b32`: each lane reads the lane its address names, which gives
++                // its data, or 0 outside EXEC
++                let Fields::Ds {
++                    dst: Some(Operand::Vector { reg, .. }),
++                    addr: Some(addr),
++                    data,
++                    offset0,
++                    offset1,
++                    ..
++                } = &inst.fields
++                else {
++                    return Err("a permute's operands");
++                };
++                let data = data.first().ok_or("a permute source")?;
++                let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
++                let [(from_lo, x_lo, g_lo), (from_hi, x_hi, g_hi)] = self.both(|l| {
++                    let at = l.vgprs(inst, addr, 1)?[0];
++                    let x = l.vgprs(inst, data, 1)?[0];
++                    let guard = l.guard(b, i)?;
++                    let (o, two) = (l.s.m.i32(offset), l.s.m.i32(2));
++                    let at = l.s.m.bin(c, Bin::Add, at, o);
++                    let from = l.s.m.bin(c, Bin::LShr, at, two);
++                    let x = match guard {
++                        Some(g) => l.s.m.select(c, g, x, z),
++                        None => x,
++                    };
++                    Ok((from, x, guard))
++                })?;
++                let read = [
++                    pick(self, x_lo, x_hi, from_lo),
++                    pick(self, x_lo, x_hi, from_hi),
++                ];
++                let guards = [g_lo, g_hi];
++                let reg = *reg;
++                self.both(|l| {
++                    let n = usize::from(l.upper);
++                    l.write(inst, Reg::V(reg), read[n], guards[n]);
++                    Ok(())
++                })?;
++                return Ok(());
++            }
++        }
++        self.mirror(inst);
++        Ok(())
++    }
++
++    pub(super) fn paired_sum64(
++        &mut self,
++        high: bool,
++        lo: Value,
++        hi: Value,
++        mask: Value,
++    ) -> Result<[V; 2], Why> {
++        let &m = self
++            .x
++            .st
++            .masks
++            .get(&mask)
++            .ok_or("a wave reduction's untracked mask")?;
++        let c = self.cur;
++        let [x0, x1] = self.both(|l| {
++            let on = l.boolean(m, c)?;
++            let (dl, dh) = (l.i32_of(lo)?, l.i32_of(hi)?);
++            Ok(l.masked_double(on, dl, dh))
++        })?;
++        let (s0, s1) = (self.wave_sum_f64(x0), self.wave_sum_f64(x1));
++        let total = self.s.m.bin(self.cur, Bin::Add, s0, s1);
++        let (dl, dh) = self.split_double(total);
++        let x = if high { dh } else { dl };
++        Ok([x, x])
++    }
++
++    fn masked_double(&mut self, on: V, lo: V, hi: V) -> V {
++        let x = self.make_double(lo, hi);
++        let z = self.s.m.i32(0);
++        let zero = self.make_double(z, z);
++        self.s.m.select(self.cur, on, x, zero)
++    }
++
++    fn wave_sum_f64(&mut self, x: V) -> V {
++        self.s.flags |= flags::WAVE_OPS;
++        let c = self.cur;
++        let f64t = self.s.m.double();
++        let (sum, signed) = (self.s.m.i8(0), self.s.m.i8(0));
++        self.s.op(
++            c,
++            "waveActiveOp.f64",
++            Attr::NoUnwind,
++            f64t,
++            119,
++            &[x, sum, signed],
++        )
++    }
++
++    fn make_double(&mut self, lo: V, hi: V) -> V {
++        let c = self.cur;
++        let f64t = self.s.m.double();
++        self.s.flags |= flags::DOUBLES;
++        self.s
++            .op(c, "makeDouble.f64", Attr::ReadNone, f64t, 101, &[lo, hi])
++    }
++
++    fn split_double(&mut self, d: V) -> (V, V) {
++        let c = self.cur;
++        let i32t = self.s.t.i32;
++        let pair = self
++            .s
++            .m
++            .named_struct("dx.types.splitdouble", vec![i32t, i32t]);
++        let r = self
++            .s
++            .op(c, "splitDouble.f64", Attr::ReadNone, pair, 102, &[d]);
++        (self.s.m.extract(c, r, 0), self.s.m.extract(c, r, 1))
++    }
++}
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 5aef9a0..1a11299 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -92 +92 @@
+-#[cfg(test)]
++#[cfg(all(test, windows))]
+@@ -438,0 +439,55 @@
++    let r = emit_forms(c, native, p, st, io, res);
++    // A console wave64 compute program on a host of 32-lane waves that no form above gives
++    // the host (it still asks for 64-lane waves, or does not translate): once more in the
++    // paired form, each console wave run by one host wave (`paired`; `VICTORY_WAVE_PAIRS=0`
++    // turns it off).
++    let refused = match &r {
++        Ok((_, wave)) => *wave == Some(64),
++        Err(e) => matches!(e, ShaderError::Unsupported { .. }),
++    };
++    if refused
++        && native.stage == HwStage::Cs
++        && native.wave64
++        && lower::host_max_wave() == 32
++        && pairs_on()
++    {
++        let again = paired(c, native, p, io, res);
++        if std::env::var_os("VICTORY_WAVE_WHY").is_some() {
++            match &again {
++                Ok((_, wave)) => eprintln!("WAVE64-RETRY paired lanes: wave {wave:?}"),
++                Err(e) => eprintln!("WAVE64-RETRY paired lanes: {e}"),
++            }
++        }
++        if let Ok((shader, wave)) = again
++            && wave != Some(64)
++        {
++            return Ok(shader);
++        }
++    }
++    r.map(|(shader, _)| shader)
++}
++
++/// Whether console wave64 compute programs may take the paired form ([`paired`]):
++/// `VICTORY_WAVE_PAIRS=0` turns it off (a test can choose for its own thread).
++fn pairs_on() -> bool {
++    #[cfg(test)]
++    if let Some(on) = TEST_PAIRS.get() {
++        return on;
++    }
++    std::env::var_os("VICTORY_WAVE_PAIRS").is_none_or(|v| v != "0")
++}
++
++#[cfg(test)]
++thread_local! {
++    /// A test's choice for [`pairs_on`], for its thread only.
++    static TEST_PAIRS: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
++}
++
++fn emit_forms(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    st: &structure::Structured,
++    io: &io::Io,
++    res: &resource::Resources,
++) -> Result<(HostShader, Option<u32>), ShaderError> {
+@@ -519 +574 @@
+-                        return local.map(|(shader, _)| shader);
++                        return local;
+@@ -527 +582 @@
+-                    return local.map(|(shader, _)| shader);
++                    return local;
+@@ -536 +591 @@
+-                    return again.map(|(shader, _)| shader);
++                    return again;
+@@ -568 +623 @@
+-                        return again.map(|(shader, _)| shader);
++                        return again;
+@@ -588 +643 @@
+-                            return again.map(|(shader, _)| shader);
++                            return again;
+@@ -606 +661 @@
+-                        return local.map(|(shader, _)| shader);
++                        return local;
+@@ -614 +669 @@
+-                    return local.map(|(shader, _)| shader);
++                    return local;
+@@ -626 +681 @@
+-                            return local.map(|(shader, _)| shader);
++                            return local;
+@@ -633 +688 @@
+-                    return local.map(|(shader, _)| shader);
++                    return local;
+@@ -655 +709,0 @@
+-    let original = original.map(|(shader, _)| shader);
+@@ -669 +723 @@
+-    emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
++    emit_program(c, native, &p, &st, &io, &res)
+@@ -779,0 +834,38 @@
++fn paired(
++    c: &Container,
++    native: &NativeProgram,
++    p: &ir::Program,
++    io: &io::Io,
++    res: &resource::Resources,
++) -> Result<(HostShader, Option<u32>), ShaderError> {
++    let crate::native::StageIo::Cs(cs) = native.io else {
++        return Err(ShaderError::Unsupported {
++            offset: 0,
++            what: "paired lanes outside compute",
++        });
++    };
++    if !cs.threads.iter().product::<u32>().is_multiple_of(64) {
++        return Err(ShaderError::Unsupported {
++            offset: 0,
++            what: "paired lanes in a thread group that does not fill its console waves",
++        });
++    }
++    // every per-lane branch the wave's; again while that leaves another branch per lane
++    let mut wide = std::collections::HashSet::new();
++    let st = loop {
++        let st = structure::structure_wide(p, &wide)?;
++        let lanes: Vec<usize> = (0..st.exits.len())
++            .filter(|b| !wide.contains(b))
++            .filter(|&b| {
++                matches!(st.exits[b], structure::LaneExit::Branch { when, .. }
++                    if !st.bools.support(when).iter().all(|a| matches!(a, structure::Atom::Uniform(_))))
++            })
++            .collect();
++        if lanes.is_empty() {
++            break st;
++        }
++        wide.extend(lanes);
++    };
++    lower::with_paired_lanes(|| emit_program(c, native, p, &st, io, res))
++}
++
+@@ -1960,0 +2053,3 @@
++
++#[cfg(test)]
++mod paired_tests;
+diff --git a/crates/victory-shader/src/emit/paired_tests.rs b/crates/victory-shader/src/emit/paired_tests.rs
+new file mode 100644
+index 0000000..9125733
+--- /dev/null
++++ b/crates/victory-shader/src/emit/paired_tests.rs
+@@ -0,0 +1,524 @@
++//! Synthetic PR854/993 paired-wave regressions, usable without a device or game input.
++//! Native checks exercise translation and binary PSV/host contracts; only the Windows
++//! readback test executes generated shaders. Optional private inputs stay outside the repo.
++#![cfg(test)]
++
++use super::{HostShader, lower};
++use crate::dxbc::{Container, FourCC, u32_at};
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{ShaderError, io, ir, resource, structure};
++
++struct Overrides {
++    wave: Option<u32>,
++    pairs: Option<bool>,
++}
++impl Overrides {
++    fn new(wave: u32, pairs: bool) -> Self {
++        Self {
++            wave: lower::TEST_HOST_WAVE.replace(Some(wave)),
++            pairs: super::TEST_PAIRS.replace(Some(pairs)),
++        }
++    }
++}
++impl Drop for Overrides {
++    fn drop(&mut self) {
++        lower::TEST_HOST_WAVE.set(self.wave);
++        super::TEST_PAIRS.set(self.pairs);
++    }
++}
++
++const VCC: u32 = 106;
++const EXEC: u32 = 126;
++const LIT: u32 = 255;
++
++const fn v(n: u32) -> u32 {
++    256 + n
++}
++
++const fn k(n: u32) -> u32 {
++    128 + n
++}
++
++const fn sop1(op: u32, sdst: u32, src0: u32) -> u32 {
++    0xBE80_0000 | sdst << 16 | op << 8 | src0
++}
++
++const fn sop2(op: u32, sdst: u32, src0: u32, src1: u32) -> u32 {
++    0x8000_0000 | op << 23 | sdst << 16 | src1 << 8 | src0
++}
++
++/// A branch by `imm` dwords from the next instruction (or `s_barrier`, `imm` 0).
++const fn sopp(op: u32, imm: i16) -> u32 {
++    0xBF80_0000 | op << 16 | imm as u16 as u32
++}
++
++const fn vop1(op: u32, vdst: u32, src0: u32) -> u32 {
++    0x7E00_0000 | vdst << 17 | op << 9 | src0
++}
++
++const fn vop2(op: u32, vdst: u32, src0: u32, vsrc1: u32) -> u32 {
++    op << 25 | vdst << 17 | vsrc1 << 9 | src0
++}
++
++const fn vopc(op: u32, src0: u32, vsrc1: u32) -> u32 {
++    0x7C00_0000 | op << 17 | vsrc1 << 9 | src0
++}
++
++const fn vop3(op: u32, dst: u32, src0: u32, src1: u32) -> [u32; 2] {
++    [0xD400_0000 | op << 16 | dst, src0 | src1 << 9]
++}
++
++const fn ds(op: u32, vdst: u32, addr: u32, data: u32, offset: u32) -> [u32; 2] {
++    [
++        0xD800_0000 | op << 18 | offset,
++        vdst << 24 | data << 8 | addr,
++    ]
++}
++
++/// `buffer_store_dword v<data>, v<addr>, s[8:11], 0 offen offset:<offset>`
++const fn store(data: u32, addr: u32, offset: u32) -> [u32; 2] {
++    [0xE070_1000 | offset, 0x8002_0000 | data << 8 | addr]
++}
++
++/// `v<regs>` stored as each thread's dwords of the UAV, the thread's index (v0) times 16 on.
++fn stores(regs: [u32; 4]) -> Vec<u32> {
++    let mut w = vec![vop2(0x1A, 15, k(4), 0)]; // v_lshlrev_b32 v15, 4, v0
++    for (n, r) in regs.into_iter().enumerate() {
++        w.extend(store(r, 15, 4 * n as u32));
++    }
++    w
++}
++
++fn native_with(body: &[u32], wave64: bool, threads: u32, lds: u32) -> NativeProgram {
++    let mut words = vec![
++        0xBE85_0380, // s_mov_b32 s5, 0
++        0x3D << 26 | 0x02 << 18 | 8 << 6 | 2,
++        125 << 25, // s_load_dwordx4 s[8:11], s[4:5], 0
++    ];
++    words.extend_from_slice(body);
++    words.push(0xBF81_0000);
++    NativeProgram {
++        stage: HwStage::Cs,
++        wave64,
++        vgprs: 16,
++        layout: vec![
++            RootParam {
++                root: RootType::Constants,
++                table_offset_dwords: 0,
++                sgprs: 4,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            },
++            RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 4,
++                slot: 1,
++            },
++        ],
++        used: vec![UsedResource {
++            kind: ResourceType::Uav,
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            lower_bound: 0,
++            stride: 0,
++            dwords: 4,
++            user_data: 4,
++            slot: 1,
++        }],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: 5 << 1 | lds.div_ceil(512) << 15, // 5 user SGPRs: s0..s4
++            threads: [threads, 1, 1],
++        }),
++        code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++    }
++}
++
++fn lds_fixture() -> NativeProgram {
++    let mut w = vec![vop2(0x1A, 1, k(2), 0)]; // v_lshlrev_b32 v1, 2, v0: this lane's dword
++    w.extend(vop3(0x169, 2, v(0), k(7))); // v_mul_lo_u32 v2, v0, 7
++    w.extend([
++        vop2(0x26, 5, k(63), 0), // v_sub_nc_u32 v5, 63, v0: the mirror lane
++        vop2(0x1A, 5, k(2), 5),  // v_lshlrev_b32 v5, 2, v5: its dword
++        vop2(0x1B, 3, k(1), 0),  // v_and_b32 v3, 1, v0
++        vopc(0xC2, k(0), 3),     // v_cmp_eq_u32 vcc, 0, v3: the even lanes
++        sop1(0x24, 12, VCC),     // s_and_saveexec_b64 s[12:13], vcc
++        sopp(0x08, 4),           // s_cbranch_execz past the even lanes' arm
++        vop2(0x25, 4, LIT, 2),   // v_add_nc_u32 v4, 100, v2
++        100,
++    ]);
++    w.extend(ds(0x0D, 0, 1, 4, 0)); // ds_write_b32 v1, v4
++    w.extend([
++        sop2(0x15, EXEC, 12, EXEC), // s_andn2_b64 exec, s[12:13], exec: the odd lanes
++        sopp(0x08, 6),              // s_cbranch_execz past their arm
++        vop2(0x25, 4, LIT, 2),      // v_add_nc_u32 v4, 200, v2
++        200,
++    ]);
++    w.extend(ds(0x0D, 0, 1, 4, 0)); // ds_write_b32 v1, v4
++    w.extend(ds(0x36, 6, 5, 0, 0)); // ds_read_b32 v6, v5: an even lane's, from the other arm
++    w.extend([
++        sop1(0x04, EXEC, 12), // s_mov_b64 exec, s[12:13]
++        sop1(0x24, 12, VCC),  // s_and_saveexec_b64 s[12:13], vcc: the even lanes again
++    ]);
++    w.extend(ds(0x36, 6, 5, 0, 0)); // ds_read_b32 v6, v5: an odd lane's
++    w.push(sop1(0x04, EXEC, 12)); // s_mov_b64 exec, s[12:13]
++    w.extend(vop3(0x360, 14, v(6), k(5))); // v_readlane_b32 s14, v6, 5
++    w.extend(vop3(0x360, 15, v(6), k(40))); // v_readlane_b32 s15, v6, 40
++    w.extend([
++        sop2(0x00, 14, 14, 15), // s_add_u32 s14, s14, s15
++        vopc(0xC1, LIT, 6),     // v_cmp_lt_u32 vcc, 250, v6
++        250,
++        sop1(0x10, 16, VCC), // s_bcnt1_i32_b64 s16, vcc
++    ]);
++    w.extend(vop3(0x365, 7, VCC, k(0))); // v_mbcnt_lo_u32_b32 v7, vcc_lo, 0
++    w.extend(vop3(0x366, 7, VCC + 1, v(7))); // v_mbcnt_hi_u32_b32 v7, vcc_hi, v7
++    w.extend([
++        vop1(0x01, 9, 14),  // v_mov_b32 v9, s14
++        vop1(0x01, 10, 16), // v_mov_b32 v10, s16
++    ]);
++    w.extend(stores([6, 9, 10, 7]));
++    native_with(&w, true, 64, 256)
++}
++
++fn loop_fixture() -> NativeProgram {
++    let mut w = vec![
++        vop2(0x16, 1, k(6), 0),  // v_lshrrev_b32 v1, 6, v0: the console wave
++        vop2(0x1B, 2, k(63), 0), // v_and_b32 v2, 63, v0: the lane in it
++        vop2(0x1A, 11, k(2), 1), // v_lshlrev_b32 v11, 2, v1: the wave's dword
++        vop1(0x01, 12, k(0)),    // v_mov_b32 v12, 0
++        sop1(0x04, 22, EXEC),    // s_mov_b64 s[22:23], exec
++        vopc(0xD2, k(0), 2),     // v_cmpx_eq_u32 exec, 0, v2: lane 0
++    ];
++    w.extend(ds(0x0D, 0, 11, 12, 0)); // ds_write_b32 v11, v12
++    w.extend([
++        sop1(0x04, EXEC, 22),   // s_mov_b64 exec, s[22:23]
++        vop2(0x1B, 3, k(3), 2), // v_and_b32 v3, 3, v2
++        vop2(0x25, 3, k(1), 3), // v_add_nc_u32 v3, 1, v3
++        vop2(0x25, 3, v(1), 3), // v_add_nc_u32 v3, v1, v3: the rounds
++        vop1(0x01, 4, k(0)),    // v_mov_b32 v4, 0
++        vop1(0x01, 13, k(1)),   // v_mov_b32 v13, 1
++        sop1(0x04, 20, EXEC),   // s_mov_b64 s[20:21], exec
++        vop2(0x25, 4, v(2), 4), // loop: v_add_nc_u32 v4, v2, v4
++    ]);
++    w.extend(ds(0x00, 0, 11, 13, 0)); // ds_add_u32 v11, v13
++    w.extend([
++        vop2(0x25, 3, 193, 3),       // v_add_nc_u32 v3, -1, v3
++        vopc(0xC5, k(0), 3),         // v_cmp_ne_u32 vcc, 0, v3
++        sop2(0x0F, EXEC, EXEC, VCC), // s_and_b64 exec, exec, vcc
++        sopp(0x09, -7),              // s_cbranch_execnz loop
++        sop1(0x04, EXEC, 20),        // s_mov_b64 exec, s[20:21]
++    ]);
++    w.extend(ds(0x36, 5, 11, 0, 0)); // ds_read_b32 v5, v11: the wave's total
++    w.extend([
++        sop1(0x04, 24, EXEC),          // s_mov_b64 s[24:25], exec
++        vopc(0xD1, k(39), 2),          // v_cmpx_lt_u32 exec, 39, v2: lanes 40-63
++        vop1(0x02, 6, v(4)),           // v_readfirstlane_b32 s6, v4
++        sop1(0x04, EXEC, 24),          // s_mov_b64 exec, s[24:25]
++        vopc(0xD1, k(19), 2),          // v_cmpx_lt_u32 exec, 19, v2: lanes 20-63
++        vop1(0x02, 7, v(4)),           // v_readfirstlane_b32 s7, v4
++        sop1(0x04, EXEC, 24),          // s_mov_b64 exec, s[24:25]
++        vop1(0x01, 6, 6),              // v_mov_b32 v6, s6
++        vop1(0x01, 9, 7),              // v_mov_b32 v9, s7
++        0xD400_0000 | 0x346 << 16 | 6, // v_lshl_add_u32 v6, v9, 16, v6
++        v(9) | k(16) << 9 | v(6) << 18,
++        sopp(0x0A, 0),            // s_barrier
++        vop2(0x1D, 14, k(4), 11), // v_xor_b32 v14, 4, v11: the other wave's dword
++    ]);
++    w.extend(ds(0x36, 7, 14, 0, 0)); // ds_read_b32 v7, v14
++    w.extend(stores([4, 5, 6, 7]));
++    native_with(&w, true, 128, 512)
++}
++
++fn permute_fixture() -> NativeProgram {
++    let mut w = vop3(0x169, 1, v(0), k(3)).to_vec(); // v_mul_lo_u32 v1, v0, 3
++    w.extend([
++        vop2(0x25, 1, k(1), 1),  // v_add_nc_u32 v1, 1, v1
++        vop2(0x26, 2, k(63), 0), // v_sub_nc_u32 v2, 63, v0
++        vop2(0x1A, 2, k(2), 2),  // v_lshlrev_b32 v2, 2, v2: the mirror lane's address
++    ]);
++    w.extend(ds(0xB3, 3, 2, 1, 0)); // ds_bpermute_b32 v3, v2, v1
++    w.extend([
++        vop1(0x01, 4, LIT), // v_mov_b32 v4, 1000
++        1000,
++        vop1(0x01, 4, 0xFA), // v_mov_b32 v4, v1 row_shr:1 row_mask:0x6 bank_mask:0xf
++        0x6 << 28 | 0xF << 24 | 0x111 << 8 | 1,
++    ]);
++    w.extend(ds(0x35, 5, 1, 0, 0x401F)); // ds_swizzle_b32 v5, v1 offset:swizzle(BITMASK_PERM, xor 16)
++    w.push(vop1(0x01, 6, v(0))); // v_mov_b32 v6, v0
++    w.extend(vop3(0x361, 6, 0, k(45))); // v_writelane_b32 v6, s0, 45
++    w.extend(stores([3, 4, 5, 6]));
++    native_with(&w, true, 64, 0)
++}
++
++fn branch_fixture() -> NativeProgram {
++    let mut w = vec![
++        sop1(0x03, 7, LIT), // s_mov_b32 s7, 0x77
++        0x77,
++        vop1(0x01, 5, k(1)),    // v_mov_b32 v5, 1
++        vop2(0x16, 6, k(1), 0), // v_lshrrev_b32 v6, 1, v0
++        vop2(0x1A, 7, v(6), 5), // v_lshlrev_b32 v7, v6, v5
++        vopc(0xC4, 0, 0),       // v_cmp_gt_u32 vcc, s0, v0
++        sop1(0x24, 12, VCC),    // s_and_saveexec_b64 s[12:13], vcc
++        sopp(0x08, 20),         // s_cbranch_execz past the OR
++    ];
++    w.extend_from_slice(&super::wave::WAVE_OR_V7_TO_S7);
++    w.extend([
++        sop1(0x04, EXEC, 12), // s_mov_b64 exec, s[12:13]
++        vop1(0x01, 8, 7),     // v_mov_b32 v8, s7
++    ]);
++    w.extend(stores([8, 7, 6, 0]));
++    native_with(&w, true, 64, 0)
++}
++
++#[derive(Clone, Copy)]
++enum Form {
++    Paired,
++    Original,
++    Selected,
++}
++
++fn emit(
++    native: &NativeProgram,
++    _marks: bool,
++    form: Form,
++) -> Result<(HostShader, Option<u32>), ShaderError> {
++    let p = ir::build(&native.code, native.wave64, native.vgprs)?;
++    let st = structure::structure(&p)?;
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
++    let io = io::raise(&p, native)?;
++    let bytes = crate::dxbc::build(&[]);
++    let c = Container::parse(&bytes)?;
++    match form {
++        Form::Paired => super::paired(&c, native, &p, &io, &res),
++        Form::Original => super::emit_program(&c, native, &p, &st, &io, &res),
++        Form::Selected => super::emit(&c, native, &p, &st, &io, &res).map(|s| {
++            let (_, min, max) = runtime(&s);
++            let wave = (min == max).then_some(min);
++            (s, wave)
++        }),
++
++    }
++}
++
++// Decode the emitted binary contract, not strings in the bitcode payload.
++fn runtime(shader: &HostShader) -> ([u32; 3], u32, u32) {
++    let c = Container::parse(&shader.dxil).expect("emitted container");
++    assert!(c.part(FourCC::DXIL).is_some(), "missing executable part");
++    let psv = c.part(FourCC::PSV0).expect("PSV0").data;
++    assert!(u32_at(psv, 0).unwrap() >= 48);
++    assert_eq!(psv[4 + 24], 5, "compute stage");
++    let word = |at| u32_at(psv, at).unwrap();
++    ([word(40), word(44), word(48)], word(20), word(24))
++}
++
++#[test]
++fn paired_synthetic_bodies_require_wave32_and_halve_the_group() {
++    let _scope = Overrides::new(32, true);
++    for native in [
++        lds_fixture(),
++        loop_fixture(),
++        permute_fixture(),
++        branch_fixture(),
++    ] {
++        let StageIo::Cs(cs) = &native.io else {
++            unreachable!()
++        };
++        for marks in [false, true] {
++            let (shader, wave) = emit(&native, marks, Form::Paired).expect("paired synthetic body");
++            assert_eq!(wave, Some(32));
++            assert_eq!(
++                runtime(&shader),
++                ([cs.threads.iter().product::<u32>() / 2, 1, 1], 32, 32)
++            );
++
++        }
++    }
++}
++
++#[test]
++fn paired_group_guards_use_total_threads_including_2d_groups() {
++    let _scope = Overrides::new(32, true);
++    for threads in [[32, 1, 1], [64, 1, 1], [96, 1, 1], [128, 1, 1], [8, 8, 1]] {
++        let mut native = permute_fixture();
++        let StageIo::Cs(cs) = &mut native.io else {
++            unreachable!()
++        };
++        cs.threads = threads;
++        let count = threads.iter().product::<u32>();
++        let result = emit(&native, false, Form::Paired);
++        if count % 64 == 0 {
++            let (shader, wave) = result.expect("complete console waves");
++            assert_eq!(wave, Some(32));
++            assert_eq!(runtime(&shader), ([count / 2, 1, 1], 32, 32));
++        } else {
++            assert!(matches!(
++                result,
++                Err(ShaderError::Unsupported {
++                    offset: 0,
++                    what: "paired lanes in a thread group that does not fill its console waves"
++                })
++            ));
++        }
++    }
++}
++
++#[test]
++fn paired_refuses_noncompute_before_lowering() {
++    let _scope = Overrides::new(32, true);
++    let mut native = permute_fixture();
++    let p = ir::build(&native.code, true, native.vgprs).unwrap();
++    let st = structure::structure(&p).unwrap();
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++    let io = io::raise(&p, &native).unwrap();
++    native.stage = HwStage::Vs;
++    native.io = StageIo::None;
++    let bytes = crate::dxbc::build(&[]);
++    let c = Container::parse(&bytes).unwrap();
++    assert!(matches!(
++        super::paired(&c, &native, &p, &io, &res),
++        Err(ShaderError::Unsupported {
++            offset: 0,
++            what: "paired lanes outside compute"
++        })
++    ));
++}
++
++#[test]
++fn paired_retains_all_host_annotations() {
++    let native = permute_fixture();
++    for marks in [false, true] {
++        let (mut original, wave) = {
++            let _scope = Overrides::new(64, false);
++            emit(&native, marks, Form::Original).expect("original wave64")
++        };
++        assert_eq!(wave, Some(64));
++        assert_eq!(runtime(&original), ([64, 1, 1], 64, 64));
++        let (mut paired, _) = {
++            let _scope = Overrides::new(32, true);
++            emit(&native, marks, Form::Paired).expect("paired wave32")
++        };
++        // All HostShader fields besides the executable remain the host's same contract.
++        original.dxil.clear();
++        paired.dxil.clear();
++        assert_eq!(paired, original);
++    }
++}
++
++#[test]
++fn exact_originals_stay_byte_identical_with_pairs_enabled_or_disabled() {
++    for (wave64, host_wave) in [(false, 32), (true, 64)] {
++        let mut native = permute_fixture();
++        if !wave64 {
++            native = native_with(&stores([0, 0, 0, 0]), false, 32, 0);
++        }
++        for marks in [false, true] {
++            let (original, required) = {
++                let _scope = Overrides::new(host_wave, false);
++                emit(&native, marks, Form::Original).expect("exact original")
++            };
++            for pairs in [false, true] {
++                let _scope = Overrides::new(host_wave, pairs);
++                let (selected, selected_wave) =
++                    emit(&native, marks, Form::Selected).expect("exact selection");
++                assert_eq!(selected_wave, required);
++                assert_eq!(selected, original);
++            }
++        }
++    }
++}
++
++#[test]
++fn paired_choices_and_host_wave_are_in_the_translation_fingerprint() {
++    let fingerprint = {
++        let _scope = Overrides::new(32, true);
++        super::translation_fingerprint()
++    };
++    assert!(fingerprint.starts_with(env!("VICTORY_SHADER_SOURCE_HASH").as_bytes()));
++    for name in ["VICTORY_WAVE_PAIRS"] {
++        assert!(
++            env!("VICTORY_SHADER_SWITCHES")
++                .split(',')
++                .any(|s| s == name)
++        );
++        let mut entry = format!("{name}=").into_bytes();
++        if let Some(value) = std::env::var_os(name) {
++            entry.extend_from_slice(value.as_encoded_bytes());
++        }
++        entry.push(0);
++        assert!(
++            fingerprint.windows(entry.len()).any(|w| w == entry),
++            "{name}"
++        );
++    }
++    let _scope = Overrides::new(64, true);
++    assert_ne!(super::translation_fingerprint(), fingerprint);
++}
++
++#[test]
++fn overrides_restore_nested_choices() {
++    let before = (lower::TEST_HOST_WAVE.get(), super::TEST_PAIRS.get());
++    {
++        let _outer = Overrides::new(32, true);
++        assert!(super::pairs_on());
++        {
++            let _inner = Overrides::new(64, false);
++            assert!(!super::pairs_on());
++            assert_eq!(lower::TEST_HOST_WAVE.get(), Some(64));
++        }
++        assert!(super::pairs_on());
++        assert_eq!(lower::TEST_HOST_WAVE.get(), Some(32));
++    }
++    assert_eq!(
++        (lower::TEST_HOST_WAVE.get(), super::TEST_PAIRS.get()),
++        before
++    );
++}
++
++
++/// Opt in with a private directory containing only the desired .cdxil inputs.
++/// Never writes files, embeds private paths, or requires game data in the repository.
++#[test]
++fn optional_external_wave_shader_directory_translates_on_wave32() {
++    let Some(dir) = std::env::var_os("VICTORY_TEST_WAVE_SHADER_DIR") else {
++        eprintln!("VICTORY_TEST_WAVE_SHADER_DIR unset; external fixture check skipped");
++        return;
++    };
++    let mut paths: Vec<_> = std::fs::read_dir(dir)
++        .expect("external fixture directory")
++        .map(|e| e.expect("directory entry").path())
++        .filter(|p| p.is_file() && p.extension().is_some_and(|e| e == "cdxil"))
++        .collect();
++    paths.sort();
++    assert!(
++        !paths.is_empty(),
++        "explicit fixture directory has no .cdxil files"
++    );
++    let _scope = Overrides::new(32, true);
++    let mut failed = Vec::new();
++    for path in paths {
++        let name = path.file_name().unwrap().to_string_lossy();
++        let input = std::fs::read(&path).expect("read external fixture");
++        match super::translate(&input) {
++            Ok(shader) => {
++                let (threads, min, max) = runtime(&shader);
++                eprintln!(
++                    "{name}: translated, group={threads:?}, wave={min}..{max}"
++                );
++                // Unconstrained output (0..MAX) is also legal on a wave32 host.
++                if max == 64 || min > 32 || max < 32 {
++                    failed.push(name.into_owned());
++                }
++            }
++            Err(error) => {
++                eprintln!("{name}: translation failed: {error}");
++                failed.push(name.into_owned());
++            }
++        }
++    }
++    assert!(failed.is_empty(), "wave32 translation failed: {failed:?}");
++}
