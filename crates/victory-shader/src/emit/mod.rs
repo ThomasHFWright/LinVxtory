@@ -251,11 +251,11 @@ pub use shader::{
     null_buffer_view, set_view_heap_limit, view_heap_limit,
 };
 
-/// The loop limit without an override: 2^20.
+/// The sentinel selecting the existing per-stage budgets: 2^20.
 pub const DEFAULT_LOOP_LIMIT: u32 = lower::LOOP_LIMIT;
 
-/// The iteration count after which a translated loop is left, per lane and
-/// per entry into the loop: [`DEFAULT_LOOP_LIMIT`].
+/// The named iteration budget per lane and per entry into a loop.
+/// [`DEFAULT_LOOP_LIMIT`] selects pixel128, vertex/mesh256 and compute4096.
 ///
 /// With the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT` (decimal or
 /// `0x` hex, at least 1) sets it instead. A loop that hits the limit in
@@ -272,6 +272,41 @@ pub fn loop_limit() -> u32 {
             lower::LOOP_LIMIT
         }
     })
+}
+
+/// The compute-only diagnostic limit, falling back to [`loop_limit`].
+/// `VICTORY_SHADER_LOOP_LIMIT_CS` accepts a positive decimal or `0x` hex
+/// count. Unset, invalid and zero values preserve the general limit.
+/// The default sentinel still selects the existing per-stage budgets.
+/// Adapted from Danigamer05's fxceless/victory-fork PR #683.
+pub fn compute_loop_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| {
+        if cfg!(feature = "diagnostics") {
+            parse_compute_loop_limit(
+                std::env::var("VICTORY_SHADER_LOOP_LIMIT_CS").ok().as_deref(),
+                loop_limit(),
+            )
+        } else {
+            loop_limit()
+        }
+    })
+}
+
+/// The general limit when the compute override is absent or invalid.
+fn parse_compute_loop_limit(value: Option<&str>, fallback: u32) -> u32 {
+    parse_count(value).unwrap_or(fallback)
+}
+
+/// A positive decimal or `0x` hex count, ignoring surrounding whitespace.
+fn parse_count(value: Option<&str>) -> Option<u32> {
+    value
+        .map(str::trim)
+        .and_then(|v| match v.strip_prefix("0x") {
+            Some(hex) => u32::from_str_radix(hex, 16).ok(),
+            None => v.parse().ok(),
+        })
+        .filter(|&n| n > 0)
 }
 
 /// Which of a translated program's group barriers wait for the whole
@@ -354,6 +389,7 @@ pub fn translation_fingerprint() -> Vec<u8> {
     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
     out.extend_from_slice(&loop_limit().to_le_bytes());
+    out.extend_from_slice(&compute_loop_limit().to_le_bytes());
     out.push(group_sync());
     out.extend_from_slice(&shader_opt().to_le_bytes());
     out
@@ -374,16 +410,7 @@ fn parse_shader_opt(value: Option<&str>) -> u32 {
 /// `VICTORY_SHADER_LOOP_LIMIT`'s value; the default when it is unset,
 /// unreadable or 0. Pure, for testing.
 fn parse_loop_limit(value: Option<&str>) -> u32 {
-    let parsed = value
-        .map(str::trim)
-        .and_then(|v| match v.strip_prefix("0x") {
-            Some(hex) => u32::from_str_radix(hex, 16).ok(),
-            None => v.parse().ok(),
-        });
-    match parsed {
-        Some(n) if n > 0 => n,
-        _ => lower::LOOP_LIMIT,
-    }
+    parse_count(value).unwrap_or(lower::LOOP_LIMIT)
 }
 
 /// A translated shader and what the host binds for it.
@@ -1210,7 +1237,7 @@ mod tests {
     #[cfg(windows)]
     use super::bitcode::Attr;
     use super::lower::LOOP_LIMIT;
-    use super::{parse_loop_limit, parse_shader_opt};
+    use super::{parse_compute_loop_limit, parse_loop_limit, parse_shader_opt};
 
     #[test]
     fn wide_loads_are_opt_in_and_preserve_default_passes() {
@@ -1236,6 +1263,21 @@ mod tests {
             assert_eq!(parse_loop_limit(Some(bad)), LOOP_LIMIT, "{bad:?}");
         }
     }
+    #[test]
+    fn the_compute_loop_limit_follows_the_general_one_unless_set() {
+        assert_eq!(parse_compute_loop_limit(None, 32), 32);
+        assert_eq!(parse_compute_loop_limit(Some("1024"), 32), 1024);
+        assert_eq!(parse_compute_loop_limit(Some(" 0x400 "), 32), 1024);
+        let full = LOOP_LIMIT.to_string();
+        assert_eq!(parse_compute_loop_limit(Some(&full), 32), LOOP_LIMIT);
+        assert_eq!(parse_compute_loop_limit(Some("1"), 32), 1);
+        assert_eq!(parse_compute_loop_limit(Some("4294967295"), 32), u32::MAX);
+        for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
+            assert_eq!(parse_compute_loop_limit(Some(bad), 32), 32, "{bad:?}");
+            assert_eq!(parse_compute_loop_limit(Some(bad), LOOP_LIMIT), LOOP_LIMIT);
+        }
+    }
+
     use super::container::SigElement;
     #[cfg(windows)]
     use super::shader::Shader;

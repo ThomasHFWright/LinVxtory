@@ -69,8 +69,9 @@ pub fn counts() -> (u64, u64) {
 pub(crate) fn build() -> [u8; 32] {
     static WARNED: std::sync::Once = std::sync::Once::new();
     let limit = victory_shader::emit::loop_limit();
-    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
-        WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+    let compute_limit = victory_shader::emit::compute_loop_limit();
+    if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT || compute_limit != limit {
+        WARNED.call_once(|| tracing::warn!(limit, compute_limit, "diagnostic shader loop limits (1048576 selects stage defaults)"));
     }
     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
     let exe = EXE.get_or_init(|| {

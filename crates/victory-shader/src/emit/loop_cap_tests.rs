@@ -219,3 +219,142 @@ fn check_follow(m: &super::super::bitcode::Module, entry: usize, expected: [u32;
         assert_eq!(result.args[0], [expected], "lane {lane}: current PHI");
     }
 }
+
+/// Separate processes exercise the real OnceLocks and environment fingerprint
+/// without mutating the environment underneath parallel translation tests.
+#[test]
+fn compute_override_is_stage_local_and_changes_translation_identity() {
+    const CHILD: &str = "LINVICTORY_LOOP_TEST_CHILD";
+    if let Ok(expect) = std::env::var(CHILD) {
+        let expected: Vec<u32> = expect.split(',').map(|v| v.parse().unwrap()).collect();
+        let expected = if cfg!(feature = "diagnostics") {
+            expected
+        } else {
+            vec![128, 256, 4096]
+        };
+        assert_stage_limits(&expected);
+        let (m, entry, follows) = emitted(&[
+            0x3400_0088, // lane's first ID * 256: wave one wants 8192
+            0x7E00_0500,
+            0xBE81_0380,
+            0xBF06_0001,
+            0xBF85_0002,
+            0x8001_8101,
+            0xBF82_FFFC,
+            0xBF8A_0000,
+            0x7E04_0201,
+            0xBF81_0000,
+        ]);
+        check_follow(&m, entry, [0, expected[2]]);
+        assert_eq!(follows, 1);
+        assert!(
+            env!("VICTORY_SHADER_SWITCHES")
+                .split(',')
+                .any(|s| s == "VICTORY_SHADER_LOOP_LIMIT_CS")
+        );
+        let fingerprint: String = crate::emit::translation_fingerprint()
+            .iter()
+            .map(|v| format!("{v:02x}"))
+            .collect();
+        println!("loop-fingerprint={fingerprint}");
+        return;
+    }
+    let mut fingerprints = Vec::new();
+    for (global, compute, expected) in [
+        (None, None, "128,256,4096"),
+        (Some("32"), None, "32,32,32"),
+        (Some("32"), Some("128"), "32,32,128"),
+        (None, Some("128"), "128,256,128"),
+        (Some("32"), Some(" 0x80 "), "32,32,128"),
+        (Some("32"), Some("0"), "32,32,32"),
+        (Some("32"), Some("invalid"), "32,32,32"),
+        (Some("32"), Some("1048576"), "32,32,4096"),
+        (Some("32"), Some("1"), "32,32,1"),
+    ] {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "emit::lower::loop_cap_tests::compute_override_is_stage_local_and_changes_translation_identity", "--nocapture"])
+            .env(CHILD, expected)
+            .env_remove("VICTORY_SHADER_LOOP_LIMIT")
+            .env_remove("VICTORY_SHADER_LOOP_LIMIT_CS")
+            .env_remove("VICTORY_GROUP_SYNC");
+        for (name, value) in [
+            ("VICTORY_SHADER_LOOP_LIMIT", global),
+            ("VICTORY_SHADER_LOOP_LIMIT_CS", compute),
+        ] {
+            if let Some(value) = value {
+                cmd.env(name, value);
+            }
+        }
+        let out = cmd.output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "global={global:?}, cs={compute:?}: {stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let fingerprint = stdout
+            .lines()
+            .find_map(|s| s.strip_prefix("loop-fingerprint="))
+            .expect("child executed");
+        fingerprints.push(fingerprint.to_owned());
+    }
+    assert_ne!(
+        fingerprints[0], fingerprints[3],
+        "compute-only override must change cache identity"
+    );
+    assert_ne!(
+        fingerprints[1], fingerprints[2],
+        "global32 and global32+CS128 must never share translations"
+    );
+}
+
+fn assert_stage_limits(expected: &[u32]) {
+    let native = NativeProgram {
+        stage: HwStage::Cs,
+        wave64: false,
+        vgprs: 4,
+        layout: vec![],
+        used: vec![],
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: 0,
+            threads: [64, 1, 1],
+        }),
+        code: 0xBF81_0000u32.to_le_bytes().to_vec(),
+    };
+    let p = crate::ir::build(&native.code, false, 4).unwrap();
+    let st = crate::structure::structure(&p).unwrap();
+    let res = crate::resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
+    let io = crate::io::raise(&p, &native).unwrap();
+    let parts = Parts {
+        native: &native,
+        p: &p,
+        st: &st,
+        res: &res,
+        io: &io,
+        inputs: vec![],
+        outputs: vec![],
+        prims: vec![],
+        mesh_stride: 0,
+        view_marks: false,
+    };
+    // The actual emitter selects stages from Shader, including mesh programs
+    // with compute-shaped input. Do not mistake those for compute.
+    let bad = HashMap::new();
+    let mut lower = Lower::new(&parts, &bad);
+    let compute = lower.iteration_limit();
+    assert_eq!(compute, lower.s.m.i32(expected[2]));
+    lower.s.mesh = Some(super::super::shader::Mesh {
+        max_vertices: 1,
+        max_primitives: 1,
+        topology: 2,
+    });
+    let mesh = lower.iteration_limit();
+    assert_eq!(mesh, lower.s.m.i32(expected[1]));
+    lower.s.mesh = None;
+    lower.s.threads = None;
+    let vertex = lower.iteration_limit();
+    assert_eq!(vertex, lower.s.m.i32(expected[1]));
+    lower.s.pixel = true;
+    let pixel = lower.iteration_limit();
+    assert_eq!(pixel, lower.s.m.i32(expected[0]));
+}

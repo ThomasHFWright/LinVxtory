@@ -609,7 +609,8 @@ The on/off switches below (`...=1`) are off when unset or set to `0`.
 | `VICTORY_D3D12_WARP=1` | host device on the software adapter (slow; cannot reset the driver) |
 | `VICTORY_PIPELINE_LOG=<file>` | a line per title pipeline created (key, shaders, state), first used, and made or loaded (library name); `translate --cache --pipelines` writes the last kind too |
 | `VICTORY_PREBUILD_KEYS=<file>` | `translate --cache --pipelines` makes nothing and lists each pack record's key, shaders and state (or why it is skipped) |
-| `VICTORY_SHADER_LOOP_LIMIT=<n>` | translated shader loops stop after `n` iterations per lane instead of 2^20 (own shader cache entries); if a lower `n` makes world frames much faster, loops hitting the limit are what makes them slow |
+| `VICTORY_SHADER_LOOP_LIMIT=<n>` | diagnostics: overrides every stage's loop budget. Unset/default sentinel `1048576` retains pixel128, vertex/mesh256 and compute4096; decimal and `0x` hex accepted. Truncates remaining loop iterations; fallback aborts may terminate the shader. |
+| `VICTORY_SHADER_LOOP_LIMIT_CS=<n>` | diagnostics: overrides compute alone; unset, invalid or zero follows the general limit. `VICTORY_SHADER_LOOP_LIMIT=32 VICTORY_SHADER_LOOP_LIMIT_CS=128` leaves pixel/vertex/mesh at32 and compute at128. Runtime and `translate` use the same settings and distinct cache fingerprints; paired-wave loops share this budget. The value `1048576` selects the existing stage default, including for the compute override. Adapted from [Danigamer05's #683, “A loop limit for compute programs alone”](https://github.com/fxceless/victory-fork/pull/683). No performance or visual gain established on this fork. |
 | `VICTORY_AUDIO_CAPTURE=<file.wav>` | records what the title plays (our process only) |
 | `VICTORY_XMA_DUMP=<dir>` | saves the first 32 XMA voices' context and input |
 
