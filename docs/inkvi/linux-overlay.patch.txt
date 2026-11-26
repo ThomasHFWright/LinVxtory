@@ -100,7 +100,7 @@ index 49180ea..8685c1a 100644
 +    }
 +}
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
-index 7ba71f7..d103be1 100644
+index 7ba71f7..d68d70f 100644
 --- a/crates/victory-gpu/src/descriptor.rs
 +++ b/crates/victory-gpu/src/descriptor.rs
 @@ -1126,9 +1126,12 @@ struct Views {
@@ -217,6 +217,15 @@ index 7ba71f7..d103be1 100644
  }
 
  /// Device method.
+@@ -1985,7 +2021,7 @@ mod tests {
+             user_data: 4,
+             slot: 1,
+         };
+-        let made = state.tables(&list, &[range], &[], &[(1, 8)], true);
++        let made = state.tables(&list, &[range], &[], &[(1, 8)], true, &[], &mut Vec::new());
+         let [(1, offset)] = made[..] else {
+             panic!("one fresh table for root parameter 1, not {made:?}");
+         };
 @@ -2188,6 +2224,40 @@ mod tests {
          assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
      }
@@ -283,8 +292,106 @@ index 7ba71f7..d103be1 100644
          // The same shape, unordered: another shape.
          create_placed_uav(null, &resource, &desc, at);
          assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 7872aac..343d328 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -113,6 +113,8 @@ pub(crate) struct HostHeap {
+     /// read there is a GPU page fault (the console reads stale memory).
+     /// One lock per slot: every use is of one slot.
+     kept: Box<[Mutex<Option<ID3D12Resource>>]>,
++    /// First slot and populated copy count of the heap's permanent raw-page run.
++    raw_pages: Mutex<Option<(u32, usize)>>,
+     /// Where the search for free dynamic slots starts, and which are taken
+     /// (by lists not yet reset).
+     next: Mutex<(u32, Vec<bool>)>,
+@@ -1295,6 +1297,7 @@ impl HostHeap {
+                 .map(|_| std::sync::atomic::AtomicU64::new(0))
+                 .collect(),
+             kept: (0..count + extra).map(|_| Mutex::new(None)).collect(),
++            raw_pages: Mutex::default(),
+             next: Mutex::new((0, vec![false; if sampler { DYNAMIC } else { extra } as usize])),
+             free: std::sync::atomic::AtomicU32::new(if sampler { DYNAMIC } else { extra }),
+             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
+@@ -2368,6 +2371,34 @@ impl HostHeap {
+         self.keep(index, None);
+     }
+
++    /// An append-only descriptor run for guest-address readers on this heap.
++    pub(crate) fn raw_page_views(&self, copies: &[std::sync::Arc<crate::shadow::Shadow>]) -> Option<u32> {
++        const SLOTS: u32 = crate::memory::RAW_VIEW_SLOTS;
++        const _: () = assert!(SLOTS <= DYNAMIC);
++        if copies.len() >= SLOTS as usize {
++            return None;
++        }
++        let mut run = self.raw_pages.lock().unwrap_or_else(|e| e.into_inner());
++        let (base, made) = match *run {
++            Some(run) => run,
++            None => {
++                let base = self.dynamic(SLOTS)?;
++                // The shared directory may expose a newer copy ID to this heap.
++                for index in base..base + SLOTS {
++                    self.null_raw_uav_at(index);
++                }
++                (base, 0)
++            }
++        };
++        for (n, shadow) in copies.iter().enumerate().skip(made) {
++            let (start, len) = shadow.span();
++            self.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, shadow.offset(start) + len);
++        }
++        // Keep earlier slots and their resources for lists that recorded this base.
++        *run = Some((base, made.max(copies.len())));
++        Some(base)
++    }
++
+     /// Makes slot `index` (a dynamic one) a raw unordered access view of
+     /// `len` bytes of `buffer` from byte `offset` (a multiple of 16): a
+     /// root UAV with a size, whose accesses past it do nothing instead of
+@@ -3332,6 +3363,16 @@ fn acceleration_structure(words: &[u32; 10]) -> Option<u64> {
+     (words[1] == SRV_ACCELERATION_STRUCTURE).then(|| u64::from(words[4]) | u64::from(words[5]) << 32)
+ }
+
++/// Guest address supplied to a shader that uses raw title memory.
++pub(crate) fn guest_address(view: &View) -> Option<u64> {
++    if let View::Shader(_, Some(words)) = view
++        && let Some(address) = acceleration_structure(words)
++    {
++        return (address != 0).then_some(address);
++    }
++    buffer_range(view).map(|(address, _)| address)
++}
++
+ /// Why a table's view gives no buffer address ([`buffer_range`] is
+ /// `None`), for the log: what kind of view it is, and for a ray-tracing
+ /// acceleration structure view (no resource; the title's traces take the
+@@ -4721,7 +4762,10 @@ mod tests {
+         words[1] = SRV_ACCELERATION_STRUCTURE;
+         (words[4], words[5]) = (0x3456_7800, 0x12);
+         assert_eq!(acceleration_structure(&words), Some(0x12_3456_7800));
+-        let why = why_no_address(Some(&View::Shader(0, Some(words))));
++        let view = View::Shader(0, Some(words));
++        assert_eq!(guest_address(&view), Some(0x12_3456_7800));
++        assert_eq!(buffer_range(&view), None);
++        let why = why_no_address(Some(&view));
+         assert!(why.contains("acceleration structure") && why.contains("0x1234567800"), "{why}");
+         words[1] = D3D12_SRV_DIMENSION_BUFFER.0 as u32;
+         assert_eq!(acceleration_structure(&words), None);
+@@ -4871,11 +4915,7 @@ void BY_FLOATS_OR_NOT(uint3 id : SV_DispatchThreadID) {
+                     .replace("BY_FLOATS_OR_NOT", "main")
+                     .replace("#ifdef BY_FLOATS", "#if 0")
+             };
+-            let code = crate::host::compile(
+-                &source,
+-                windows::core::s!("main"),
+-                windows::core::s!("cs_5_1"),
+-            )
++            let code = crate::host::compile(&source, "main", "cs_5_1")
+             .expect("the test's shader");
+             let (from, filled) = host.shared_buffer(BYTES).expect("a buffer");
+             let (to, result) = host.shared_buffer(BYTES).expect("a buffer");
 diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
-index 1b5a344..5bfd8ae 100644
+index 1b5a344..68a5198 100644
 --- a/crates/victory-gpu/src/draw.rs
 +++ b/crates/victory-gpu/src/draw.rs
 @@ -726,8 +726,8 @@ pub(crate) struct State {
@@ -307,7 +414,184 @@ index 1b5a344..5bfd8ae 100644
          self.host_pipeline = 0;
          self.host_roots = [0; 2];
          self.host_heaps = [0; 2];
-@@ -5259,7 +5261,7 @@ impl State {
+@@ -2184,7 +2186,7 @@ impl State {
+         }
+         // A dispatch starts at group 0; one split into several sets each
+         // part's first group itself (`dispatch`, `execute_indirect`).
+-        if kind == USER_GROUP_BASE {
++        if kind == USER_GROUP_BASE || kind == victory_shader::emit::USER_DISPATCH_THREADS_X {
+             return 0;
+         }
+         if kind == USER_VIEW_BIAS {
+@@ -2205,20 +2207,12 @@ impl State {
+             return 0;
+         }
+         // The title address of the buffer view at that dword of the table.
+-        let (address, view) = match self.roots_ref(compute).get(usize::from(slot)) {
+-            Some(&Root::Table(table)) => {
+-                let view = crate::descriptor::view(table + u64::from(dword) * 4);
+-                let address = view
+-                    .as_ref()
+-                    .and_then(crate::descriptor::host::buffer_range)
+-                    .map_or(0, |range| range.0);
+-                (address, Some(view))
+-            }
+-            _ => (0, None),
+-        };
++        let view = self.table_view(compute, slot, dword);
++        let address = view.as_ref().and_then(crate::descriptor::host::guest_address).unwrap_or(0);
+         if address == 0 {
+             once!(slot, dword, "a shader takes the address of a buffer view that is not there: it reads 0");
+-            no_address(self.pipeline as This, slot, dword, view.as_ref());
++            let table = matches!(self.roots_ref(compute).get(usize::from(slot)), Some(Root::Table(_)));
++            no_address(self.pipeline as This, slot, dword, table.then_some(&view));
+         }
+         if kind == USER_VIEW_ADDRESS {
+             address as u32
+@@ -2227,10 +2221,19 @@ impl State {
+         }
+     }
+
++    fn table_view(&self, compute: bool, slot: u8, dword: u32) -> Option<View> {
++        let Root::Table(table) = self.roots_ref(compute).get(usize::from(slot))? else {
++            return None;
++        };
++        crate::descriptor::view(table.checked_add(u64::from(dword) * 4)?)
++    }
++
+     /// For a shader that reads title memory by address
+     /// ([`crate::memory`]): its directory, fault notes and view slots,
+     /// with the pages of the root views the list has set made ready.
+-    fn memory_ready(&self, list: &HostList, compute: bool, writes: bool) -> Option<crate::memory::Ready> {
++    fn memory_ready(
++        &self, list: &HostList, compute: bool, writes: bool, shader: &victory_shader::emit::HostShader,
++    ) -> Option<crate::memory::Ready> {
+         let heap = match self.heaps[0] {
+             0 => None,
+             h => crate::descriptor::heap(h as This).host(),
+@@ -2243,6 +2246,18 @@ impl State {
+                 _ => {}
+             }
+         }
++        let low = victory_shader::emit::USER_VIEW_ADDRESS;
++        for word in &shader.user_data {
++            if word.root == RootType::Other(low) || word.root == RootType::Other(low + 1) {
++                if let Some(address) = self.table_view(compute, word.slot, word.dword)
++                    .as_ref().and_then(crate::descriptor::host::guest_address)
++                {
++                    addresses.push(address);
++                }
++            }
++        }
++        addresses.sort_unstable();
++        addresses.dedup();
+         crate::memory::ready(list, heap, &addresses, &constants, writes)
+     }
+
+@@ -2460,7 +2475,8 @@ impl State {
+             }
+             // Title memory by address: what the shader finds it by.
+             let memory = if t.host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY) {
+-                let Some(ready) = self.memory_ready(list, compute, writes) else {
++                let raw_writes = writes && (t.stores_guest_memory || !write_skip());
++                let Some(ready) = self.memory_ready(list, compute, raw_writes, &t.host) else {
+                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
+                     return false;
+                 };
+@@ -4356,7 +4372,7 @@ impl State {
+     }
+
+     /// Runs a dispatch on the host.
+-    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32) {
++    pub(crate) fn dispatch(&mut self, list: &HostList, x: u32, y: u32, z: u32, flags: u32) {
+         let _timed = RecordTimed::new(rec::DISPATCHES_NS, Some(rec::DISPATCHES));
+         // It may write the arguments a window holds clamped.
+         self.window = None;
+@@ -4386,7 +4402,8 @@ impl State {
+             return;
+         }
+         // The ray-tracing structure builder's stages run all or none.
+-        if crate::pipeline::is_builder(self.pipeline as This) && !crate::pipeline::builder_runs() {
++        let builder = crate::pipeline::is_builder(self.pipeline as This);
++        if builder && !crate::pipeline::builder_runs() {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+             #[cfg(feature = "diagnostics")]
+             {
+@@ -4412,15 +4429,48 @@ impl State {
+             once!("a dispatch with a graphics pipeline");
+             return;
+         }
++        let threads = [x, y, z];
++        let mut thread_count = None;
++        let [x, y, z] = if builder && flags & THREAD_DIMENSIONS != 0 {
++            let plan = p.stages.first()
++                .and_then(|stage| stage.translated().threads)
++                .and_then(|size| dispatch_groups(threads, size).map(|(groups, partial)| (groups, partial, size[0])));
++            let Some((groups, partial, width)) = plan else {
++                crate::pipeline::builder_off("unsupported builder thread dimensions");
++                DROPPED.fetch_add(1, Ordering::Relaxed);
++                return;
++            };
++            thread_count = compute_word(p, victory_shader::emit::USER_DISPATCH_THREADS_X)
++                .map(|(param, word)| (param, word, width));
++            if (partial && thread_count.is_none())
++                || (groups[0] > MOST_GROUPS && group_base(p).is_none())
++            {
++                crate::pipeline::builder_off("builder thread dimensions cannot be represented by the host shader");
++                DROPPED.fetch_add(1, Ordering::Relaxed);
++                return;
++            }
++            groups
++        } else {
++            threads
++        };
+         if !self.bind(list, p, true) {
+             DROPPED.fetch_add(1, Ordering::Relaxed);
+-            // A stage of the structure builder that cannot be bound is a
+-            // dropped stage: the others stop too.
+-            if crate::pipeline::is_builder(self.pipeline as This) {
++            if builder {
+                 crate::pipeline::builder_off("one of its dispatches could not be bound");
+             }
+             return;
+         }
++        let set_count = |base: u32| {
++            if let Some((param, word, width)) = thread_count {
++                // The shader's guard uses IDs relative to this host dispatch.
++                let remaining = threads[0] - base * width;
++                // SAFETY: the bound compute signature declares this root word.
++                unsafe { list.list.SetComputeRoot32BitConstant(param, remaining, word) };
++            }
++        };
++        if builder && flags & THREAD_DIMENSIONS != 0 {
++            once!(?threads, groups = ?[x, y, z], "a builder dispatch uses the console thread dimensions");
++        }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+         list.prof_draw(false);
+@@ -4432,6 +4482,7 @@ impl State {
+                 let mut first = 0;
+                 while first < x {
+                     let n = (x - first).min(MOST_GROUPS);
++                    set_count(first);
+                     // SAFETY: an open list with everything set; the root
+                     // parameter holds the program's user data.
+                     unsafe {
+@@ -4441,8 +4492,11 @@ impl State {
+                     first += n;
+                 }
+             }
+-            // SAFETY: an open list with everything set.
+-            None => unsafe { list.list.Dispatch(x, y, z) },
++            None => {
++                set_count(0);
++                // SAFETY: an open list with everything set.
++                unsafe { list.list.Dispatch(x, y, z) };
++            }
+         }
+         list.prof_draw(true);
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+@@ -5259,7 +5313,7 @@ impl State {
              };
              #[cfg(feature = "diagnostics")]
              tally(0, 1);
@@ -316,7 +600,7 @@ index 1b5a344..5bfd8ae 100644
                  if let Some(title) = heap.index(table) {
                      for k in 0..n {
                          host.drawn_fresh(title + k, seq, read[k as usize]);
-@@ -5318,7 +5320,7 @@ impl State {
+@@ -5318,7 +5372,7 @@ impl State {
              };
              #[cfg(feature = "diagnostics")]
              clock.lap(21);
@@ -325,7 +609,7 @@ index 1b5a344..5bfd8ae 100644
              if !spans.is_empty() {
                  staged.push((table, n));
              }
-@@ -5337,6 +5339,7 @@ impl State {
+@@ -5337,6 +5391,7 @@ impl State {
                  let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
                  match crate::descriptor::view(table + u64::from(k) * 32) {
                      Some(View::Constant(address, size)) => {
@@ -333,7 +617,7 @@ index 1b5a344..5bfd8ae 100644
                          if let Some(gpu) = table_constant_on_card(list, address, size) {
                              host.constant_at(index, gpu, size);
                              continue;
-@@ -5409,6 +5412,7 @@ impl State {
+@@ -5409,6 +5464,7 @@ impl State {
                      }
                  }
              }
@@ -341,11 +625,97 @@ index 1b5a344..5bfd8ae 100644
              made.push((slot, first * 32));
          }
          #[cfg(feature = "diagnostics")]
+@@ -6223,19 +6279,37 @@ const MOST_GROUPS: u32 = 65535;
+ /// the base. None for programs that do not read one (those with a spilled
+ /// user-data table), and for any other pipeline.
+ fn group_base(p: &HostPipeline) -> Option<(u32, u32)> {
+-    if !p.compute {
++    compute_word(p, victory_shader::emit::USER_GROUP_BASE)
++}
++
++fn compute_word(p: &HostPipeline, kind: u32) -> Option<(u32, u32)> {
++    let stage = p.stages.first().filter(|_| p.compute)?;
++    let (param, _) = stage.user_data?;
++    let word = stage.translated().host.user_data.iter().find(|u| u.root == RootType::Other(kind))?;
++    Some((param, word.index))
++}
++
++/// DispatchX counts lanes when this console flag is set (DexNom bc3cd4b).
++const THREAD_DIMENSIONS: u32 = 0x20;
++
++fn dispatch_groups(threads: [u32; 3], size: [u32; 3]) -> Option<([u32; 3], bool)> {
++    if size.contains(&0) || threads[1] % size[1] != 0 || threads[2] % size[2] != 0 {
++        // The shader masks partial groups along x only.
+         return None;
+     }
+-    let stage = p.stages.first()?;
+-    let (param, _) = stage.user_data?;
+-    let base = RootType::Other(victory_shader::emit::USER_GROUP_BASE);
+-    stage
+-        .translated()
+-        .host
+-        .user_data
+-        .iter()
+-        .find(|u| u.root == base)
+-        .map(|u| (param, u.index))
++    let groups = std::array::from_fn(|i| threads[i].div_ceil(size[i]));
++    (groups[1] <= MOST_GROUPS && groups[2] <= MOST_GROUPS)
++        .then_some((groups, threads[0] % size[0] != 0))
++}
++
++#[cfg(test)]
++#[test]
++fn thread_dispatch_counts_full_and_partial_groups() {
++    assert_eq!(dispatch_groups([74, 1, 1], [64, 1, 1]), Some(([2, 1, 1], true)));
++    assert_eq!(dispatch_groups([64, 8, 8], [64, 2, 4]), Some(([1, 4, 2], false)));
++    assert_eq!(dispatch_groups([0, 1, 1], [64, 1, 1]), Some(([0, 1, 1], false)));
++    assert_eq!(dispatch_groups([74, 3, 1], [64, 2, 1]), None);
++    assert_eq!(dispatch_groups([74, 1, 1], [0, 1, 1]), None);
+ }
+
+ /// The host command signature for a split dispatch's records
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 5c32919..e3df880 100644
+index 5c32919..d12c4ee 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
-@@ -15993,13 +15993,29 @@ impl Host {
+@@ -3903,6 +3903,9 @@ struct Deferred {
+     filled: std::collections::HashMap<(usize, usize), u64>,
+     /// Textures whose contents the list brings up to date.
+     textures: std::collections::HashSet<usize>,
++    /// Prefixes of the guest-address spans registered on this list.
++    guest_reads: usize,
++    guest_writes: usize,
+     /// Last GPU source copied into each aliased host texture in this list.
+     texture_aliases: std::collections::HashMap<usize, usize>,
+     /// Bottom-of-pipe writes, done once the list has run: address, what,
+@@ -4636,6 +4639,7 @@ mod relay_tests {
+                 fence,
+                 lists: Vec::new(),
+                 order: (0..lists).collect(),
++                texture_back_ranges: Vec::new(),
+                 card: None,
+                 back: Vec::new(),
+                 read_back: Vec::new(),
+@@ -13792,6 +13796,18 @@ impl HostList {
+         self.deferred().textures.insert(key)
+     }
+
++    /// The first guest-address span without a refresh and write declaration.
++    pub(crate) fn guest_span_usage(&self, spans: usize, writes: bool) -> (usize, usize) {
++        let mut deferred = self.deferred();
++        let read_from = std::mem::replace(&mut deferred.guest_reads, spans);
++        let write_from = if writes {
++            std::mem::replace(&mut deferred.guest_writes, spans)
++        } else {
++            spans
++        };
++        (read_from, write_from)
++    }
++
+     pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
+         let view = view.as_raw() as usize;
+         let source = source.as_raw() as usize;
+@@ -15993,13 +16009,29 @@ impl Host {
      /// as frame `frame` (saved if captures are on). `None` if nothing was
      /// shown; else, in diagnostics builds, whether the frame was black.
      pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
@@ -377,7 +747,7 @@ index 5c32919..e3df880 100644
          // SAFETY: a live resource.
          let desc = unsafe { texture.GetDesc() };
          let Some(format) = swap_format(desc.Format) else {
-@@ -16058,7 +16074,7 @@ impl Host {
+@@ -16058,7 +16090,7 @@ impl Host {
              let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
              #[cfg(not(feature = "diagnostics"))]
              let read_now = false;
@@ -386,7 +756,7 @@ index 5c32919..e3df880 100644
                  let finished = FINISHED.load(Ordering::Acquire);
                  p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
                      let list = self.new_list().ok()?;
-@@ -16120,33 +16136,43 @@ impl Host {
+@@ -16120,33 +16152,43 @@ impl Host {
                  .then(|| crate::capture::read_back(&self.device, list, texture))
                  .flatten();
              #[cfg(feature = "diagnostics")]
@@ -449,8 +819,34 @@ index 5c32919..e3df880 100644
              copy.close();
              match slot {
                  Some(i) => {
+@@ -17645,7 +17687,7 @@ void main() {
+             eprintln!("inflight_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
+             return;
+         }
+-        let code = compile(TWICE, windows::core::s!("main"), windows::core::s!("cs_5_1")).expect("the test's shader");
++        let code = compile(TWICE, "main", "cs_5_1").expect("the test's shader");
+         // SAFETY: the shader's own root signature; plain creation.
+         let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
+             let root: ID3D12RootSignature = host.device.CreateRootSignature(0, &code).expect("a root signature");
+diff --git a/crates/victory-gpu/src/indirect.rs b/crates/victory-gpu/src/indirect.rs
+index db6a060..49c50a1 100644
+--- a/crates/victory-gpu/src/indirect.rs
++++ b/crates/victory-gpu/src/indirect.rs
+@@ -4393,9 +4393,9 @@ float4 paint(float4 at : SV_Position) : SV_Target {
+
+     impl Bench {
+         fn new() -> Option<Self> {
+-            let cs = compile(SHADERS, s!("work"), s!("cs_5_1")).ok()?;
+-            let vs = compile(SHADERS, s!("corner"), s!("vs_5_1")).ok()?;
+-            let ps = compile(SHADERS, s!("paint"), s!("ps_5_1")).ok()?;
++            let cs = compile(SHADERS, "work", "cs_5_1").ok()?;
++            let vs = compile(SHADERS, "corner", "vs_5_1").ok()?;
++            let ps = compile(SHADERS, "paint", "ps_5_1").ok()?;
+             // SAFETY: plain object creation on a device of our own.
+             unsafe {
+                 let mut device: Option<ID3D12Device> = None;
 diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
-index bf9f095..6eee8e7 100644
+index bf9f095..5ff5ef1 100644
 --- a/crates/victory-gpu/src/lib.rs
 +++ b/crates/victory-gpu/src/lib.rs
 @@ -79,6 +79,8 @@ pub mod list;
@@ -462,8 +858,15 @@ index bf9f095..6eee8e7 100644
  pub mod pipeline;
  #[cfg(windows)]
  mod prepare;
+@@ -132,5 +134,5 @@ pub use inplace::{
+ #[cfg(windows)]
+ pub use watch::{
+     title_memory_committed, title_memory_reading, title_memory_remapped, title_memory_remapping, title_memory_reserved,
+-    title_memory_written, writing as kernel_will_write,
++    title_memory_written, with_title_memory_write, writing as kernel_will_write,
+ };
 diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
-index 864dd2f..b6b93f1 100644
+index 864dd2f..a73de53 100644
 --- a/crates/victory-gpu/src/list.rs
 +++ b/crates/victory-gpu/src/list.rs
 @@ -871,6 +871,48 @@ fn may_write(this: This) {
@@ -515,6 +918,459 @@ index 864dd2f..b6b93f1 100644
  /// Moves a title texture's host copy to `state` in the list, if needed.
  #[cfg(windows)]
  pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+@@ -1479,16 +1521,13 @@ extern "system" fn driver_hint(_: This, _feature: u64, _value: u64) -> u64 {
+     0
+ }
+
+-/// `DispatchX(x, y, z, flags)`: a dispatch with console flags, which the
+-/// host has no use for (the ray-tracing builder dispatches this way).
+-extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, _flags: u32) {
++/// `DispatchX(x, y, z, flags)`: the ray-tracing builder can count threads.
++extern "system" fn dispatch_x(this: This, x: u32, y: u32, z: u32, flags: u32) {
++    count_dispatch();
+     #[cfg(windows)]
+-    state::dispatch(this, x, y, z);
++    with_state(this, |list, s| s.dispatch(list, x, y, z, flags));
+     #[cfg(not(windows))]
+-    {
+-        let _ = (this, x, y, z);
+-        count_dispatch();
+-    }
++    let _ = (this, x, y, z, flags);
+ }
+
+ /// `BeginQuery`/`EndQuery(heap, type, index)`: queries are answered when
+@@ -1755,7 +1794,7 @@ mod state {
+     }
+     pub(super) extern "system" fn dispatch(this: This, x: u32, y: u32, z: u32) {
+         super::count_dispatch();
+-        with_state(this, |list, s| s.dispatch(list, x, y, z));
++        with_state(this, |list, s| s.dispatch(list, x, y, z, 0));
+     }
+     /// `DispatchMesh(x, y, z)` (the PC method of List6); the title's mesh
+     /// programs take `x` groups only.
+diff --git a/crates/victory-gpu/src/memory.rs b/crates/victory-gpu/src/memory.rs
+index 27b4230..e55d3e3 100644
+--- a/crates/victory-gpu/src/memory.rs
++++ b/crates/victory-gpu/src/memory.rs
+@@ -37,14 +37,13 @@
+ //! is the extent of the title's allocation around an address, which the
+ //! memory module of the layer knows and this one does not ask yet.
+ //!
+-//! shortcut: a copy that is numbered is kept for the rest of the run, and
+-//! there are at most [`COPIES`] of them (4 MiB windows mostly: 4 GiB at
+-//! most). Every dispatch of such a shader brings all numbered copies up to
+-//! date and, if it can store, declares all of them written (the bytes are
++//! shortcut: numbered copies stay for the run within a slot and byte budget;
++//! reclaiming them needs fence-aware retirement. Every dispatch of such a
++//! shader brings the published guest spans up to date and, if it can store,
++//! declares them written (the bytes are
+ //! compared on the CPU afterwards, as for any unordered access view): a
+ //! dirty-page mask written by the shader would bound both.
+
+-use std::collections::HashMap;
+ use std::sync::{Arc, Mutex};
+
+ use victory_shader::emit::{MEMORY_FAULTS, MEMORY_PAGES};
+@@ -54,9 +53,11 @@ use crate::descriptor::host::HostHeap;
+ use crate::host::{HostList, host};
+ use crate::shadow::Shadow;
+
+-/// Copies that can be numbered (the run of heap slots is one longer). A
+-/// listed frame of the opening cutscene names about 50 windows.
+-const COPIES: u32 = 1023;
++/// Slot zero is null. The remaining slots hold one-based copy IDs.
++pub(crate) const RAW_VIEW_SLOTS: u32 = 4096;
++const COPIES: usize = RAW_VIEW_SLOTS as usize - 1;
++/// Sum of numbered D3D12 buffer widths, excluding staging and other mirrors.
++const COPY_BYTES: u64 = 8 << 30;
+ /// A window of memory outside buffers (`shadow.rs`).
+ const CELL: u64 = 4 << 20;
+ /// A directory page.
+@@ -68,9 +69,9 @@ struct Memory {
+     faults: (ID3D12Resource, *mut u32, u64),
+     /// Copy `n` is `copies[n - 1]`.
+     copies: Vec<Arc<Shadow>>,
+-    /// Per host view heap (by address): the first slot of its run, and how
+-    /// many copies have their view there.
+-    heaps: HashMap<usize, (u32, u32)>,
++    /// Each published span, in order, as (copy index, guest address, bytes).
++    spans: Vec<(usize, u64, u64)>,
++    copy_bytes: u64,
+     /// The frame the faults were last read in.
+     frame: u64,
+     /// Pages asked for this frame that are not the title's memory.
+@@ -83,6 +84,13 @@ unsafe impl Send for Memory {}
+
+ static MEMORY: Mutex<Option<Memory>> = Mutex::new(None);
+
++fn admit_copy(copies: usize, bytes: u64, width: u64) -> Option<u64> {
++    if copies >= COPIES {
++        return None;
++    }
++    bytes.checked_add(width).filter(|&total| total <= COPY_BYTES)
++}
++
+ /// Copies numbered (held for the rest of the run) and their bytes.
+ static NUMBERED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+@@ -100,6 +108,39 @@ pub(crate) struct Ready {
+     pub(crate) base: u32,
+ }
+
++/// A shader word is only a clue to an address. Host heaps and the
++/// runtime's scratch mappings can also be committed and readable.
++fn guest_region(start: u64) -> Option<(u64, u64)> {
++    use windows_sys::Win32::System::Memory::{
++        MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery,
++    };
++
++    let mut info = MEMORY_BASIC_INFORMATION::default();
++    // SAFETY: the address is queried, and the output is local.
++    if unsafe { VirtualQuery(start as *const _, &mut info, size_of_val(&info)) } == 0
++        || info.State != MEM_COMMIT
++        || info.Protect & (PAGE_GUARD | PAGE_NOACCESS) != 0
++    {
++        return None;
++    }
++    let base = info.BaseAddress as u64;
++    let end = base.checked_add(info.RegionSize as u64)?;
++    if start < base || start + PAGE > end {
++        return None;
++    }
++    match info.Type {
++        MEM_PRIVATE if crate::watch::watched_block((start / PAGE) as usize) => Some((base, end)),
++        MEM_MAPPED => crate::inplace::views_between(start as usize, (start + PAGE) as usize)
++            .into_iter()
++            .find_map(|(at, len)| {
++                let at = at as u64;
++                let last = at.checked_add(len as u64)?;
++                (at <= start && start + PAGE <= last).then_some((base.max(at), end.min(last)))
++            }),
++        _ => None,
++    }
++}
++
+ impl Memory {
+     fn new() -> Option<Memory> {
+         let host = host()?;
+@@ -117,7 +158,8 @@ impl Memory {
+             directory: make(u64::from(MEMORY_PAGES) * 2, "directory")?,
+             faults: make(u64::from(MEMORY_FAULTS), "faults")?,
+             copies: Vec::new(),
+-            heaps: HashMap::new(),
++            spans: Vec::new(),
++            copy_bytes: 0,
+             frame: u64::MAX,
+             refused: Default::default(),
+         })
+@@ -143,10 +185,10 @@ impl Memory {
+         if self.refused.contains(&page) {
+             return;
+         }
+-        if !crate::texture::committed(start as *const u8, PAGE as usize) {
++        let Some((owner_start, owner_end)) = guest_region(start) else {
+             self.refused.insert(page);
+             return;
+-        }
++        };
+         // The copy a root view at that address would get; a buffer that
+         // ends inside the page is passed over for what holds all of it.
+         let whole = |s: &Arc<Shadow>| s.offset_in(start).is_some_and(|_| s.left(start) >= PAGE);
+@@ -157,51 +199,61 @@ impl Memory {
+             return;
+         };
+         // SAFETY: a live buffer.
+-        let flags = unsafe { shadow.buffer.GetDesc() }.Flags;
+-        if flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
++        let desc = unsafe { shadow.buffer.GetDesc() };
++        if desc.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0 {
++            return;
++        }
++        let (first, len) = shadow.span();
++        let from = first.max(owner_start).next_multiple_of(PAGE);
++        let to = (first + len).min(owner_end).min((u64::from(MEMORY_PAGES) - 1) * PAGE);
++        let first_byte = shadow.offset(first);
++        let width = desc.Width.min(u64::from(u32::MAX) + 1);
++        let to = to.min(first + width.saturating_sub(first_byte)) / PAGE * PAGE;
++        if start < from || start + PAGE > to {
++            self.refused.insert(page);
+             return;
+         }
+         let n = match self.copies.iter().position(|c| Arc::ptr_eq(c, &shadow)) {
+             Some(n) => n,
+-            None if self.copies.len() < COPIES as usize => {
++            None => {
++                let Some(bytes) = admit_copy(self.copies.len(), self.copy_bytes, desc.Width) else {
++                    static ONCE: std::sync::Once = std::sync::Once::new();
++                    ONCE.call_once(|| tracing::warn!(
++                        copies = self.copies.len(),
++                        bytes = self.copy_bytes,
++                        requested = desc.Width,
++                        COPIES,
++                        COPY_BYTES,
++                        "title memory by address: copy budget exhausted; new pages read zeros"
++                    ));
++                    return;
++                };
++                self.copy_bytes = bytes;
+                 self.copies.push(shadow.clone());
+                 NUMBERED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                 NUMBERED[1].fetch_add(shadow.span().1, std::sync::atomic::Ordering::Relaxed);
+-                let n = self.copies.len() - 1;
+-                // Every page the copy holds whole, not only the one asked
+-                // for: a structure is more than 64 KiB.
+-                // shortcut: a page of a title buffer inside this one that
+-                // has a copy of its own is given this copy too.
+-                let (first, len) = shadow.span();
+-                let mut at = first.next_multiple_of(PAGE);
+-                while at + PAGE <= first + len && at / PAGE < u64::from(MEMORY_PAGES) - 1 {
+-                    // SAFETY: inside the directory's mapping.
+-                    let other = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
+-                    // SAFETY: as above; the offset first, as below.
+-                    unsafe {
+-                        if other.read() == 0 {
+-                            other.add(1).write_volatile((at - first) as u32);
+-                            other.write_volatile(n as u32 + 1);
+-                        }
+-                    }
+-                    at += PAGE;
++                self.copies.len() - 1
++            }
++        };
++        let mut added = None;
++        for at in (from..to).step_by(PAGE as usize) {
++            // SAFETY: the last directory entry is excluded above.
++            let entry = unsafe { self.directory.1.add((at / PAGE) as usize * 2) };
++            // SAFETY: the offset is written before the nonzero copy number.
++            unsafe {
++                if entry.read() == 0 {
++                    entry.add(1).write_volatile(shadow.offset(at) as u32);
++                    entry.write_volatile(n as u32 + 1);
++                    added.get_or_insert(at);
++                    continue;
+                 }
+-                n
+             }
+-            None => {
+-                static ONCE: std::sync::Once = std::sync::Once::new();
+-                ONCE.call_once(|| {
+-                    tracing::warn!(COPIES, "title memory by address: no number left for another copy; its pages read zeros")
+-                });
+-                return;
++            if let Some(start) = added.take() {
++                self.spans.push((n, start, at - start));
+             }
+-        };
+-        let offset = shadow.offset_in(start).unwrap_or(0);
+-        // The offset first: a shader that sees the number sees it too.
+-        // SAFETY: inside the directory's mapping.
+-        unsafe {
+-            entry.add(1).write_volatile(offset as u32);
+-            entry.write_volatile(n as u32 + 1);
++        }
++        if let Some(start) = added {
++            self.spans.push((n, start, to - start));
+         }
+     }
+
+@@ -268,7 +320,6 @@ pub(crate) fn ready(
+         m.refused.clear();
+         m.take_faults();
+     }
+-    let numbered = m.copies.len();
+     for &address in addresses {
+         m.name(address);
+     }
+@@ -286,45 +337,157 @@ pub(crate) fn ready(
+             m.name(u64::from(c) << 8);
+         }
+     }
+-    let key = std::ptr::from_ref(heap) as usize;
+-    let (base, made) = match m.heaps.get(&key) {
+-        Some(&run) => run,
+-        None => {
+-            // Held for the heap's life: not given back with a list's slots.
+-            let base = heap.dynamic(COPIES + 1)?;
+-            heap.null_raw_uav_at(base);
+-            (base, 0)
+-        }
+-    };
+-    for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
+-        let (_, len) = shadow.span();
+-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
+-    }
+-    m.heaps.insert(key, (base, m.copies.len() as u32));
+-    // Once per list, and for copies numbered since: the builder alone
+-    // dispatches hundreds of times a frame.
+-    // shortcut: a copy another list numbers meanwhile is brought up to date
+-    // by that list's submission, which may run after this one's.
+-    const READ: usize = usize::MAX - 0x6d;
+-    const WRITE: usize = usize::MAX - 0x6e;
+-    let first_read = list.first_use(READ);
+-    let first_write = writes && list.first_use(WRITE);
+-    for (n, shadow) in m.copies.iter().enumerate() {
+-        let (start, len) = shadow.span();
+-        if first_read || n >= numbered {
++    let base = heap.raw_page_views(&m.copies)?;
++    // Another list can publish more spans in a copy this one already saw.
++    let (read_from, write_from) = list.guest_span_usage(m.spans.len(), writes);
++    for (i, &(copy, start, len)) in m.spans.iter().enumerate().skip(read_from.min(write_from)) {
++        let shadow = &m.copies[copy];
++        if i >= read_from {
+             shadow.refresh(list, start, len);
+         }
+-        if writes && (first_write || n >= numbered) {
++        if i >= write_from {
+             shadow.gpu_writes(list, start, len);
+         }
+     }
+-    if first_read {
+-        list.keep(&m.directory.0);
+-        list.keep(&m.faults.0);
+-    }
++    // Both buffers belong to the process-wide directory for these lists.
+     Some(Ready {
+         directory: m.directory.2,
+         faults: m.faults.2,
+         base,
+     })
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use windows_sys::Win32::System::Memory::{
++        MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
++    };
++
++    #[test]
++    fn raw_pages_require_guest_memory_ownership() {
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++        for flags in [0, MEM_WRITE_WATCH] {
++            // SAFETY: allocate and release a fresh writable range.
++            let at = unsafe {
++                VirtualAlloc(std::ptr::null(), 2 * PAGE as usize, MEM_RESERVE | MEM_COMMIT | flags, PAGE_READWRITE)
++            };
++            assert!(!at.is_null());
++            let start = at as u64;
++            for address in [start, start + PAGE] {
++                let region = guest_region(address);
++                if flags == 0 {
++                    assert_eq!(region, None);
++                } else {
++                    let (base, end) = region.expect("a guest page");
++                    assert!(start <= base && base <= address);
++                    assert!(address + PAGE <= end && end <= start + 2 * PAGE);
++                }
++            }
++            assert_ne!(unsafe { VirtualFree(at, 0, MEM_RELEASE) }, 0);
++        }
++    }
++
++    #[test]
++    fn raw_mapped_pages_require_a_registered_title_view() {
++        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++        use windows_sys::Win32::System::Memory::{CreateFileMappingW, FILE_MAP_WRITE, MapViewOfFile, UnmapViewOfFile};
++
++        // SAFETY: a temporary anonymous section and a writable view of it.
++        let (section, view) = unsafe {
++            let section = CreateFileMappingW(
++                INVALID_HANDLE_VALUE, std::ptr::null(), PAGE_READWRITE, 0, PAGE as u32, std::ptr::null(),
++            );
++            assert!(!section.is_null());
++            (section, MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, PAGE as usize))
++        };
++        assert!(!view.Value.is_null());
++        let start = view.Value as u64;
++        assert_eq!(guest_region(start), None);
++        crate::inplace::title_memory_view(start as usize, PAGE as usize, section as usize, 0);
++        assert_eq!(guest_region(start), Some((start, start + PAGE)));
++        crate::inplace::views_gone(start as usize, PAGE as usize);
++        assert_eq!(guest_region(start), None);
++        // SAFETY: release the test's view and section handle.
++        unsafe {
++            UnmapViewOfFile(view);
++            CloseHandle(section);
++        }
++    }
++
++    #[test]
++    fn guest_copy_admission_bounds_slots_and_bytes() {
++        assert_eq!(admit_copy(1023, 4350 << 20, CELL), Some(4354 << 20));
++        assert_eq!(admit_copy(COPIES - 1, COPY_BYTES - CELL, CELL), Some(COPY_BYTES));
++        assert_eq!(admit_copy(COPIES, 0, CELL), None);
++        assert_eq!(admit_copy(1, COPY_BYTES - CELL + 1, CELL), None);
++        assert_eq!(admit_copy(1, CELL, u64::MAX), None);
++    }
++
++    #[test]
++    #[ignore = "requires a hardware D3D12 adapter with direct heap indexing; run alone"]
++    fn a_guest_shader_publishes_successive_sizes_before_cpu_reads() {
++        const SOURCE: &str = r#"
++#define RS "RootFlags(CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED), RootConstants(num32BitConstants=3, b0), SRV(t0)"
++cbuffer Args : register(b0) { uint base; uint page; uint size; };
++ByteAddressBuffer directory : register(t0);
++[RootSignature(RS)]
++[numthreads(1, 1, 1)]
++void main() {
++    uint2 entry = directory.Load2(page * 8);
++    RWByteAddressBuffer target = ResourceDescriptorHeap[base + entry.x];
++    target.Store(entry.y + 4, size);
++}
++"#;
++        let host = host().expect("a D3D12 device");
++        let heap = HostHeap::new(false, 1).expect("a shader-visible heap");
++        let code = crate::host::compile(SOURCE, "main", "cs_6_6").expect("guest-memory shader");
++        // SAFETY: both objects are created from the shader's signature and bytecode.
++        let (root, pipeline): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
++            let root = host.device.CreateRootSignature(0, &code).unwrap();
++            let pipeline = host.device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                pRootSignature: std::mem::transmute_copy(&root),
++                CS: D3D12_SHADER_BYTECODE { pShaderBytecode: code.as_ptr().cast(), BytecodeLength: code.len() },
++                ..Default::default()
++            }).unwrap();
++            (root, pipeline)
++        };
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++        let address = (0..32).find_map(|n| {
++            // SAFETY: asks for a fresh allocation within the guest directory's range.
++            let at = unsafe { VirtualAlloc(
++                (0x5_0000_0000 + n * CELL) as *const _,
++                PAGE as usize,
++                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            ) };
++            (!at.is_null()).then_some(at as u64)
++        }).expect("a guest-addressable test allocation");
++        let title = address as *mut [u32; 3];
++        // SAFETY: the three aligned dwords lie in the new allocation.
++        unsafe { title.write([11, 0, 22]) };
++        crate::shadow::register(address as usize, address, PAGE);
++        for size in [128, 272] {
++            let list = host.new_list().unwrap();
++            let bindings = ready(&list, &heap, &[address], &[], true).unwrap();
++            let values = [bindings.base, (address / PAGE) as u32, size];
++            // SAFETY: the list is open and its objects outlive it through execute.
++            unsafe {
++                list.list.SetDescriptorHeaps(&[Some(heap.heap.clone())]);
++                list.list.SetComputeRootSignature(&root);
++                list.list.SetPipelineState(&pipeline);
++                list.list.SetComputeRoot32BitConstants(0, 3, values.as_ptr().cast(), 0);
++                list.list.SetComputeRootShaderResourceView(1, bindings.directory);
++                list.list.Dispatch(1, 1, 1);
++            }
++            list.close();
++            host.execute(&[&list]);
++            // SAFETY: the submitted list has executed and its writes have landed.
++            assert_eq!(unsafe { title.read_volatile() }, [11, size, 22]);
++        }
++        MEMORY.lock().unwrap_or_else(|e| e.into_inner()).take();
++        crate::shadow::unregister(address as usize, address);
++        // SAFETY: the owned allocation's users have completed.
++        assert_ne!(unsafe { VirtualFree(address as *mut _, 0, MEM_RELEASE) }, 0);
++    }
++}
 diff --git a/crates/victory-gpu/src/over.rs b/crates/victory-gpu/src/over.rs
 new file mode 100644
 index 0000000..bfcb24e
@@ -1258,6 +2114,138 @@ index 0000000..dd42b07
 +        assert_eq!(&row[..], [[0u8, 0, 255, 255]; 5].as_flattened());
 +    }
 +}
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 43aaee7..7177ce6 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -155,10 +155,14 @@ fn shader(stage: &'static str, bytes: &[u8]) -> Arc<Shader> {
+ #[cfg(windows)]
+ pub(crate) struct Translated {
+     pub(crate) host: victory_shader::emit::HostShader,
++    /// The console compute program’s threads per group, before wave conversion.
++    pub(crate) threads: Option<[u32; 3]>,
+     pub(crate) used: Vec<victory_shader::UsedResource>,
+     /// Whether the shader's code can store to buffer memory ([`stores`]);
+     /// true when its code is not known.
+     pub(crate) stores: bool,
++    /// Whether the shader can write through the guest-page directory.
++    pub(crate) stores_guest_memory: bool,
+     /// Whether the shader can write through unordered access at all:
+     /// [`stores`], or image stores and atomics ([`image_stores`]). A draw
+     /// or dispatch of a pipeline none of whose shaders can leaves nothing
+@@ -280,7 +284,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
+     };
+     let host = crate::shader_cache::host_shader(container)?;
+     let stores = programs.is_empty() || programs.iter().any(stores);
++    let stores_guest_memory = host.root_srvs.contains(&victory_shader::emit::SLOT_MEMORY)
++        && (programs.is_empty() || programs.iter().any(|p| stores_guest_memory(&p.code)));
+     let writes = stores || programs.iter().any(image_stores);
++    let threads = programs.iter().find_map(|p| match &p.io {
++        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
++        _ => None,
++    });
+     let (picked_stores, picks) = if stores {
+         programs
+             .iter()
+@@ -299,7 +309,16 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
+         })
+         .map(|p| p.used)
+         .unwrap_or_default();
+-    Ok(Translated { host, used, stores, writes, picked_stores, picks })
++    Ok(Translated {
++        host,
++        threads,
++        used,
++        stores,
++        stores_guest_memory,
++        writes,
++        picked_stores,
++        picks,
++    })
+ }
+
+ /// The compute pipelines of the console's ray-tracing structure builder
+@@ -434,8 +453,11 @@ pub(crate) fn walk_held(this: This) -> bool {
+         return false;
+     }
+     // (Asked only for the few programs that walk: the lock is the builder's.)
+-    if BUILDER.lock().unwrap_or_else(|e| e.into_inner()).whole {
+-        return false;
++    {
++        let builder = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
++        if builder.whole && !builder.off {
++            return false;
++        }
+     }
+     if WALKS_HELD.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+         static ONCE: std::sync::Once = std::sync::Once::new();
+@@ -530,6 +552,25 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
+     })
+ }
+
++/// Only `memory_flat` emits writes through the guest directory. Scalar
++/// loads and BVH tests can also write fault notes, which have their own UAV.
++/// shortcut: conservatively include unknown Flat/Global opcodes and indirect
++/// control flow until the translator provides exact write metadata.
++#[cfg(any(windows, test))]
++fn stores_guest_memory(code: &[u8]) -> bool {
++    use victory_shader::gfx10::{Encoding, decode};
++    let Ok(code) = decode(code) else {
++        return true;
++    };
++    code.iter().any(|i| match i.encoding {
++        Encoding::Flat | Encoding::Global => i.name().is_none_or(|n| {
++            (n.contains("store") || n.contains("atomic")) && !n.contains("scratch")
++        }),
++        Encoding::Sop1 => i.name().is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
++        _ => false,
++    })
++}
++
+ /// Whether a console program can store to or do atomics on an image
+ /// (texture) through unordered access, use the global data share, or has
+ /// code that does not decode.
+@@ -1089,6 +1130,40 @@ pub fn save_pipeline_cache() {
+
+ #[cfg(test)]
+ mod tests {
++    #[test]
++    fn raw_guest_writes_are_distinct_from_buffer_and_texture_writes() {
++        let words = |words: &[u32]| words.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<_>>();
++        let end = 0xbf81_0000;
++        let read_and_write_elsewhere = words(&[
++            0xdc30_8000, 0x0500_0005, // global_load_dword
++            0xe078_1000, 0x8003_0d15, // buffer_store_dwordx4
++            0xf020_3f08, 0x0001_0402, // image_store
++            end,
++        ]);
++        let names = |code: &[u8]| {
++            victory_shader::gfx10::decode(code).unwrap().iter().map(|i| i.name()).collect::<Vec<_>>()
++        };
++        assert_eq!(names(&read_and_write_elsewhere), [
++            Some("global_load_dword"), Some("buffer_store_dwordx4"), Some("image_store"),
++            Some("s_endpgm"),
++        ]);
++        assert!(!super::stores_guest_memory(&read_and_write_elsewhere));
++        for (header, name) in [
++            (0xdc70_8000, "global_store_dword"),
++            (0xdcc8_8000, "global_atomic_add"),
++            (0xdc70_0000, "flat_store_dword"),
++        ] {
++            let code = words(&[header, 0x007d_0100, end]);
++            assert_eq!(names(&code)[0], Some(name));
++            assert!(super::stores_guest_memory(&code), "{name}");
++        }
++        let unknown_global = words(&[0xdc00_8000, 0x007d_0100, end]);
++        assert_eq!(names(&unknown_global)[0], None);
++        assert!(super::stores_guest_memory(&unknown_global));
++        assert!(super::stores_guest_memory(&words(&[0xbe80_2008]))); // s_setpc_b64
++        assert!(super::stores_guest_memory(&[0])); // truncated instruction
++    }
++
+     #[cfg(all(windows, feature = "diagnostics"))]
+     #[test]
+     fn skip_hashes_accepts_full_hashes_only() {
 diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
 index 9301295..d81fe50 100644
 --- a/crates/victory-gpu/src/queue.rs
@@ -1396,6 +2384,280 @@ index 9301295..d81fe50 100644
  /// Diagnostics: logs a presented frame that is black after one that was
  /// not, with what was presented and how many draws ran since.
  #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index ce4218d..fbb7442 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -8137,6 +8137,7 @@ mod card_merge_tests {
+                 staging: Some(staging.clone()),
+                 mirror: None,
+                 written: super::written_notes(title.as_ptr() as u64, LEN as u64),
++                me: std::sync::OnceLock::new(),
+                 before: Mutex::new(None),
+                 dirty: Mutex::default(),
+                 sent: Mutex::default(),
+diff --git a/crates/victory-gpu/src/watch.rs b/crates/victory-gpu/src/watch.rs
+index fc0e13f..98f1fc3 100644
+--- a/crates/victory-gpu/src/watch.rs
++++ b/crates/victory-gpu/src/watch.rs
+@@ -1423,7 +1423,7 @@ fn learn_unwatched(first: usize, last: usize) {
+
+ /// Whether block `block` is write-watched memory (asked without resetting
+ /// what the kernel holds).
+-fn watched_block(block: usize) -> bool {
++pub(crate) fn watched_block(block: usize) -> bool {
+     use windows_sys::Win32::System::Memory::GetWriteWatch;
+     let mut found = [0usize; BLOCK / KERNEL_PAGE];
+     let mut count = found.len();
+@@ -1518,6 +1518,8 @@ fn known_view(start: usize) -> bool {
+ }
+
+ struct Guards {
++    /// Block ranges held open by DirectStorage writers, one entry per scope.
++    active_writes: Vec<(usize, usize)>,
+     /// Blocks we made read-only and that were not written since: a write
+     /// (ours announced, or the title's through the handler) gives a block
+     /// its write access back and takes it out. (There was a set of the
+@@ -1590,6 +1592,7 @@ fn view_known() -> bool {
+ }
+
+ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
++    active_writes: Vec::new(),
+     clean: Runs::new(),
+     absent: Runs::new(),
+     parts: BTreeMap::new(),
+@@ -1768,6 +1771,10 @@ pub(crate) fn clean(page: usize) -> bool {
+ }
+
+ impl Guards {
++    fn being_written(&self, block: usize) -> bool {
++        self.active_writes.iter().any(|&(first, last)| first <= block && block < last)
++    }
++
+     /// Whether block `block` is one the guards hold: read-only by our hand
+     /// (clean, opened in part, or held as another view) or noted absent.
+     fn holds(&self, block: usize) -> bool {
+@@ -2070,7 +2077,7 @@ fn protect_aliases_in_runs(g: &mut Guards, from: usize, to: usize) {
+     others.sort_unstable();
+     others.dedup();
+     // As `protect_alias`: guarded already, in whole or in part, or held.
+-    others.retain(|&block| !g.holds(block));
++    others.retain(|&block| !g.holds(block) && !g.being_written(block));
+     let mut i = 0;
+     while i < others.len() {
+         let mut k = i + 1;
+@@ -2132,7 +2139,7 @@ fn protect_alias(g: &mut Guards, block: usize) {
+     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+     // Guarded already, in whole or in part (a part open was written and
+     // is reported so), or held as another view.
+-    if g.holds(block) {
++    if g.holds(block) || g.being_written(block) {
+         return;
+     }
+     let mut old = 0;
+@@ -2150,7 +2157,23 @@ fn protect_alias(g: &mut Guards, block: usize) {
+ }
+
+ /// [`protect`] for one range, without the other views of its pages.
+-fn protect_here(g: &mut Guards, from: usize, to: usize) {
++fn protect_here(g: &mut Guards, mut from: usize, to: usize) {
++    while from < to {
++        let (stop, resume) = g
++            .active_writes
++            .iter()
++            .copied()
++            .filter(|&(first, last)| first < to && from < last)
++            .min_by_key(|&(first, _)| first)
++            .unwrap_or((to, to));
++        if from < stop {
++            protect_run(g, from, stop);
++        }
++        from = resume;
++    }
++}
++
++fn protect_run(g: &mut Guards, from: usize, to: usize) {
+     use windows_sys::Win32::System::Memory::{PAGE_READONLY, VirtualProtect};
+     let set = |from: usize, to: usize| {
+         let mut old = 0;
+@@ -2427,6 +2450,69 @@ pub fn writing(at: usize, len: usize) {
+     crate::descriptor::host::remapped(at, len);
+ }
+
++/// Holds the destination open across a plain DirectStorage write.
++pub fn with_title_memory_write<T>(at: usize, len: usize, write: impl FnOnce() -> T) -> T {
++    if len == 0 {
++        writing(at, len);
++        return write();
++    }
++    let end = at.saturating_add(len);
++    let blocks = (at / BLOCK, end.div_ceil(BLOCK));
++    {
++        let mut g = guards();
++        open(&mut g, at, end);
++        g.active_writes.push(blocks);
++    }
++    let _scope = TitleMemoryWrite { at, len, blocks };
++    crate::descriptor::host::remapped(at, len);
++    write()
++}
++
++struct TitleMemoryWrite {
++    at: usize,
++    len: usize,
++    blocks: (usize, usize),
++}
++
++impl Drop for TitleMemoryWrite {
++    fn drop(&mut self) {
++        let end = self.at.saturating_add(self.len);
++        let (first, last) = self.blocks;
++        let aliases: Vec<_> =
++            crate::inplace::aliases_between(first * BLOCK, last.saturating_mul(BLOCK), usize::MAX)
++                .into_iter()
++                .flat_map(|(page, views)| {
++                    let start = self.at.max(page);
++                    let len = end.min(page.saturating_add(BLOCK)) - start;
++                    views
++                        .into_iter()
++                        .filter(move |&view| view != page)
++                        .map(move |view| (view + (start - page), len))
++                })
++                .collect();
++        {
++            let mut g = guards();
++            open(&mut g, self.at, end);
++            for &(at, len) in &aliases {
++                open_here(&mut g, at, at + len);
++            }
++        }
++        // A submission may already have asked about the range during the write.
++        wrote(self.at, self.len);
++        for (at, len) in aliases {
++            wrote(at, len);
++        }
++        title_memory_written(self.at, self.len, false);
++        let mut g = guards();
++        let entry = g
++            .active_writes
++            .iter()
++            .position(|&blocks| blocks == self.blocks)
++            .unwrap();
++        g.active_writes.swap_remove(entry);
++    }
++}
++
+ /// What `VICTORY_PAGE_WRITES` asks to be done with a write the guards do
+ /// not see once its bytes are there ([`title_memory_written`]), as bits:
+ /// 1, the guarded blocks under it are opened and count as written (host
+@@ -3420,6 +3506,48 @@ mod tests {
+         unsafe { CloseHandle(section as *mut std::ffi::c_void) };
+     }
+
++    #[test]
++    fn plain_writer_excludes_only_its_blocks_from_concurrent_guards() {
++        const SIZE: usize = 3 * BLOCK;
++        let (section, view, alias) = two_views(SIZE);
++        let middle = view + BLOCK;
++        let target = middle + SUB - 1;
++        guard(view, view + SIZE).unwrap();
++        assert!(!writable(target));
++
++        with_title_memory_write(target, 2, || {
++            assert!(writable(target));
++            std::thread::spawn(move || {
++                let mut g = guards();
++                open_here(&mut g, view, view + SIZE);
++                protect_here(&mut g, view / BLOCK, (view + SIZE) / BLOCK);
++                assert!(!writable(view));
++                assert!(writable(target));
++                assert!(!writable(view + 2 * BLOCK));
++
++                let block = alias / BLOCK + 1;
++                protect_aliases(&mut g, block, block + 1);
++                assert!(writable(target));
++                protect_aliases_in_runs(&mut g, block, block + 1);
++                assert!(writable(target));
++                protect_here(&mut g, block, block + 1);
++                assert!(!writable(alias + BLOCK));
++            })
++            .join()
++            .unwrap();
++            // SAFETY: the scope holds these two bytes in its writable view.
++            unsafe { (target as *mut [u8; 2]).write([11, 22]) };
++        });
++
++        assert!(writable(alias + BLOCK));
++        let alias_target = alias + target - view;
++        // SAFETY: the alias still maps the same bytes.
++        assert_eq!(unsafe { (alias_target as *const [u8; 2]).read() }, [11, 22]);
++        assert_eq!(guard(view, view + SIZE), Some(vec![middle / PAGE]));
++        assert!(!writable(target));
++        drop_views(section, &[view, alias], SIZE);
++    }
++
+     /// The title wrote the pages of a guarded texture through another view
+     /// of them: the fault at that view is the guard's to see, and the
+     /// guarded view's next check reports the pages written.
+@@ -3879,6 +4007,7 @@ mod walk_tests {
+             let mut m = Memory { committed, region };
+             let mut old = Old::default();
+             let mut new = Guards {
++                active_writes: Vec::new(),
+                 clean: Runs::new(),
+                 absent: Runs::new(),
+                 parts: std::collections::BTreeMap::new(),
+@@ -4061,6 +4190,7 @@ mod walk_tests {
+         let base = 0x7ff0_0000_0000usize / BLOCK;
+         kinds().placeholders.insert(base, base + 4);
+         let mut g = Guards {
++                active_writes: Vec::new(),
+                 clean: Runs::new(),
+                 absent: Runs::new(),
+                 parts: std::collections::BTreeMap::new(),
+@@ -4174,6 +4304,7 @@ mod walk_tests {
+     fn hot_blocks_are_reported_without_a_guard() {
+         let m = Memory { committed: vec![true; 8], region: vec![0; 8] };
+         let mut g = Guards {
++            active_writes: Vec::new(),
+             clean: Runs::new(),
+             absent: Runs::new(),
+             parts: std::collections::BTreeMap::new(),
+diff --git a/crates/victory-hle/src/modules/dstorage.rs b/crates/victory-hle/src/modules/dstorage.rs
+index d698824..fd8e413 100644
+--- a/crates/victory-hle/src/modules/dstorage.rs
++++ b/crates/victory-hle/src/modules/dstorage.rs
+@@ -1205,24 +1205,12 @@ fn into_destination(
+     fill: impl FnOnce(&mut [u8]) -> Result<usize, HRESULT>,
+ ) -> Result<(), HRESULT> {
+     if request.options & PAGE_DESTINATION == 0 {
+-        // Opens the guarded blocks and tells the GPU side a placed texture
+-        // there changes. `fill` writes from user mode (a file read is read
+-        // beside first, see `execute`), so a block guarded again meanwhile
+-        // faults into the guard instead of failing the write.
+-        victory_gpu::kernel_will_write(request.destination as usize, len);
+-        // SAFETY: the title's destination holds `destination_size` bytes, at
+-        // least `len`, and nothing else writes it until completion.
+-        let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
+-        let filled = fill(out).map(drop);
+-        // Said again now that the bytes are there (upstream's c75fdba holds
+-        // the blocks open over the read and marks them once more at its
+-        // end): a copy or a texture pass that took the memory while the
+-        // read was under way took what was there before. Counted; the
+-        // texture slots under it are made due again if uploaded meanwhile
+-        // (`VICTORY_PAGE_WRITES` unset, `1`, `slots`), the guards opened only
+-        // with `all`.
+-        victory_gpu::title_memory_written(request.destination as usize, len, false);
+-        return filled;
++        return victory_gpu::with_title_memory_write(request.destination as usize, len, || {
++            // SAFETY: the title's destination holds at least `len` bytes
++            // and nothing else writes it until completion.
++            let out = unsafe { std::slice::from_raw_parts_mut(request.destination.cast::<u8>(), len) };
++            fill(out).map(drop)
++        });
+     }
+     let offset = (request.page_offset & 0xffff) as usize;
+     // SAFETY: the title passes a page number per 64 KiB of destination,
 diff --git a/crates/victory-hle/src/modules/ffx.rs b/crates/victory-hle/src/modules/ffx.rs
 new file mode 100644
 index 0000000..c0e5af5
@@ -1585,6 +2847,51 @@ index 51e3590..4e7f910 100644
  pub mod display;
  pub mod dsp;
  #[cfg(windows)]
+diff --git a/crates/victory-shader/src/bvh.rs b/crates/victory-shader/src/bvh.rs
+index 1594c36..9b1ae76 100644
+--- a/crates/victory-shader/src/bvh.rs
++++ b/crates/victory-shader/src/bvh.rs
+@@ -208,8 +208,8 @@ pub fn boxes(children: &[u32; 4], boxes: &[[f32; 6]; 4], ray: &Ray, sort: bool)
+         }
+         let enter = near[0].max(near[1]).max(near[2]);
+         let leave = far[0].min(far[1]).min(far[2]);
+-        // A box whose minimum x is NaN is switched off.
+-        if !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
++        // An empty child may have inverted infinite bounds that would sort first.
++        if children[n] != NONE && !b[0].is_nan() && leave >= enter.max(0.0) && enter < ray.extent {
+             ids[n] = children[n];
+             distances[n] = enter;
+         }
+@@ -299,6 +299,29 @@ pub fn half_to_f32(h: u16) -> f32 {
+ pub(crate) mod tests {
+     use super::*;
+
++    #[test]
++    fn empty_children_never_precede_hits() {
++        let inside = |x: f32| [x - 1.0, -1.0, -1.0, x + 1.0, 1.0, 1.0];
++        let empty = [
++            f32::INFINITY,
++            f32::INFINITY,
++            f32::INFINITY,
++            f32::NEG_INFINITY,
++            f32::NEG_INFINITY,
++            f32::NEG_INFINITY,
++        ];
++        let bounds = [inside(30.0), empty, inside(10.0), empty];
++        let ray = Ray::new([0.0; 3], [1.0, 0.0, 0.0], 100.0);
++        assert_eq!(
++            boxes(&[8, NONE, 16, NONE], &bounds, &ray, true),
++            [16, 8, NONE, NONE]
++        );
++        assert_eq!(
++            boxes(&[8, NONE, 16, NONE], &bounds, &ray, false),
++            [8, NONE, 16, NONE]
++        );
++    }
++
+     /// The smallest 16-bit float not below `x` (`up`) or not above it.
+     pub(crate) fn f32_to_half(x: f32, up: bool) -> u16 {
+         let mut best: Option<u16> = None;
 diff --git a/crates/victory-shader/src/dxbc.rs b/crates/victory-shader/src/dxbc.rs
 index 7a20963..b36b512 100644
 --- a/crates/victory-shader/src/dxbc.rs
@@ -1616,6 +2923,1336 @@ index 7a20963..b36b512 100644
      pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
          self.parts.iter().find(|p| p.fourcc == fourcc)
      }
+diff --git a/crates/victory-shader/src/emit/dispatch_tests.rs b/crates/victory-shader/src/emit/dispatch_tests.rs
+new file mode 100644
+index 0000000..df12f80
+--- /dev/null
++++ b/crates/victory-shader/src/emit/dispatch_tests.rs
+@@ -0,0 +1,273 @@
++use super::{HostShader, USER_DISPATCH_THREADS_X, lower};
++use crate::native::{
++    ComputeIo, HwStage, NativeProgram, ResourceType, RootParam, RootType, StageIo, UsedResource,
++};
++use crate::{io, resource, structure};
++
++/// Spilled UAV table as in 7900XTX #66. Count EXEC and OR across both halves.
++/// The group also counts LDS atomics between barriers, then stores all three
++/// results to distinct global thread indices.
++fn fixture(width: u32, spilled: bool) -> NativeProgram {
++    let user_data = if spilled { 16 } else { 0 };
++    let mut words = if spilled {
++        vec![
++            0x870D_FF01,
++            0xFF,        // s_and_b32 s13, s1, 0xff
++            0xBE8C_0300, // s_mov_b32 s12, s0
++            0xF400_0106,
++            125 << 25, // s_load_dword s4, s[12:13], 0
++        ]
++    } else {
++        vec![0xBE84_0300] // s_mov_b32 s4, s0
++    };
++    words.extend([
++        0xBE85_0380, // s_mov_b32 s5, 0
++        0xF408_0202,
++        125 << 25,   // s_load_dwordx4 s[8:11], s[4:5], 0
++        0xBE86_107E, // s_bcnt1_i32_b64 s6, exec
++        0x7E0A_0281, // v_mov_b32 v5, 1
++        0x360C_00BF, // v_and_b32 v6, 63, v0
++        0x2C0C_0C81, // v_lshrrev_b32 v6, 1, v6
++        0x340E_0B06, // v_lshlrev_b32 v7, v6, v5
++    ]);
++    words.extend(super::wave::WAVE_OR_V7_TO_S7);
++    words.extend([
++        0x7E14_0280, // v_mov_b32 v10, 0: LDS address and initial value
++        0xBE94_047E, // s_mov_b64 s[20:21], exec
++        0x7DA4_0080, // v_cmpx_eq_u32 exec, 0, v0
++        0xD834_0000,
++        0x0000_0A0A, // ds_write_b32 v10, v10
++        0xBEFE_0414, // s_mov_b64 exec, s[20:21]
++        0xBF8A_0000, // s_barrier
++        0xD800_0000,
++        0x0000_050A, // ds_add_u32 v10, v5
++        0xBF8A_0000, // s_barrier
++        0xD8D8_0000,
++        0x0B00_000A,                          // ds_read_b32 v11, v10
++        0x7E10_0202,                          // v_mov_b32 v8, s2: groupId.x
++        0x3410_1080 | width.trailing_zeros(), // v_lshlrev_b32 v8, log2(width), v8
++        0x4A10_1100,                          // v_add_nc_u32 v8, v0, v8
++        0x3410_1084,                          // v_lshlrev_b32 v8, 4, v8: byte offset
++        0x7E04_0206,                          // v_mov_b32 v2, s6
++        0x7E06_0207,                          // v_mov_b32 v3, s7
++        0xE070_1000,
++        0x8002_0208, // buffer_store_dword v2, v8 offset:0
++        0xE070_1004,
++        0x8002_0308, // buffer_store_dword v3, v8 offset:4
++        0xE070_1008,
++        0x8002_0B08, // buffer_store_dword v11, v8 offset:8
++        0xBF81_0000, // s_endpgm
++    ]);
++    NativeProgram {
++        stage: HwStage::Cs,
++        wave64: true,
++        vgprs: 16,
++        layout: vec![RootParam {
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            sgprs: 1,
++            base_register: 0,
++            user_data,
++            slot: 0,
++        }],
++        used: vec![UsedResource {
++            kind: ResourceType::Uav,
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            lower_bound: 0,
++            stride: 0,
++            dwords: 4,
++            user_data,
++            slot: 0,
++        }],
++        io: StageIo::Cs(ComputeIo {
++            rsrc2: (2 << 1) | (1 << 7) | (1 << 15), // groupId.x in s2, 512 bytes LDS
++            threads: [width, 1, 1],
++        }),
++        code: words.iter().flat_map(|word| word.to_le_bytes()).collect(),
++    }
++}
++
++fn translated(native: &NativeProgram, paired: bool) -> (HostShader, Option<u32>) {
++    let p = crate::spill::build(native).expect("IR");
++    let st = structure::structure(&p).expect("structure");
++    let io = io::raise(&p, native).expect("I/O");
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resources");
++    let bytes = crate::dxbc::build(&[]);
++    let c = super::Container::parse(&bytes).expect("container");
++    let was = lower::TEST_HOST_WAVE.replace(Some(if paired { 32 } else { 64 }));
++    let result = if paired {
++        super::paired(&c, native, &p, &io, &res)
++    } else {
++        super::emit_program(&c, native, &p, &st, &io, &res)
++    };
++    lower::TEST_HOST_WAVE.set(was);
++    result.expect("translate")
++}
++
++#[test]
++fn paired_dispatch_uses_guest_width_and_spilled_layout() {
++    for width in [64, 128] {
++        for spilled in [true, false] {
++            let native = fixture(width, spilled);
++            for paired in [true, false] {
++                let (shader, wave) = translated(&native, paired);
++                assert_eq!(wave, Some(if paired { 32 } else { 64 }));
++                let words: Vec<_> = shader
++                    .user_data
++                    .iter()
++                    .filter(|u| u.root == RootType::Other(USER_DISPATCH_THREADS_X))
++                    .map(|u| (u.slot, u.dword))
++                    .collect();
++                assert_eq!(words, if spilled { vec![(0, width)] } else { vec![] });
++            }
++        }
++    }
++}
++
++#[cfg(windows)]
++#[test]
++#[ignore = "requires a Wave32 D3D12 device"]
++fn paired_dispatch_74_threads_readback() {
++    use super::host::{Dispatch, Host, Root, View};
++
++    let host = Host::new(false).expect("Wave32 D3D12 hardware");
++    for width in [64u32, 128] {
++        let (shader, wave) = translated(&fixture(width, true), true);
++        assert_eq!(wave, Some(32));
++        let limit = shader
++            .user_data
++            .iter()
++            .find(|u| u.root == RootType::Other(USER_DISPATCH_THREADS_X))
++            .expect("dispatch thread count");
++        let (root, pso) = host.compute_pipeline(&shader).expect("paired pipeline");
++        for count in [74u32, 103, 0] {
++            let mut ud = vec![0; shader.user_data_dwords() as usize];
++            ud[limit.index as usize] = count;
++            let groups = 128 / width;
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch {
++                        roots: vec![(0, Root::Constants(ud))],
++                        views: &[View::RawUav(128 * 4)],
++                        samplers: &[],
++                        groups: [groups, 1, 1],
++                    },
++                )
++                .expect("dispatch and readback");
++            let active = if count == 0 { 128 } else { count };
++            for thread in 0..128u32 {
++                let want = if thread < active {
++                    let wave_count = (active - (thread / 64) * 64).min(64);
++                    let bits = u32::MAX >> (32 - wave_count.div_ceil(2));
++                    let group_count = (active - (thread / width) * width).min(width);
++                    [wave_count, bits, group_count, 0]
++                } else {
++                    [0; 4]
++                };
++                let at = thread as usize * 4;
++                assert_eq!(
++                    out[0][at..at + 4],
++                    want,
++                    "width {width}, count {count}, thread {thread}"
++                );
++            }
++        }
++    }
++}
++
++/// 7900XTX #142's prefix scan, with inkVI's spilled UAV table prologue.
++/// Each console wave writes a subtotal to LDS and reads preceding waves'
++/// subtotals under EXEC. The negative case indexes LDS by the full lane ID.
++pub(super) fn wave_prefix(lane_dependent: bool) -> NativeProgram {
++    let lds_address = if lane_dependent {
++        0x3410_0082 // v_lshlrev_b32 v8, 2, v0
++    } else {
++        0x7E10_0210 // v_mov_b32 v8, s16
++    };
++    let words = [
++        0x2C0E_0086, // v_lshrrev_b32 v7, 6, v0             (the console wave's index)
++        0x3410_0E82, // v_lshlrev_b32 v8, 2, v7
++        0x4A12_0E8A, // v_add_nc_u32 v9, 10, v7
++        0xD760_0013,
++        0x0201_7F09, // v_readlane_b32 s19, v9, 63   (the wave's last lane: the other host wave)
++        0x7E12_0213, // v_mov_b32 v9, s19
++        0xD834_0000,
++        0x0000_0908, // ds_write_b32 v8, v9
++        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++        0xBF8A_0000, // s_barrier
++        0x7E10_0280, // v_mov_b32 v8, 0
++        0xBE80_047E, // s_mov_b64 s[0:1], exec
++        0x7DAA_0E80, // v_cmpx_ne_u32 0, v7
++        0xBF88_0011, // s_cbranch_execz END
++        0xBE86_047E, // s_mov_b64 s[6:7], exec
++        0xBE92_0380, // s_mov_b32 s18, 0
++        0xBE91_0380, // s_mov_b32 s17, 0
++        0xBF82_0002, // s_branch BODY
++        0x87FE_0614, // LOOPTOP: s_and_b64 exec, s[20:21], s[6:7]
++        0x7E22_0508, // v_readfirstlane_b32 s17, v8
++        0x8F10_8212, // BODY: s_lshl_b32 s16, s18, 2
++        0x8112_8112, // s_add_i32 s18, s18, 1
++        lds_address, // LDS address for the next subtotal
++        0xD8D8_0000,
++        0x0800_0008, // ds_read_b32 v8, v8
++        0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++        0x4A10_1011, // v_add_nc_u32 v8, s17, v8
++        0xBE94_047E, // s_mov_b64 s[20:21], exec
++        0x7DA4_0E12, // v_cmpx_eq_u32 s18, v7
++        0x8A86_7E06, // s_andn2_b64 s[6:7], s[6:7], exec
++        0xBF85_FFF3, // s_cbranch_scc1 LOOPTOP
++        0xBEFE_0400, // END: s_mov_b64 exec, s[0:1]
++        0x3402_0082, // v_lshlrev_b32 v1, 2, v0
++        0xE070_1000,
++        0x8002_0801, // buffer_store_dword v8, v1, s[8:11], 0 offen
++    ];
++    let mut native = fixture(256, true);
++    native.code.truncate(8 * 4); // keep only the spilled UAV table prologue
++    native.code.extend(
++        words
++            .into_iter()
++            .chain([0xBF81_0000])
++            .flat_map(u32::to_le_bytes),
++    );
++    native
++}
++
++fn exchange_prefix(lane_dependent: bool) -> Result<(HostShader, Option<u32>), crate::ShaderError> {
++    let native = wave_prefix(lane_dependent);
++    let p = crate::spill::build(&native)?;
++    let st = structure::structure(&p)?;
++    let io = io::raise(&p, &native)?;
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
++    let bytes = crate::dxbc::build(&[]);
++    let c = super::Container::parse(&bytes)?;
++    let was = lower::TEST_HOST_WAVE.replace(Some(32));
++    let result = super::emit_program(&c, &native, &p, &st, &io, &res);
++    lower::TEST_HOST_WAVE.set(was);
++    result
++}
++
++#[test]
++fn exchange_prefix_can_read_a_guarded_wave_uniform_subtotal() {
++    let (shader, wave) = exchange_prefix(false).expect("the uniform prefix scan translates");
++    assert_eq!(wave, Some(32));
++    assert!(
++        shader
++            .user_data
++            .iter()
++            .any(|u| u.root == RootType::Other(USER_DISPATCH_THREADS_X))
++    );
++}
++
++#[test]
++fn exchange_prefix_refuses_a_divergent_subtotal() {
++    let error = exchange_prefix(true).expect_err("a divergent subtotal needs the other half");
++    assert!(
++        error
++            .to_string()
++            .contains("a first-lane read where not every lane runs"),
++        "{error}"
++    );
++}
+diff --git a/crates/victory-shader/src/emit/float64.rs b/crates/victory-shader/src/emit/float64.rs
+index 5a6c16e..26a5331 100644
+--- a/crates/victory-shader/src/emit/float64.rs
++++ b/crates/victory-shader/src/emit/float64.rs
+@@ -56,6 +56,7 @@ impl Lower<'_> {
+         let c = self.cur;
+         let &m = self.x.st.masks.get(&mask).ok_or("a wave reduction's untracked mask")?;
+         let on = self.boolean(m, c)?;
++        let on = self.dispatch_bit(c, on);
+         let (l, h) = (self.i32_of(lo)?, self.i32_of(hi)?);
+         let x = self.masked_double(on, l, h);
+         let r = self.wave_sum_f64(x);
+@@ -93,6 +94,7 @@ impl Lower<'_> {
+                 let c = self.cur;
+                 let [x0, x1] = self.both(|l| {
+                     let on = l.boolean(m, c)?;
++                    let on = l.dispatch_bit(c, on);
+                     let (dl, dh) = (l.i32_of(lo)?, l.i32_of(hi)?);
+                     Ok(l.masked_double(on, dl, dh))
+                 })?;
+diff --git a/crates/victory-shader/src/emit/geometry_tests.rs b/crates/victory-shader/src/emit/geometry_tests.rs
+index 870e2fb..2920827 100644
+--- a/crates/victory-shader/src/emit/geometry_tests.rs
++++ b/crates/victory-shader/src/emit/geometry_tests.rs
+@@ -155,6 +155,7 @@ fn pass_through() -> (HostShader, HostShader) {
+         s.m.terminate(b, Term::Ret);
+     }
+     let host = |stage, s: Shader| HostShader {
++        half_views: Vec::new(),
+         stage,
+         dxil: s.finish(),
+         user_data: Vec::new(),
+diff --git a/crates/victory-shader/src/emit/intersect.rs b/crates/victory-shader/src/emit/intersect.rs
+index 2826156..8460d3f 100644
+--- a/crates/victory-shader/src/emit/intersect.rs
++++ b/crates/victory-shader/src/emit/intersect.rs
+@@ -73,8 +73,8 @@ enum NodeAt {
+     Buffer { handle: V, byte: V },
+     /// In title memory: the raw view of the host copy holding the node's
+     /// first 64 bytes and the node's byte in it ([`Lower::bvh_memory`]),
+-    /// and the node's address, for the second half of a 128-byte node.
+-    Memory { handle: V, byte: V, low: V, high: V },
++    /// and the node's address and residency, for a 128-byte node's split lookup.
++    Memory { handle: V, byte: V, low: V, high: V, mapped: V },
+ }
+
+ /// The ray operands, as floats.
+@@ -209,12 +209,13 @@ impl<'a> Lower<'a> {
+                 // One look for the node's copy, before the branches: a
+                 // node is 64 bytes on 64, so its first half lies in one
+                 // 64 KiB page whatever its kind.
+-                let (handle, byte) = self.bvh_memory(low, high, guard);
++                let (handle, byte, mapped) = self.bvh_memory(low, high, guard);
+                 NodeAt::Memory {
+                     handle,
+                     byte,
+                     low,
+                     high,
++                    mapped,
+                 }
+             }
+         };
+@@ -292,10 +293,8 @@ impl<'a> Lower<'a> {
+     }
+
+     /// Title memory at `low`/`high` for a node's bytes: the raw view of the
+-    /// host copy holding the address and the byte in that view
+-    /// ([`Lower::memory`]: a page the host has no copy of reads zeros and
+-    /// is left for the host to fetch, for lanes that run).
+-    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V) {
++    /// host copy, its byte offset, and whether the page has a copy.
++    fn bvh_memory(&mut self, low: V, high: V, guard: Option<V>) -> (V, V, V) {
+         #[cfg(test)]
+         if let Some((slot, base)) = TEST_MEMORY.get() {
+             // The buffer at heap slot `slot` holds the bytes from title
+@@ -312,35 +311,79 @@ impl<'a> Lower<'a> {
+             let inside = self.s.m.bin(c, Bin::And, in_low, in_high);
+             let outside = self.s.m.i32(0xffff_ff00);
+             let at = self.s.m.select(c, inside, at, outside);
+-            return (handle, at);
++            return (handle, at, inside);
+         }
+-        self.memory(low, high, guard)
++        use super::super::{MEMORY_PAGES, SLOT_MEMORY};
++        let c = self.cur;
++        let last = MEMORY_PAGES - 1;
++        // The generic lookup masks the high word to 8 bits. Send an address
++        // outside the directory to its reserved null entry, even if it aliases.
++        let last_high = self.s.m.i32(last >> 16);
++        let in_range = self.s.m.cmp(c, pred::IULE, high, last_high);
++        let beyond = self.s.m.i32(0xff);
++        let high = self.s.m.select(c, in_range, high, beyond);
++        let shift = self.s.m.i32(16);
++        let page_low = self.s.m.bin(c, Bin::LShr, low, shift);
++        let page_high = self.s.m.bin(c, Bin::Shl, high, shift);
++        let page = self.s.m.bin(c, Bin::Or, page_low, page_high);
++        let last = self.s.m.i32(last);
++        let page = self.s.op(
++            c, "binary.i32", Attr::ReadNone, self.s.t.i32, 40, &[page, last],
++        );
++        let shift = self.s.m.i32(3);
++        let at = self.s.m.bin(c, Bin::Shl, page, shift);
++        let dir = self.s.root_srv_handle(SLOT_MEMORY);
++        let (undef, mask, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i8(3), self.s.m.i32(4));
++        let entry = self.s.op(
++            c,
++            "rawBufferLoad.f32",
++            Attr::ReadOnly,
++            self.s.t.res_ret,
++            139,
++            &[dir, at, undef, mask, align],
++        );
++        let copy = self.s.m.extract(c, entry, 0);
++        let copy = self.as_int(copy);
++        let zero = self.s.m.i32(0);
++        let mapped = self.s.m.cmp(c, pred::NE, copy, zero);
++        let (handle, byte) = self.memory(low, high, guard);
++        (handle, byte, mapped)
+     }
+
+-    /// `count` dwords of the node from its byte `base` + `offset` (`base`
+-    /// computed, `offset` fixed; none of the node's bytes past 127), read
+-    /// four at a time.
++    /// The second half of a Box32 node can have its own guest page and copy.
++    fn bvh_second_half(&mut self, at: NodeAt) -> NodeAt {
++        match at {
++            NodeAt::Buffer { handle, byte } => {
++                let size = self.s.m.i32(64);
++                let byte = self.s.m.bin(self.cur, Bin::Add, byte, size);
++                NodeAt::Buffer { handle, byte }
++            }
++            NodeAt::Memory { low, high, .. } => {
++                let (low, high) = self.address_plus(low, high, 64);
++                let (handle, byte, mapped) = self.bvh_memory(low, high, None);
++                NodeAt::Memory {
++                    handle,
++                    byte,
++                    low,
++                    high,
++                    mapped,
++                }
++            }
++        }
++    }
++
++    /// `count` dwords in one half of a node, read four at a time.
+     fn bvh_node_words(&mut self, at: NodeAt, base: Option<V>, offset: u32, count: u32) -> Vec<V> {
+         let c = self.cur;
+         let (undef, align) = (self.s.m.undef(self.s.t.i32), self.s.m.i32(4));
+-        // The second half of a 128-byte node may lie in the next 64 KiB
+-        // page, which may be in another copy: its own look, made once.
+-        let mut second = None;
++        let (handle, start_byte) = match at {
++            NodeAt::Buffer { handle, byte } | NodeAt::Memory { handle, byte, .. } => (handle, byte),
++        };
+         let mut out = Vec::with_capacity(count as usize);
+         for start in (0..count).step_by(4) {
+             let n = (count - start).min(4);
+             let node_byte = offset + 4 * start;
+-            let (handle, mut byte) = match at {
+-                NodeAt::Buffer { handle, byte } => (handle, byte),
+-                NodeAt::Memory { handle, byte, .. } if node_byte < 64 => (handle, byte),
+-                NodeAt::Memory { low, high, .. } => *second.get_or_insert_with(|| {
+-                    let (low, high) = self.address_plus(low, high, 64);
+-                    // Every lane in this block runs the instruction.
+-                    let (handle, byte) = self.bvh_memory(low, high, None);
+-                    let k64 = self.s.m.i32(64);
+-                    (handle, self.s.m.bin(c, Bin::Sub, byte, k64))
+-                }),
+-            };
++            let mut byte = start_byte;
+             if let Some(b) = base {
+                 byte = self.s.m.bin(c, Bin::Add, byte, b);
+             }
+@@ -377,6 +420,11 @@ impl<'a> Lower<'a> {
+         let p = self.join64(pointer, pointer_high.unwrap_or(zero));
+         let (k3, k6) = (self.s.m.int_const(i64t, 3), self.s.m.int_const(i64t, 6));
+         let p = self.s.m.bin(c, Bin::LShr, p, k3);
++        // A 40-bit base in 256-byte units can address 48 bits. Cap the
++        // node index outside that span so an oversized pointer cannot wrap.
++        let outside = self.s.m.int_const(i64t, 1 << (48 - 6));
++        let too_far = self.s.m.cmp(c, pred::IUGT, p, outside);
++        let p = self.s.m.select(c, too_far, outside, p);
+         let p = self.s.m.bin(c, Bin::Shl, p, k6);
+         let a = self.s.m.bin(c, Bin::Add, base, p);
+         self.s.flags |= flags::INT64;
+@@ -398,7 +446,9 @@ impl<'a> Lower<'a> {
+         // 32-bit floats: 24 dwords from byte 16.
+         self.cur = wide_block;
+         let k16 = self.s.m.i32(16);
+-        let words = self.bvh_node_words(at, None, 16, 24);
++        let mut words = self.bvh_node_words(at, None, 16, 12);
++        let second = self.bvh_second_half(at);
++        words.extend(self.bvh_node_words(second, None, 0, 12));
+         let floats: Vec<V> = words.iter().map(|&w| self.as_float(w)).collect();
+         self.s.m.terminate(wide_block, Term::Br(join));
+         // 16-bit floats: 24 halves in 12 dwords from byte 16, the low half
+@@ -424,6 +474,17 @@ impl<'a> Lower<'a> {
+         }
+         self.s.m.terminate(half_block, Term::Br(join));
+         self.cur = join;
++        // All child IDs are in the first half. Only the last two Box32
++        // bounds also need the second half.
++        let residency = match (at, second) {
++            (NodeAt::Memory { mapped: first, .. }, NodeAt::Memory { mapped: last, .. }) => {
++                let mapped = self.s.m.phi(join, self.s.m.type_of(first));
++                self.s.m.set_phi(mapped, vec![(last, wide_block), (first, half_block)]);
++                let both = self.s.m.bin(join, Bin::And, first, mapped);
++                Some([first, first, both, both])
++            }
++            _ => None,
++        };
+         let mut coords = Vec::with_capacity(24);
+         for n in 0..24 {
+             let phi = self.s.m.phi(join, f32t);
+@@ -473,6 +534,11 @@ impl<'a> Lower<'a> {
+             let on = self.s.m.bin(c, Bin::Xor, off, on);
+             let hit = self.s.m.bin(c, Bin::And, through, before);
+             let hit = self.s.m.bin(c, Bin::And, hit, on);
++            let present = self.s.m.cmp(c, pred::NE, children[n], none);
++            let mut hit = self.s.m.bin(c, Bin::And, hit, present);
++            if let Some(pages) = residency {
++                hit = self.s.m.bin(c, Bin::And, hit, pages[n]);
++            }
+             ids[n] = self.s.m.select(c, hit, children[n], none);
+             distances[n] = self.s.m.select(c, hit, enter, infinity);
+         }
+@@ -616,7 +682,10 @@ impl<'a> Lower<'a> {
+         let back_ahead = self.s.m.cmp(c, pred::OLE, t, fzero);
+         let back = self.s.m.bin(c, Bin::And, back, back_ahead);
+         let ahead = self.s.m.bin(c, Bin::Or, front, back);
+-        let hit = self.s.m.bin(c, Bin::And, inside, ahead);
++        let mut hit = self.s.m.bin(c, Bin::And, inside, ahead);
++        if let NodeAt::Memory { mapped, .. } = at {
++            hit = self.s.m.bin(c, Bin::And, hit, mapped);
++        }
+         let miss = bvh::MISS.map(|f| self.s.m.f32(f.to_bits()));
+         let out = [t, det, v, w];
+         std::array::from_fn(|n| {
+diff --git a/crates/victory-shader/src/emit/intersect_tests.rs b/crates/victory-shader/src/emit/intersect_tests.rs
+index 7ae78ee..e53bd3c 100644
+--- a/crates/victory-shader/src/emit/intersect_tests.rs
++++ b/crates/victory-shader/src/emit/intersect_tests.rs
+@@ -12,7 +12,7 @@
+ //! keeps copies of title memory and their directory, so for the second
+ //! they put a stand-in under the node reader
+ //! (`lower::intersect::TEST_MEMORY`); without it the same program reads
+-//! through the directory, which is only checked to lower and validate.
++//! through the directory, also tested below with synthetic mapped pages.
+
+ use super::host::{Dispatch, Host, Root, Stride, View};
+ use super::lower::intersect::TEST_MEMORY;
+@@ -659,6 +659,125 @@ fn a_descriptor_of_numbers_is_title_memory_read_through_the_directory() {
+     }
+ }
+
++#[test]
++fn guest_bvh_pages_report_misses_without_losing_resident_children() {
++    use super::{MEMORY_FAULTS, MEMORY_PAGES, SLOT_FAULTS, SLOT_MEMORY, USER_MEMORY_BASE};
++
++    const PAGE: usize = 1 << 16;
++    const LAST: u64 = (MEMORY_PAGES as u64 - 1) << 16;
++    let (shader, _) = build(true, WHOLE).expect("lowers through the real directory");
++    assert_eq!(shader.root_uavs, [SLOT_FAULTS]);
++    assert_eq!(shader.root_srvs, [SLOT_MEMORY]);
++    let mut constants = vec![0; shader.user_data_dwords() as usize];
++    let base = shader
++        .user_data
++        .iter()
++        .find(|u| u.root == RootType::Other(USER_MEMORY_BASE))
++        .unwrap();
++    constants[base.index as usize] = 2;
++
++    let bounds = |x: f32| [x - 0.5, -1.0, -1.0, x + 0.5, 1.0, 1.0];
++    let empty = [
++        f32::INFINITY,
++        f32::INFINITY,
++        f32::INFINITY,
++        f32::NEG_INFINITY,
++        f32::NEG_INFINITY,
++        f32::NEG_INFINITY,
++    ];
++    let node = nodes::box32(
++        [0, bvh::NONE, 16, 24],
++        [bounds(3.0), empty, bounds(1.0), bounds(2.0)],
++    );
++    let triangle = nodes::triangles(&[[2.0, 0.0, 2.0], [2.0, 2.0, -2.0], [2.0, -2.0, -2.0]], 9);
++    // The first 64 KiB holds the fault words. The same backing UAV also
++    // holds the two box pages and the triangle page at distinct offsets.
++    let mut backing = vec![0; PAGE];
++    backing[(2 * PAGE - 64) / 4..2 * PAGE / 4].copy_from_slice(&node[..16]);
++    backing[2 * PAGE / 4..2 * PAGE / 4 + 12].copy_from_slice(&node[16..]);
++    backing[3 * PAGE / 4..3 * PAGE / 4 + 16].copy_from_slice(&triangle[..16]);
++    let mut dir = vec![0; 2 * MEMORY_PAGES as usize];
++    for (page, storage) in [(0, 1), (1, 2), (2, 1), (5, 2), (7, 3)] {
++        dir[2 * page..2 * page + 2].copy_from_slice(&[1, (storage * PAGE) as u32]);
++    }
++    let ray = Ray::new([-1.0, 0.0, 0.0], [1.0, 0.0, 0.0], 100.0);
++    let pointers = [
++        (0x0ffc0 >> 3) | 5,                 // both box halves present
++        (0x2ffc0 >> 3) | 5,                 // only the first half present
++        (0x4ffc0 >> 3) | 5,                 // only the second half present
++        (0x60000 >> 3) | 4,                 // absent Box16
++        0x70000 >> 3,                       // present triangle
++        0x80000 >> 3,                       // absent triangle
++        (((1u64 << 40) + 0xffc0) >> 3) | 5, // high bits must not alias page zero
++        (1u64 << 61) | (0xffc0 >> 3) | 5,   // oversized index must not wrap
++        (LAST >> 3) | 4,                    // explicitly reserved null page
++    ];
++    let mut scene = Scene::new();
++    scene.add(node, 32);
++    let batch = [Some((0, 5, ray)); 9];
++    let mut data = buffer(&scene, &batch, 0);
++    for (record, pointer) in data.chunks_exact_mut(RECORD as usize / 4).zip(pointers) {
++        (record[0], record[1]) = (pointer as u32, (pointer >> 32) as u32);
++    }
++    let box_miss = bvh::nothing_in_the_way(5);
++    let tri_miss = bvh::nothing_in_the_way(0);
++    let tri_hit = bvh::intersect(&triangle, 0, &ray, true);
++    assert_ne!(tri_hit, tri_miss);
++    let want = [
++        [16, 24, 0, bvh::NONE],
++        [0, bvh::NONE, bvh::NONE, bvh::NONE],
++        box_miss,
++        box_miss,
++        tri_hit,
++        tri_miss,
++        box_miss,
++        box_miss,
++        box_miss,
++    ];
++    let _one = super::valu_tests::ONE_AT_A_TIME
++        .lock()
++        .unwrap_or_else(|e| e.into_inner());
++    let host = Host::new(false)
++        .or_else(|_| Host::new(true))
++        .expect("an SM 6.6 device");
++    let (root, pso) = host.compute_pipeline_bounded(&shader).unwrap();
++    let out = host
++        .dispatch(
++            &root,
++            &pso,
++            &Dispatch {
++                roots: vec![
++                    (0, Root::Constants(constants)),
++                    (1, Root::Uav(backing)),
++                    (
++                        2,
++                        Root::View {
++                            srv: true,
++                            data: dir,
++                        },
++                    ),
++                ],
++                views: &[
++                    View::Buffer {
++                        data: &data,
++                        stride: Stride::Raw,
++                    },
++                    View::RawUav(4 * THREADS),
++                    View::RawUav(PAGE as u32 / 4), // stands in for the zero-reading null view
++                ],
++                samplers: &[],
++                groups: [1, 1, 1],
++            },
++        )
++        .unwrap();
++    assert_eq!(&out[0][..want.len() * 4], want.as_flattened());
++    assert_eq!(&out[0][want.len() * 4..want.len() * 4 + 4], &BEFORE);
++    let faults = &out[2];
++    for page in [3, 4, 6, 8] {
++        assert_eq!(faults[(1 + page % (MEMORY_FAULTS - 1)) as usize], page);
++    }
++}
++
+ /// With `VICTORY_BVH_NO_HIT=1` a node test over title memory lowers and
+ /// validates, and reads nothing: the program asks the host neither for the
+ /// directory of title memory nor for the list of pages it found no copy
+diff --git a/crates/victory-shader/src/emit/loop_tests.rs b/crates/victory-shader/src/emit/loop_tests.rs
+index 91a4ffe..1c9d29e 100644
+--- a/crates/victory-shader/src/emit/loop_tests.rs
++++ b/crates/victory-shader/src/emit/loop_tests.rs
+@@ -198,6 +198,7 @@ fn element(name: &str, kind: u8, interp: u8, usage: u8) -> SigElement {
+
+ fn host_shader(stage: HwStage, dxil: Vec<u8>) -> HostShader {
+     HostShader {
++        half_views: Vec::new(),
+         stage,
+         dxil,
+         user_data: Vec::new(),
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index 07e5db9..0c8ec26 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -316,6 +316,9 @@ struct Lower<'a> {
+     /// handed to host waves (`wave_base`), and the base made in the entry block.
+     halves: Option<u32>,
+     wave_base: Option<V>,
++    /// Lanes kept for group barriers in an X-counted dispatch. Each paired
++    /// host thread has an independent predicate for its two guest lanes.
++    dispatch_active: Option<[V; 2]>,
+     /// Vertex and mesh outputs holding 16-bit values: row, whether two per
+     /// dword, and the row packed after it.
+     half_outputs: HashMap<u8, (bool, Option<u8>)>,
+@@ -488,12 +491,12 @@ fn need(block: usize) {
+ /// one nothing in the dispatch writes, its address is held alike (or is the offset alone) and
+ /// every lane runs it.
+ fn lane_uniform(
+-    p: &Program,
+-    st: &Structured,
++    x: &Parts<'_>,
+     all: &[bool],
+     waits: &dyn Fn(usize) -> bool,
+     read_only: &dyn Fn(Site) -> bool,
+ ) -> HashSet<Value> {
++    let (p, st) = (x.p, x.st);
+     let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
+     let own_registers = wave_uniform() & 1 != 0;
+     let mut same: HashSet<Value> = HashSet::new();
+@@ -592,9 +595,191 @@ fn lane_uniform(
+             }
+         }
+     }
++    if let Some(tid) = builder_wave_tid(x) {
++        same.extend(guarded_lane_uniform(p, st, all, tid, waits));
++    }
+     same
+ }
+
++/// Wave-uniform values in the builder's guarded prefix scans (7900XTX #142,
++/// based on fxceless #497). Facts grow from known inputs to a fixed point;
++/// a loop-carried value cannot prove itself. A guarded write includes its
++/// retained value, and an LDS read requires an unraced, wave-uniform address.
++fn guarded_lane_uniform(
++    p: &Program,
++    st: &Structured,
++    all: &[bool],
++    wave_tid: Value,
++    waits: &dyn Fn(usize) -> bool,
++) -> HashSet<Value> {
++    let is_mask = |v: Value| st.masks.contains_key(&v) || st.highs.contains_key(&v);
++    let order = crate::ir::reverse_postorder(&p.blocks);
++    let regions = lane_regions(st);
++    let mut same: HashSet<Value> = HashSet::new();
++    let alike_bool = |same: &HashSet<Value>, b: Bool| {
++        st.bools.support(b).iter().all(|a| match a {
++            Atom::Uniform(_) => true,
++            Atom::Lane(v) => same.contains(v),
++            _ => false,
++        })
++    };
++    loop {
++        let before = same.len();
++        let wave_all = if let Some(regions) = &regions {
++            let mut whole = vec![true; st.exits.len()];
++            for (branch, region) in regions {
++                if let LaneExit::Branch { when, .. } = st.exits[*branch]
++                    && !alike_bool(&same, when)
++                {
++                    for (whole, inside) in whole.iter_mut().zip(region) {
++                        *whole &= !*inside;
++                    }
++                }
++            }
++            whole
++        } else {
++            all.to_vec()
++        };
++        for &b in &order {
++            let block = &p.blocks[b];
++            let whole = block
++                .preds
++                .iter()
++                .all(|&q| wave_all.get(q).copied().unwrap_or(false));
++            for phi in &block.phis {
++                if matches!(phi.reg, Reg::V(_)) && whole && phi.args.iter().all(|a| same.contains(a)) {
++                    same.insert(phi.value);
++                }
++            }
++            for (i, inst) in block.insts.iter().enumerate() {
++                let name = inst.name();
++                // under a condition: only one every lane of the console wave holds alike, and
++                // over an old value that is alike too
++                if let Some(g) = st.guards[b][i] {
++                    if !alike_bool(&same, g) {
++                        continue;
++                    }
++                    let old_alike = inst
++                        .writes
++                        .iter()
++                        .filter(|w| matches!(w.0, Reg::V(_)))
++                        .all(|w| inst.read(w.0).is_none_or(|old| same.contains(&old)));
++                    if !old_alike {
++                        continue;
++                    }
++                }
++                // an LDS read at an alike address reads one value in every lane
++                if let Fields::Ds {
++                    addr: Some(Operand::Vector { reg, .. }),
++                    dst: Some(_),
++                    data,
++                    gds: false,
++                    ..
++                } = &inst.fields
++                    && name.starts_with("ds_read")
++                    && !name.contains("_d16")
++                    && data.is_empty()
++                {
++                    if inst.read(Reg::V(*reg)).is_some_and(|a| same.contains(&a))
++                        && lds_unraced(p, (b, i), waits)
++                    {
++                        same.extend(
++                            inst.writes
++                                .iter()
++                                .filter(|w| matches!(w.0, Reg::V(_)))
++                                .map(|w| w.1),
++                        );
++                    }
++                    continue;
++                }
++                let ops = match &inst.fields {
++                    Fields::Valu(v)
++                        if v.dpp.is_none()
++                            && v.sdwa.is_none()
++                            && !name.starts_with("v_mbcnt")
++                            && !name.starts_with("v_cmpx")
++                            && !name.starts_with("v_movrel")
++                            && !name.starts_with("v_swaprel")
++                            && !name.starts_with("v_div_fmas")
++                            && !name.contains("lane") =>
++                    {
++                        v.src.as_slice()
++                    }
++                    _ => continue,
++                };
++                // the thread id's x shifted past the console wave: one value per console wave
++                // The b32 instruction uses only the low five bits of the shift count.
++                if let (
++                    "v_lshrrev_b32",
++                    [Operand::Const(k @ 128..=192), Operand::Vector { reg, .. }, ..],
++                ) = (name, ops)
++                    && ((k - 128) & 31) >= 6
++                    && inst.read(Reg::V(*reg)) == Some(wave_tid)
++                {
++                    same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
++                    continue;
++                }
++                // Implicit VGPR inputs include accumulators and the other side of a swap.
++                let implicit_alike = !(name == "v_swap_b32" || name.contains("mac_"))
++                    || inst
++                        .reads
++                        .iter()
++                        .all(|(reg, value)| !matches!(reg, Reg::V(_)) || same.contains(value));
++                let mask_alike = name != "v_cndmask_b32"
++                    || matches!(ops.get(2), Some(Operand::Scalar { code, .. })
++                        if inst.read(Reg::S(*code))
++                            .and_then(|v| st.masks.get(&v))
++                            .is_some_and(|&b| alike_bool(&same, b)));
++                let operands_alike = ops.iter().all(|op| match *op {
++                    Operand::Vector { reg, dwords } => {
++                        (0..dwords).all(|i| {
++                            reg.checked_add(i)
++                                .and_then(|r| inst.read(Reg::V(r)))
++                                .is_some_and(|v| same.contains(&v))
++                        })
++                    }
++                    Operand::Scalar { code, dwords } if code != NULL => {
++                        (0..dwords).all(|i| {
++                            code.checked_add(i)
++                                .and_then(|r| inst.read(Reg::S(r)))
++                                .is_some_and(|v| !is_mask(v) || same.contains(&v))
++                        })
++                    }
++                    // These sources depend on execution or an implicit register.
++                    Operand::Const(251..=254) | Operand::Attr { .. } => false,
++                    _ => true,
++                });
++                if implicit_alike && mask_alike && operands_alike {
++                    same.extend(inst.writes.iter().filter(|w| w.0 != Reg::Scc).map(|w| w.1));
++                }
++            }
++        }
++        if same.len() == before {
++            return same;
++        }
++    }
++}
++
++/// The thread id's x (`v0` on entry) of a console wave64 compute program whose console waves are
++/// runs of 64 ids along x (a group 64-aligned along x, or one row): `id >> 6` and up is then one
++/// value per console wave. The guarded proof is only needed by the spilled builder programs.
++fn builder_wave_tid(x: &Parts<'_>) -> Option<Value> {
++    let StageIo::Cs(cs) = &x.native.io else {
++        return None;
++    };
++    let [tx, ty, tz] = cs.threads;
++    if !x.native.wave64
++        || !(tx.is_multiple_of(64) || (ty, tz) == (1, 1))
++        || !crate::spill::is_spilled(x.native)
++    {
++        return None;
++    }
++    x.p.inputs
++        .iter()
++        .find(|(r, _)| *r == Reg::V(0))
++        .map(|(_, v)| *v)
++}
++
+ /// Whether no LDS write can run while the read at `at` does, in any wave of the group: none
+ /// lies in the stretch between group barriers that holds the read. The stretch starts where
+ /// the read can be reached from without passing a barrier (going back to the barriers, or the
+@@ -1559,7 +1744,7 @@ impl<'a> Lower<'a> {
+                                 _ => true,
+                             }
+                     };
+-                    lane_uniform(p, x.st, all, &waits, &|_| false)
++                    lane_uniform(x, all, &waits, &|_| false)
+                 }
+                 _ => HashSet::new(),
+             },
+@@ -1574,6 +1759,7 @@ impl<'a> Lower<'a> {
+             pair: None,
+             halves,
+             wave_base: None,
++            dispatch_active: None,
+             flat: None,
+             sums64: HashMap::new(),
+             no_barrier,
+@@ -1643,7 +1829,7 @@ impl<'a> Lower<'a> {
+                     matches!(u.kind, ResourceType::Srv | ResourceType::Cbv)
+                 })
+             };
+-            let uniform = lane_uniform(p, x.st, all, &waits, &read_only);
++            let uniform = lane_uniform(x, all, &waits, &read_only);
+             l.uniform = uniform;
+         }
+         l
+@@ -1789,7 +1975,7 @@ impl<'a> Lower<'a> {
+             .scalar
+             .get(&(b, i))
+             .ok_or("an untracked global address")?;
+-        let guard = self.guard(b, i)?;
++        let guard = self.memory_guard(b, i)?;
+         let Some(Operand::Vector { reg, .. }) = *dst else {
+             return Err("a global load result");
+         };
+@@ -1970,6 +2156,7 @@ impl<'a> Lower<'a> {
+                     .get(&mask)
+                     .ok_or("a wave reduction's untracked mask")?;
+                 let on = self.boolean(m, c)?;
++                let on = self.dispatch_bit(c, on);
+                 let x = self.i32_of(src)?;
+                 let id = self.s.m.i32(ident);
+                 return Ok(self.s.m.select(c, on, x, id));
+@@ -2000,6 +2187,7 @@ impl<'a> Lower<'a> {
+             .get(&mask)
+             .ok_or("a wave reduction's untracked mask")?;
+         let on = self.boolean(m, c)?;
++        let on = self.dispatch_bit(c, on);
+         let x = self.i32_of(src)?;
+         let id = self.s.m.i32(ident);
+         let x = self.s.m.select(c, on, x, id);
+@@ -2172,6 +2360,7 @@ impl<'a> Lower<'a> {
+         let c = self.cur;
+         let [lo, hi] = self.both(|l| {
+             let on = l.boolean(m, c)?;
++            let on = l.dispatch_bit(c, on);
+             let x = l.i32_of(src)?;
+             let id = l.s.m.i32(ident);
+             Ok(l.s.m.select(c, on, x, id))
+@@ -2354,7 +2543,56 @@ impl<'a> Lower<'a> {
+         self.s.m.bin(c, Bin::Or, first, sum)
+     }
+
++    // DexNom bc3cd4b / 7900XTX 810efe5 use the spilled builder layout to
++    // recognize thread-counted DispatchX. Keep padding alive for barriers as
++    // in 7900XTX #66, with separate predicates for inkVI's paired lanes.
++    fn dispatch_thread_count(&mut self) {
++        let StageIo::Cs(cs) = self.x.native.io else {
++            return;
++        };
++        let [width, y, z] = cs.threads;
++        if width <= 1 || y != 1 || z != 1 || !crate::spill::is_spilled(self.x.native) {
++            return;
++        }
++        let entry = self.s.entry;
++        let count = self.host_word(RootType::Other(super::USER_DISPATCH_THREADS_X), 0, width);
++        let Val::I32(group) = self.compute_id("groupId.i32", 94, 0) else {
++            unreachable!()
++        };
++        let width = self.s.m.i32(width);
++        let first = self.s.m.bin(entry, Bin::Mul, group, width);
++        let zero = self.s.m.i32(0);
++        let all = self.s.m.cmp(entry, pred::EQ, count, zero);
++        let active = |l: &mut Self| {
++            let Val::I32(thread) = l.thread_id(0) else {
++                unreachable!()
++            };
++            let x = l.s.m.bin(entry, Bin::Add, first, thread);
++            let inside = l.s.m.cmp(entry, pred::IULT, x, count);
++            l.s.m.bin(entry, Bin::Or, all, inside)
++        };
++        let lo = active(self);
++        let hi = if self.twin.is_some() {
++            self.swap_lanes();
++            let hi = active(self);
++            self.swap_lanes();
++            hi
++        } else {
++            lo
++        };
++        let barrier = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier");
++        if self.twin.is_some() || self.halves.is_some() || self.exchange.is_some() || barrier {
++            self.dispatch_active = Some([lo, hi]);
++        } else {
++            let (body, done) = (self.s.m.new_block(), self.s.m.new_block());
++            self.s.m.terminate(entry, Term::CondBr(lo, body, done));
++            self.s.m.terminate(done, Term::Ret);
++            self.s.entry = body;
++        }
++    }
++
+     fn run(mut self) -> Result<Lowered, Stop> {
++        self.dispatch_thread_count();
+         let p = self.x.p;
+         self.halves_only = self.places_read_as_halves();
+         let order = crate::ir::reverse_postorder(&p.blocks);
+@@ -3417,10 +3655,15 @@ impl<'a> Lower<'a> {
+                     return Err("a lane mask whose lanes depend on its own value");
+                 }
+                 // (the paired form: the upper lanes' bits too, lanes 32-63)
++                let exec = self.x.st.active.contains(&lo);
++                let bit = |l: &mut Self| {
++                    let bit = l.boolean(m, at)?;
++                    Ok(if exec { l.dispatch_bit(at, bit) } else { bit })
++                };
+                 let bits = if self.twin.is_some() {
+-                    self.both(|l| l.boolean(m, at)).map(|[a, b]| (a, Some(b)))
++                    self.both(bit).map(|[a, b]| (a, Some(b)))
+                 } else {
+-                    self.boolean(m, at).map(|a| (a, None))
++                    bit(self).map(|a| (a, None))
+                 };
+                 self.balloting.remove(&lo);
+                 let (bit, upper) = bits?;
+@@ -4170,7 +4413,10 @@ impl<'a> Lower<'a> {
+         };
+         if self.twin.is_some() {
+             let at = at(self)?;
+-            let [lo, hi] = self.both(|l| l.boolean(m, at))?;
++            let [lo, hi] = self.both(|l| {
++                let bit = l.boolean(m, at)?;
++                Ok(l.dispatch_bit(at, bit))
++            })?;
+             let either = self.s.m.bin(at, Bin::Or, lo, hi);
+             self.s.flags |= flags::WAVE_OPS;
+             return Ok(self.s.op(at, "waveAnyTrue", Attr::NoUnwind, self.s.t.i1, 113, &[either]));
+@@ -4181,6 +4427,7 @@ impl<'a> Lower<'a> {
+         }
+         let at = at(self)?;
+         let bit = self.boolean(m, at)?;
++        let bit = self.dispatch_bit(at, bit);
+         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+         let some = self.s.op(at, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[bit]);
+         self.s.flags |= flags::WAVE_OPS;
+@@ -4207,7 +4454,10 @@ impl<'a> Lower<'a> {
+             // says what it says on the console (no set bit for "some lane", no objection to
+             // "every lane").
+             let c = self.cur;
+-            let [lo, hi] = self.both(|l| l.boolean(when, c))?;
++            let [lo, hi] = self.both(|l| {
++                let bit = l.boolean(when, c)?;
++                Ok(l.dispatch_vote(c, bit, any))
++            })?;
+             let pair = self.s.m.bin(c, if any { Bin::Or } else { Bin::And }, lo, hi);
+             self.s.flags |= flags::WAVE_OPS;
+             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+@@ -4219,6 +4469,7 @@ impl<'a> Lower<'a> {
+             // the lanes here, and "every lane's bit is clear" is true of the others anyway.
+             let c = self.cur;
+             let mine = self.boolean(when, c)?;
++            let mine = self.dispatch_vote(c, mine, any);
+             let i1t = self.s.t.i1;
+             self.s.flags |= flags::WAVE_OPS;
+             let (name, code) = if any { ("waveAnyTrue", 113) } else { ("waveAllTrue", 114) };
+@@ -4242,6 +4493,7 @@ impl<'a> Lower<'a> {
+             let t = self.s.m.bool(true);
+             self.s.m.bin(c, Bin::Xor, mine, t)
+         };
++        let set = self.dispatch_bit(c, set);
+         let (i1t, i32t) = (self.s.t.i1, self.s.t.i32);
+         let some = self.s.op(c, "waveAnyTrue", Attr::NoUnwind, i1t, 113, &[set]);
+         self.s.flags |= flags::WAVE_OPS;
+@@ -4253,6 +4505,14 @@ impl<'a> Lower<'a> {
+         Ok(self.s.m.cmp(c, if any { pred::NE } else { pred::EQ }, both, z))
+     }
+
++    /// A padded lane cannot cast a vote against a wave-wide condition.
++    fn dispatch_vote(&mut self, at: usize, bit: V, any: bool) -> V {
++        let Some(lanes) = self.dispatch_active else { return bit };
++        let active = lanes[usize::from(self.upper)];
++        let neutral = self.s.m.bool(!any);
++        self.s.m.select(at, active, bit, neutral)
++    }
++
+     /// Whether every lane runs IR block `b` (always true without `exchange`).
+     fn all_lanes(&self, b: usize) -> bool {
+         self.exchange.as_ref().is_none_or(|(_, _, all)| all.get(b).copied().unwrap_or(false))
+@@ -4324,6 +4584,25 @@ impl<'a> Lower<'a> {
+         }
+     }
+
++    /// Intersect EXEC with the guest lanes launched in a padded group.
++    fn dispatch_guard(&mut self, at: usize, guard: Option<V>) -> Option<V> {
++        let Some(lanes) = self.dispatch_active else { return guard };
++        let active = lanes[usize::from(self.upper)];
++        Some(match guard {
++            Some(g) => self.s.m.bin(at, Bin::And, active, g),
++            None => active,
++        })
++    }
++
++    fn memory_guard(&mut self, b: usize, i: usize) -> Result<Option<V>, Why> {
++        let guard = self.guard(b, i)?;
++        Ok(self.dispatch_guard(self.cur, guard))
++    }
++
++    fn dispatch_bit(&mut self, at: usize, bit: V) -> V {
++        self.dispatch_guard(at, Some(bit)).expect("a guard was supplied")
++    }
++
+     // ---- results ----
+
+     fn set(&mut self, v: Option<Value>, val: Val) {
+@@ -4713,6 +4992,7 @@ impl<'a> Lower<'a> {
+     /// (a guard, not a branch) is not one. With none, `x` of the wave's first lane here.
+     /// A helper lane of a pixel shader takes its own `x` ([`Self::helper_own`]).
+     fn first_lane(&mut self, x: V, guard: Option<V>) -> (V, V) {
++        let guard = self.dispatch_guard(self.cur, guard);
+         let (first, any) = self.first_lane_of_wave(x, guard);
+         (self.helper_own(x, first), any)
+     }
+@@ -4817,7 +5097,11 @@ impl<'a> Lower<'a> {
+             return self.ring(inst, b, i);
+         }
+         let name = inst.name();
+-        let guard = self.guard(b, i)?;
++        let guard = if name == "ds_swizzle_b32" {
++            self.guard(b, i)?
++        } else {
++            self.memory_guard(b, i)?
++        };
+         let c = self.cur;
+         let offset = u32::from(*offset0) | u32::from(*offset1) << 8;
+         let dst_reg = match dst {
+@@ -4933,6 +5217,16 @@ impl<'a> Lower<'a> {
+                 (u32::from(*offset1) * scale, w),
+             ]
+         };
++        // A padded lane's LDS address may come from a load it skipped.
++        let read_lds = |l: &mut Self, ptr: V| {
++            if l.dispatch_active.is_none() {
++                return l.s.m.load(l.cur, ptr);
++            }
++            let at = l.begin_guarded(guard);
++            let x = l.s.m.load(l.cur, ptr);
++            let zero = l.s.m.i32(0);
++            l.end_guarded(at, &[(x, zero)])[0]
++        };
+         // Bytes and halves: the dword holding them, and their bit position
+         // in it (naturally aligned, so they never straddle dwords).
+         // `_d16` reads fill a register's low half (`_d16_hi` its high half)
+@@ -4958,7 +5252,8 @@ impl<'a> Lower<'a> {
+             let mask = self.s.m.i32((1u32 << bits) - 1);
+             if name.starts_with("ds_read") {
+                 let reg = dst_reg.ok_or("an LDS read result")?;
+-                let w = self.s.m.load(c, p);
++                let w = read_lds(self, p);
++                let c = self.cur;
+                 let x = self.s.m.bin(c, Bin::LShr, w, sh);
+                 let x = if base.contains("_i") {
+                     let k = self.s.m.i32(32 - bits);
+@@ -5021,7 +5316,7 @@ impl<'a> Lower<'a> {
+             for (off, w) in elements {
+                 for k in 0..w {
+                     let p = dword(self, off + 4 * k);
+-                    let x = self.s.m.load(self.cur, p);
++                    let x = read_lds(self, p);
+                     self.write(inst, Reg::V(reg + n), x, guard);
+                     n += 1;
+                 }
+@@ -5442,7 +5737,7 @@ impl<'a> Lower<'a> {
+                 let [(from_lo, x_lo, g_lo), (from_hi, x_hi, g_hi)] = self.both(|l| {
+                     let at = l.vgprs(inst, addr, 1)?[0];
+                     let x = l.vgprs(inst, data, 1)?[0];
+-                    let guard = l.guard(b, i)?;
++                    let guard = l.memory_guard(b, i)?;
+                     let (o, two) = (l.s.m.i32(offset), l.s.m.i32(2));
+                     let at = l.s.m.bin(c, Bin::Add, at, o);
+                     let from = l.s.m.bin(c, Bin::LShr, at, two);
+@@ -9658,7 +9953,7 @@ impl<'a> Lower<'a> {
+         // A load or sample with no channel enabled returns the first.
+         let dmask = if *dmask == 0 { &1 } else { dmask };
+         let site = (b, i);
+-        let guard = self.guard(b, i)?;
++        let guard = self.memory_guard(b, i)?;
+         let c = self.cur;
+         let (kind, coords) = match dim {
+             0 => (1, 1),
+@@ -10488,7 +10783,7 @@ impl<'a> Lower<'a> {
+             return Err(name);
+         }
+         let site = (b, i);
+-        let guard = self.guard(b, i)?;
++        let guard = self.memory_guard(b, i)?;
+         let c = self.cur;
+         let store = name.starts_with("buffer_store_");
+         // DXIL atomic operations: add, and, or, xor, signed and unsigned
+@@ -11648,6 +11943,41 @@ mod tests {
+
+     const S_ENDPGM: u32 = 0xBF81_0000;
+
++    #[test]
++    fn guarded_prefix_proves_only_the_wave_uniform_subtotal() {
++        for lane_dependent in [false, true] {
++            let native = crate::emit::dispatch_tests::wave_prefix(lane_dependent);
++            let p = crate::spill::build(&native).unwrap();
++            let st = structure::structure(&p).unwrap();
++            let all = super::all_lane_blocks(&st).unwrap();
++            let tid = p.inputs.iter().find(|(r, _)| *r == super::Reg::V(0)).unwrap().1;
++            let values = super::guarded_lane_uniform(&p, &st, &all, tid, &|_| true);
++            let read = p.blocks.iter().flat_map(|b| &b.insts)
++                .find(|i| i.name() == "v_readfirstlane_b32").unwrap();
++            let subtotal = read.read(super::Reg::V(8)).unwrap();
++            assert_eq!(values.contains(&subtotal), !lane_dependent);
++            let without_wait = super::guarded_lane_uniform(&p, &st, &all, tid, &|_| false);
++            assert!(!without_wait.contains(&subtotal));
++        }
++    }
++
++    #[test]
++    fn guarded_wave_proof_uses_the_effective_shift_count() {
++        for shift in 0..=64u32 {
++            // v_lshrrev_b32 v7, shift, v0
++            let words = [0x2C0E_0080 + shift, S_ENDPGM];
++            let code: Vec<_> = words.into_iter().flat_map(u32::to_le_bytes).collect();
++            let p = ir::build(&code, true, 8).unwrap();
++            let st = structure::structure(&p).unwrap();
++            let inst = &p.blocks[0].insts[0];
++            let tid = inst.read(super::Reg::V(0)).unwrap();
++            let value = inst.write(super::Reg::V(7)).unwrap();
++            let uniform = super::guarded_lane_uniform(&p, &st, &[true], tid, &|_| false);
++            assert_eq!(uniform.contains(&value), (shift & 31) >= 6, "shift {shift}");
++        }
++    }
++
++
+     /// A program's constant table starts after its instructions, unless a
+     /// load at a fixed offset reads below that.
+     #[test]
+diff --git a/crates/victory-shader/src/emit/mask_join_tests.rs b/crates/victory-shader/src/emit/mask_join_tests.rs
+index 2357cb6..c7dd97b 100644
+--- a/crates/victory-shader/src/emit/mask_join_tests.rs
++++ b/crates/victory-shader/src/emit/mask_join_tests.rs
+@@ -86,6 +86,7 @@ fn build(words: &[u32]) -> Result<HostShader, crate::ShaderError> {
+         mesh_stride: 0,
+     })?;
+     let shader = HostShader {
++        half_views: Vec::new(),
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 8dd9833..9dda355 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -92,6 +92,8 @@
+ mod amplify;
+ mod bitcode;
+ mod container;
++#[cfg(test)]
++mod dispatch_tests;
+ #[cfg(all(test, windows))]
+ mod descriptor_tests;
+ #[cfg(all(test, windows))]
+@@ -149,7 +151,8 @@ pub use rect::rect_list_gs;
+ pub use shader::{
+     LOOP_NOTE_DWORDS, LOOP_NOTES, MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE,
+     SLOT_FAULTS, SLOT_LOOPS, SLOT_MEMORY, SLOT_STRIDES, SLOT_STRIDES_COUNT, USER_DATA_SPACE,
+-    USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS, set_view_heap_limit,
++    USER_DISPATCH_THREADS_X, USER_GROUP_BASE, USER_MEMORY_BASE, USER_VIEW_ADDRESS, USER_VIEW_BIAS,
++    set_view_heap_limit,
+     view_heap_limit,
+ };
+
+@@ -2005,6 +2008,7 @@ mod tests {
+             return;
+         };
+         let cs = super::HostShader {
++            half_views: Vec::new(),
+             stage: super::HwStage::Cs,
+             dxil,
+             user_data: l.user_data,
+diff --git a/crates/victory-shader/src/emit/shader.rs b/crates/victory-shader/src/emit/shader.rs
+index a2d130b..b6a299c 100644
+--- a/crates/victory-shader/src/emit/shader.rs
++++ b/crates/victory-shader/src/emit/shader.rs
+@@ -93,6 +93,9 @@ pub const USER_VIEW_BIAS: u32 = 0x103;
+ /// Not asked by programs with a spilled user-data table (their root
+ /// signature is close to the host's 64 dwords).
+ pub const USER_GROUP_BASE: u32 = 0x104;
++/// A DispatchX thread count along X (0 for all lanes). Its metadata's slot is
++/// 0 and its dword is the guest group width, even when the host pairs lanes.
++pub const USER_DISPATCH_THREADS_X: u32 = 0x106;
+
+ /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
+ pub(crate) mod flags {
+diff --git a/crates/victory-shader/src/emit/valu_tests.rs b/crates/victory-shader/src/emit/valu_tests.rs
+index be472b8..b7a8adf 100644
+--- a/crates/victory-shader/src/emit/valu_tests.rs
++++ b/crates/victory-shader/src/emit/valu_tests.rs
+@@ -2008,6 +2008,7 @@ void main() {
+         .expect("dxc");
+     assert!(o.status.success(), "dxc: {}", String::from_utf8_lossy(&o.stderr));
+     let shader = HostShader {
++        half_views: Vec::new(),
+         stage: HwStage::Cs,
+         dxil: std::fs::read(&out).unwrap(),
+         user_data: Vec::new(),
+@@ -2647,6 +2648,9 @@ fn image_gather4_c_lz_and_offset_match_rdna2() {
+                 mesh_stride: 0,
+             })?;
+             let shader = HostShader {
++                half_views: Vec::new(),
++                root_indexed_views: Vec::new(),
++                root_uavs: Vec::new(),
+                 stage: HwStage::Cs,
+                 dxil: lowered.dxil,
+                 user_data: lowered.user_data,
+diff --git a/crates/victory-shader/src/emit/wave64_tests.rs b/crates/victory-shader/src/emit/wave64_tests.rs
+index 27f0f47..18fe2cd 100644
+--- a/crates/victory-shader/src/emit/wave64_tests.rs
++++ b/crates/victory-shader/src/emit/wave64_tests.rs
+@@ -131,6 +131,7 @@ fn lowered_on(
+     lower::TEST_HOST_WAVE.set(was);
+     let lowered = lowered?;
+     Ok(HostShader {
++        half_views: Vec::new(),
+         stage: HwStage::Cs,
+         dxil: lowered.dxil,
+         user_data: lowered.user_data,
 diff --git a/crates/victory-shader/src/gfx10/fields.rs b/crates/victory-shader/src/gfx10/fields.rs
 index 2773b3c..faddc7e 100644
 --- a/crates/victory-shader/src/gfx10/fields.rs

@@ -18,7 +18,7 @@ Configure Rust 1.98.1 and the Windows x64 MSVC cross toolchain
 
 From the LinVxtory root, run `sh build.sh "../linvxtory-renderer"`. The
 wrapper checks all 39 patch hashes and the pinned upstream tree, then
-verifies 218 final build inputs before invoking Cargo. The release
+verifies 219 final build inputs before invoking Cargo. The release
 executable is in `target/x86_64-pc-windows-msvc/release/` under that
 external checkout. The build fetches a pinned helper shader from the
 public base fork. The checkout supplies the same BCPack table exception
@@ -84,5 +84,36 @@ later chapters still need verification on this build.
 | Locked source | Identity |
 | --- | --- |
 | inkVI reference tree | `3535e80cb6d1f7b4adff282678fe41d77f99a22c` |
-| Combined renderer tree | `463835438f93e46dc7b905720b8434bf41355464` |
-| LinVxtory overlay SHA-256 | `5a8213841840ac4e3e9301b219bd24f8976eca3dac9322ac5b513254c3364ac8` |
+| Combined renderer tree used for the FPS table | `463835438f93e46dc7b905720b8434bf41355464` |
+| Ray-tracing preview tree | `c9e8e9e1eed6865010ff237a530cc1dcb33b11d1` |
+| LinVxtory overlay SHA-256 | `16be293bd1180a6bb31f4d93609f12df4894524dc2b6f78a89e311d45ba36d5f` |
+
+
+## Ray-tracing preview
+
+This branch adds DexNom's guest acceleration-structure path and the
+7900XTX Wave32 adaptations. The guarded prefix-scan proof comes from
+7900XTX #142, based on fxceless #497.
+[DexNom renderer change](https://github.com/DexNom/VIctory/commit/bc3cd4b045ff63c52972d29c1bef7e897b94abc7) · [7900XTX Wave32 tails](https://github.com/avatarmanz/VIctory-7900XTX/pull/66) · [7900XTX guarded scan](https://github.com/avatarmanz/VIctory-7900XTX/pull/142) · [fxceless uniformity proof](https://github.com/fxceless/victory-fork/pull/497)
+
+The same release build can enable the preview. After sourcing
+`speed.env`, set these for a separate offline replay.
+
+```sh
+export VICTORY_BVH_BUILDER=1 VICTORY_BVH_HOLD=1 VICTORY_AMBIENT=0
+export VICTORY_GPU_UPLOAD_COPIES=0 VICTORY_CARD_WINDOWS_MB=6144
+```
+
+The RTX 5090 and GE-Proton 11-14 replay created all 53 builder pipelines
+and reached the Series S cell with the movement and camera prompts.
+The preview ran with the ambient substitute disabled. A second replay
+held compute traversal while keeping the
+builder and other settings active. The cell's left wall and shelving
+received visible indirect light with traversal enabled.
+
+The cell's median was **5.1 FPS** with traversal and **7.3 FPS** with
+traversal held. Each median uses nine host samples from seconds 185–235
+of a warmed replay. The traversal run ended manually after 5 minutes
+43 seconds. Window speckling and slow streaming remain, and later
+areas are unverified. Keep a separate shader cache and save directory
+for the preview.
