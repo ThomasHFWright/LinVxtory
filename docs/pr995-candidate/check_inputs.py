@@ -7,8 +7,8 @@ from pathlib import Path
 kit = Path(__file__).resolve().parent
 source = Path(sys.argv[1])
 expected = json.loads((kit / 'source-lock.json').read_text())['source_files_sha256']
-if len(sys.argv) == 3:
-    expected.update(json.loads(Path(sys.argv[2]).read_text()))
+for overlay in sys.argv[2:]:
+    expected.update(json.loads(Path(overlay).read_text()))
 
 extra = {str(p.relative_to(source)) for folder in ('apps', 'crates', '.cargo')
          for p in (source / folder).rglob('*') if p.is_file()} - expected.keys()

@@ -1,7 +1,7 @@
 # PR995 Linux candidate: source and reproduction kit
 
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
-The finished source tree is `9087a7f7796671ddec0f176aa5931be73c514624`.
+The finished source tree is `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
 It retains the published `91b6968` checkpoint, where a player confirmed
 walking, camera control, conversation and mouth movement on an Xbox Wireless
 Controller. The texture and scheduling update changed five files. The latest
@@ -188,6 +188,18 @@ tippythetaidum’s half-view work and the associated Linux tests are recorded
 with the original source patch at commit `4331d2b`. Its matched checkpoint
 runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
 [Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
+
+## Small buffer copies in GPU memory
+
+The standard build includes the small-buffer threshold port from fxceless.
+The default floor stays at 1 MiB. For an opt-in run, set
+`VICTORY_CARD_BUFFERS_MIN_KB=64` and `VICTORY_CARD_BUFFERS_MB=1536` in the
+launch environment. Smaller copies then qualify for GPU memory within the
+renderer’s residency budget. The build verifies the patched source before
+invoking Cargo. [Upstream threshold port](https://github.com/fxceless/victory-fork/commit/c36971b213770e48f513f0d6e3ced3f1f65a32b2)
+
+OctoAlgo measured the threshold on their fork and ran a combined experiment
+on PR995. [RTX 5090 measurements](../linux-notes-5090.md) · [Local RTX 5090 comparison](validation.md#small-buffer-eligibility-on-an-rtx-5090)
 
 ## Linux preset and runtime
 
