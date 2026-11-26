@@ -14,9 +14,16 @@ and reached the rendered room. Two windows using the same checkpoint measured:
 | +180..330 seconds | 766 / 142.81 | 5.364 | 0.709 |
 | +330..480 seconds | 816 / 148.14 | 5.508 | 0.720 |
 
-Opposing inputs turned the camera toward opposite room features and back.
-These are bounded-window observations, not a completed stability test.
-Thirty-minute stability remains pending; walking is not yet verified.
+The run completed its 30-minute limit. The harness closed the game after
+1,801.97 seconds. No NVIDIA Xid, title crash report or memory-limit kill was
+observed. Over nearly 25 minutes following world load, the renderer delivered
+7,276 presents in 1,492.97 seconds (4.87 FPS). The comparison build delivered
+1,039 in 1,494.99 seconds (0.70 FPS).
+
+Opposite controller inputs turned the camera from the window to the bunks and
+back. Holding the mapped left trigger at the tutorial changed the view and
+advanced its instruction. Releasing it restored the original prompt. Walking
+remains unverified, and some lighting, hair and surfaces render incorrectly.
 
 Frozen executable SHA256:
 `c24b8578d2a8d51882f2d2c3b5b983383e85235d8a9d7d0758aa4b131d203403`.

@@ -26,7 +26,10 @@ performance, controllable gameplay, then more complete textures and models.
 CachyOS with an RTX 5090.** The previous Linux build measured 0.71 and 0.72 FPS
 in the same two windows after loading a copy of the same story checkpoint.
 The camera turned from the window to the bunks and back in response to opposite
-controller inputs. Hair and some surfaces still have rendering defects.
+controller inputs. The game also accepted the left trigger at the aiming tutorial.
+The offline run completed 30 minutes before the test harness closed it. Across
+nearly 25 minutes of world rendering it averaged **4.87 FPS**, versus **0.70 FPS**
+on the comparison build. Hair, lighting and some surfaces still have rendering defects.
 
 Download the tested executable from the [PR995 Linux release](https://github.com/ThomasHFWright/LinVictory/releases/tag/linux-pr995-c24b8578).
 It uses the indexed GE-Proton 11-14 runtime and the supplied PR995 preset with

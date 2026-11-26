@@ -30,8 +30,7 @@ neither republishes them nor bypasses the policy. The source manifest records
 hashes of required inputs, not their contents.
 
 The frozen candidate separately passed three offline CLI smoke checks. The
-source-kit preparation ran no title or GPU jobs. LinVictory's GPU and bounded
-frame-rate results are described in the README; 30-minute stability remains
-pending. Raw logs, screenshots, checkpoints, caches and runtime binaries are
+source-kit preparation ran no title or GPU jobs. The [run report](README.md) records the four real GPU pipeline checks,
+the completed 30-minute checkpoint trial and the accepted tutorial input. Raw logs, screenshots, checkpoints, caches and runtime binaries are
 excluded. All validation here concerns this exact candidate and kit, not
 OctoAlgo's unpublished combined renderer.
