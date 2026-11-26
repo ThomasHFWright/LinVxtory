@@ -99,6 +99,23 @@ index 49180ea..8685c1a 100644
 +        }
 +    }
 +}
+diff --git a/crates/victory-gpu/src/cpuwait.rs b/crates/victory-gpu/src/cpuwait.rs
+index 26d041c..2ec2530 100644
+--- a/crates/victory-gpu/src/cpuwait.rs
++++ b/crates/victory-gpu/src/cpuwait.rs
+@@ -33,6 +33,12 @@
+ use std::sync::OnceLock;
+ use std::sync::atomic::{AtomicU64, Ordering};
+
++/// Trace individual memory waits even in normal release builds.
++pub(crate) fn trace_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_MEMORY_WAIT").is_some_and(|value| value == "1"))
++}
++
+ /// A "title wrote under shader writes" settle with the relay's second stage
+ /// waits only until the flights that declared shader writes in what the
+ /// submission refreshes have landed, not until nothing is in the air
 diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
 index 7ba71f7..d68d70f 100644
 --- a/crates/victory-gpu/src/descriptor.rs
@@ -675,7 +692,7 @@ index 1b5a344..68a5198 100644
 
  /// The host command signature for a split dispatch's records
 diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
-index 5c32919..d12c4ee 100644
+index 5c32919..1d3ddf9 100644
 --- a/crates/victory-gpu/src/host.rs
 +++ b/crates/victory-gpu/src/host.rs
 @@ -3903,6 +3903,9 @@ struct Deferred {
@@ -696,7 +713,48 @@ index 5c32919..d12c4ee 100644
                  card: None,
                  back: Vec::new(),
                  read_back: Vec::new(),
-@@ -13792,6 +13796,18 @@ impl HostList {
+@@ -7372,6 +7376,7 @@ pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
+
+ /// Settles the flights in the air, if any ([`Host::settle`]), for reason
+ /// `why` (one of the `WHY_` places). Not from inside a submission.
++#[track_caller]
+ pub(crate) fn settle_now(why: usize) {
+     if !late() {
+         return;
+@@ -7384,6 +7389,7 @@ pub(crate) fn settle_now(why: usize) {
+ }
+
+ /// [`settle_now`] at a present, and for a fence the title blocks on.
++#[track_caller]
+ pub(crate) fn settle_for_present() {
+     settle_now(WHY_SYNC);
+ }
+@@ -10666,8 +10672,24 @@ impl Host {
+     /// Everything in the air is settled, never the first flights alone:
+     /// the merge writes the copies' CPU side, which a flight still on the
+     /// card may be writing too.
++    #[track_caller]
+     fn settle(&self, submitted: &mut u64, why: usize) {
++        let timing =
++            (why == WHY_SYNC && crate::cpuwait::trace_enabled()).then(std::time::Instant::now);
+         self.settle_needing(submitted, why, u64::MAX);
++        if let Some(start) = timing {
++            let elapsed = start.elapsed();
++            if elapsed.as_millis() >= 2 {
++                let site = std::panic::Location::caller();
++                tracing::info!(
++                    target: "victory_gpu::memory_wait",
++                    file = site.file(),
++                    line = site.line(),
++                    wait_us = elapsed.as_micros() as u64,
++                    "synchronous settle"
++                );
++            }
++        }
+     }
+
+     /// [`settle_lists`] at 2: waits until the card has run the flights up
+@@ -13792,6 +13814,18 @@ impl HostList {
          self.deferred().textures.insert(key)
      }
 
@@ -715,23 +773,52 @@ index 5c32919..d12c4ee 100644
      pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
          let view = view.as_raw() as usize;
          let source = source.as_raw() as usize;
-@@ -15993,13 +16009,29 @@ impl Host {
-     /// as frame `frame` (saved if captures are on). `None` if nothing was
-     /// shown; else, in diagnostics builds, whether the frame was black.
-     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
-+        self.present_planes(texture, state, frame, None)
-+    }
+@@ -15458,16 +15492,20 @@ fn swap_format(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+
+ const BUFFERS: u32 = 2;
+
++struct PresentList {
++    commands: HostList,
++    overlay: Option<crate::over::Pass>,
++    flight: u64,
++}
 +
-+    pub(crate) fn present_planes(
+ struct Presenter {
+     swap_chain: IDXGISwapChain3,
+     width: u32,
+     height: u32,
+     format: DXGI_FORMAT,
+-    copy: HostList,
+-    /// With presents sent ahead ([`late_free_present`]): a list for each
+-    /// present in the air, and the submission it last flew as (it is used
+-    /// again once that one has finished).
+-    ahead: Vec<(HostList, u64)>,
++    copy: PresentList,
++    /// Presents sent ahead each keep their descriptor slots until they finish.
++    ahead: Vec<PresentList>,
+     hwnd: HWND,
+     meter: Meter,
+ }
+@@ -15989,17 +16027,28 @@ impl Meter {
+ }
+
+ impl Host {
+-    /// Shows `texture`, which is in `state` (a host state) and stays in it,
+-    /// as frame `frame` (saved if captures are on). `None` if nothing was
+-    /// shown; else, in diagnostics builds, whether the frame was black.
+-    pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
++    /// Shows a tracked title texture and optional UI overlay in our window.
++    pub(crate) fn present(
 +        &self,
-+        texture: &ID3D12Resource,
-+        state: u32,
++        source: &std::sync::Arc<crate::resource::HostTexture>,
 +        frame: u64,
-+        over: Option<(&ID3D12Resource, u32)>,
++        overlay: Option<&std::sync::Arc<crate::resource::HostTexture>>,
 +    ) -> Option<bool> {
          let showing = std::time::Instant::now();
 -        let shown = self.present_now(texture, state, frame);
-+        let shown = self.present_now(texture, state, frame, over);
++        // Queue workers can present while they hold the drain lock.
++        crate::queue::before_sync();
++        let shown = self.present_now(source, frame, overlay);
          crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
          shown
      }
@@ -739,24 +826,95 @@ index 5c32919..d12c4ee 100644
 -    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
 +    fn present_now(
 +        &self,
-+        texture: &ID3D12Resource,
-+        state: u32,
++        source: &std::sync::Arc<crate::resource::HostTexture>,
 +        frame: u64,
-+        over: Option<(&ID3D12Resource, u32)>,
++        over: Option<&std::sync::Arc<crate::resource::HostTexture>>,
 +    ) -> Option<bool> {
++        let texture = &source.texture;
          // SAFETY: a live resource.
          let desc = unsafe { texture.GetDesc() };
          let Some(format) = swap_format(desc.Format) else {
-@@ -16058,7 +16090,7 @@ impl Host {
+@@ -16021,6 +16070,7 @@ impl Host {
+         if (p.width, p.height, p.format) != (width, height, format) {
+             // Presents sent ahead hold back buffers until they have run.
+             settle_now(WHY_SYNC);
++            p.ahead.clear();
+             // SAFETY: no back buffer is held; every submission was waited for.
+             let resized = unsafe {
+                 p.swap_chain
+@@ -16044,7 +16094,7 @@ impl Host {
+                 }
+             }
+         }
+-        let state = D3D12_RESOURCE_STATES(state as i32);
++        let state = D3D12_RESOURCE_STATE_COPY_SOURCE;
+         // SAFETY: our swap chain, list and a live source texture.
+         unsafe {
+             let index = p.swap_chain.GetCurrentBackBufferIndex();
+@@ -16058,22 +16108,45 @@ impl Host {
              let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
              #[cfg(not(feature = "diagnostics"))]
              let read_now = false;
 -            let slot = if late_free_present() && !read_now {
-+            let slot = if late_free_present() && !read_now && over.is_none() {
-                 let finished = FINISHED.load(Ordering::Acquire);
-                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
-                     let list = self.new_list().ok()?;
-@@ -16120,33 +16152,43 @@ impl Host {
+-                let finished = FINISHED.load(Ordering::Acquire);
+-                p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+-                    let list = self.new_list().ok()?;
+-                    list.close();
+-                    p.ahead.push((list, 0));
++            static OVERLAY_AHEAD: OnceLock<bool> = OnceLock::new();
++            let overlay_ahead = *OVERLAY_AHEAD.get_or_init(|| {
++                std::env::var_os("VICTORY_ASYNC_PRESENT_OVERLAY").is_some_and(|value| value == "1")
++            });
++            let finished = FINISHED.load(Ordering::Acquire);
++            for present in &mut p.ahead {
++                if present.flight != 0 && present.flight <= finished {
++                    // Retain the heaps, and drop the old title textures.
++                    present.commands.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
++                    present.flight = 0;
++                }
++            }
++            let slot = if late_free_present()
++                && !read_now
++                && (over.is_none() || (overlay_ahead && crate::queue::forces()))
++            {
++                p.ahead.iter().position(|present| present.flight == 0).or_else(|| {
++                    let commands = self.new_list().ok()?;
++                    commands.close();
++                    p.ahead.push(PresentList { commands, overlay: None, flight: 0 });
+                     Some(p.ahead.len() - 1)
+                 })
+             } else {
+                 None
+             };
+-            let copy = match slot {
+-                Some(i) => &p.ahead[i].0,
+-                None => &p.copy,
++            let present = match slot {
++                Some(i) => &mut p.ahead[i],
++                None => &mut p.copy,
+             };
++            let copy = &present.commands;
++            debug_assert!(present.flight <= FINISHED.load(Ordering::Acquire));
+             copy.reset();
++            // Resolve the real texture states in the prelude under the
++            // submission lock. Each present leaves them in the read states.
++            copy.settle(source, state.0 as u32);
++            if slot.is_some() && over.is_some() {
++                static TOLD: std::sync::Once = std::sync::Once::new();
++                TOLD.call_once(|| tracing::info!("present overlays are submitted ahead with per-list descriptors"));
++            }
+             let list = &copy.list;
+             // `VICTORY_BRIGHTEN`: the image through the curve first, and the
+             // window copies that (`crate::brighten`).
+@@ -16100,7 +16173,6 @@ impl Host {
+                 }
+                 None => {
+                     crate::barstat::record(&list, crate::barstat::Why::Present, &[
+-                        transition(texture, state, D3D12_RESOURCE_STATE_COPY_SOURCE),
+                         transition(
+                             &back,
+                             D3D12_RESOURCE_STATE_PRESENT,
+@@ -16120,40 +16192,49 @@ impl Host {
                  .then(|| crate::capture::read_back(&self.device, list, texture))
                  .flatten();
              #[cfg(feature = "diagnostics")]
@@ -776,24 +934,7 @@ index 5c32919..d12c4ee 100644
 -                        D3D12_RESOURCE_STATE_COPY_DEST,
 -                        D3D12_RESOURCE_STATE_PRESENT,
 -                    )]);
-+            if let Some(bright) = &bright {
-+                crate::brighten::Brighten::after_copy(list, bright);
-+            } else {
-+                crate::barstat::record(list, crate::barstat::Why::Present, &[
-+                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
-+                ]);
-+            }
-+            let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-+            let overlay = over.and_then(|(plane, prior)| {
-+                Some((plane, D3D12_RESOURCE_STATES(prior as i32), swap_format(plane.GetDesc().Format)?))
-+            });
-+            let back_state = if let Some((plane, prior, plane_format)) = overlay {
-+                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
-+                let moved = prior.0 & readable.0 == 0;
-+                let mut barriers = vec![transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target)];
-+                if moved {
-+                    barriers.push(transition(plane, prior, readable));
-                 }
+-                }
 -                None => {
 -                    crate::barstat::record(&list, crate::barstat::Why::Present, &[
 -                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
@@ -803,12 +944,28 @@ index 5c32919..d12c4ee 100644
 -                            D3D12_RESOURCE_STATE_PRESENT,
 -                        ),
 -                    ]);
-+                crate::barstat::record(list, crate::barstat::Why::Present, &barriers);
-+                crate::over::record(&self.device, list, &back, format, (width, height), plane, plane_format);
-+                if moved {
-+                    crate::barstat::record(list, crate::barstat::Why::Present, &[transition(plane, readable, prior)]);
-                 }
+-                }
 -            }
++            if let Some(bright) = &bright {
++                crate::brighten::Brighten::after_copy(list, bright);
++            }
++            let overlay = over.and_then(|plane| Some((plane, swap_format(plane.texture.GetDesc().Format)?)));
++            let back_state = if let Some((plane, plane_format)) = overlay {
++                copy.settle(plane, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE.0 as u32);
++                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
++                crate::barstat::record(list, crate::barstat::Why::Present, &[
++                    transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target),
++                ]);
++                crate::over::record(
++                    &mut present.overlay,
++                    &self.device,
++                    list,
++                    &back,
++                    format,
++                    (width, height),
++                    &plane.texture,
++                    plane_format,
++                );
 +                target
 +            } else {
 +                D3D12_RESOURCE_STATE_COPY_DEST
@@ -818,8 +975,30 @@ index 5c32919..d12c4ee 100644
 +            ]);
              copy.close();
              match slot {
-                 Some(i) => {
-@@ -17645,7 +17687,7 @@ void main() {
+-                Some(i) => {
+-                    let flown = self.execute_own(copy);
+-                    p.ahead[i].1 = flown;
++                Some(_) => {
++                    present.flight = self.execute_own(copy);
++                }
++                None => {
++                    let _ = self.submit(&[copy], false);
++                    copy.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                 }
+-                None => self.execute(&[copy]),
+             }
+             #[cfg(feature = "diagnostics")]
+             if let Some((buffer, footprint)) = capture {
+@@ -16227,7 +16308,7 @@ impl Host {
+                 width,
+                 height,
+                 format,
+-                copy,
++                copy: PresentList { commands: copy, overlay: None, flight: 0 },
+                 ahead: Vec::new(),
+                 hwnd,
+                 meter: Meter::new(),
+@@ -17645,7 +17726,7 @@ void main() {
              eprintln!("inflight_tests: skipped, the copy is not in the card's memory (VICTORY_CARD_BUFFERS_MIN_MB=1)");
              return;
          }
@@ -1373,10 +1552,10 @@ index 27b4230..e55d3e3 100644
 +}
 diff --git a/crates/victory-gpu/src/over.rs b/crates/victory-gpu/src/over.rs
 new file mode 100644
-index 0000000..bfcb24e
+index 0000000..49f75df
 --- /dev/null
 +++ b/crates/victory-gpu/src/over.rs
-@@ -0,0 +1,553 @@
+@@ -0,0 +1,521 @@
 +//! A present's second plane, drawn over the first in our window.
 +//!
 +//! The console's display composes the planes of a present. The title in
@@ -1413,30 +1592,14 @@ index 0000000..bfcb24e
 +float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
 +"#;
 +
-+/// Views kept until the list that uses them has run: a present can be sent
-+/// ahead of the card, so a view is not reused for this many presents.
-+///
-+/// shortcut: a fixed count, not derived from how many presents are in
-+/// flight. Presents sent ahead each hold a back buffer and the swap chain
-+/// has two, so no more than a few lists are ever waiting; 16 is well past
-+/// that.
-+const RING: u32 = 16;
-+
-+struct Pass {
++/// Descriptor slots owned by one present list, reused after its fence.
++pub(crate) struct Pass {
 +    format: i32,
 +    root: ID3D12RootSignature,
 +    pipeline: ID3D12PipelineState,
 +    targets: ID3D12DescriptorHeap,
 +    views: ID3D12DescriptorHeap,
-+    target_step: usize,
-+    view_step: u32,
-+    next: u32,
 +}
-+
-+// SAFETY: D3D12 objects are free-threaded.
-+unsafe impl Send for Pass {}
-+
-+static PASS: Mutex<Option<Pass>> = Mutex::new(None);
 +
 +/// A bilinear, clamping sampler at `s0` for the stages `visibility` names.
 +fn bilinear(visibility: D3D12_SHADER_VISIBILITY) -> D3D12_STATIC_SAMPLER_DESC {
@@ -1563,14 +1726,14 @@ index 0000000..bfcb24e
 +        let targets: ID3D12DescriptorHeap =
 +            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
 +                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
-+                NumDescriptors: RING,
++                NumDescriptors: 1,
 +                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
 +                NodeMask: 0,
 +            })?;
 +        let views: ID3D12DescriptorHeap =
 +            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
 +                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
-+                NumDescriptors: RING,
++                NumDescriptors: 1,
 +                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
 +                NodeMask: 0,
 +            })?;
@@ -1578,13 +1741,8 @@ index 0000000..bfcb24e
 +            format: format.0,
 +            root,
 +            pipeline,
-+            target_step: device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
-+                as usize,
-+            view_step: device
-+                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
 +            targets,
 +            views,
-+            next: 0,
 +        })
 +    }
 +}
@@ -1598,6 +1756,7 @@ index 0000000..bfcb24e
 +/// target, viewport, scissor and topology and puts none of them back: it is
 +/// for a list of ours that records nothing of the title's.
 +pub(crate) fn record(
++    pass: &mut Option<Pass>,
 +    device: &ID3D12Device,
 +    list: &ID3D12GraphicsCommandList,
 +    back: &ID3D12Resource,
@@ -1606,7 +1765,6 @@ index 0000000..bfcb24e
 +    plane: &ID3D12Resource,
 +    plane_format: DXGI_FORMAT,
 +) -> bool {
-+    let mut pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
 +    if pass.as_ref().is_none_or(|p| p.format != format.0) {
 +        *pass = match make(device, format) {
 +            Ok(p) => Some(p),
@@ -1621,8 +1779,6 @@ index 0000000..bfcb24e
 +        tracing::info!(format = format.0, "a present's second plane is drawn over the first");
 +    }
 +    let Some(p) = pass.as_mut() else { return false };
-+    let slot = p.next % RING;
-+    p.next = p.next.wrapping_add(1);
 +    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
 +        Format: plane_format,
 +        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
@@ -1640,21 +1796,12 @@ index 0000000..bfcb24e
 +        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
 +        ..Default::default()
 +    };
-+    // SAFETY: an open list; slots of our heaps; live resources and objects
-+    // (the pass's own live as long as the process or until remade, and a
-+    // list holds what it was recorded with).
++    // SAFETY: the open list owns these slots until it finishes, and the
++    // caller retains the resources it records.
 +    unsafe {
-+        let target = D3D12_CPU_DESCRIPTOR_HANDLE {
-+            ptr: p.targets.GetCPUDescriptorHandleForHeapStart().ptr + slot as usize * p.target_step,
-+        };
-+        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
-+            ptr: p.views.GetCPUDescriptorHandleForHeapStart().ptr
-+                + (slot * p.view_step) as usize,
-+        };
-+        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
-+            ptr: p.views.GetGPUDescriptorHandleForHeapStart().ptr
-+                + u64::from(slot * p.view_step),
-+        };
++        let target = p.targets.GetCPUDescriptorHandleForHeapStart();
++        let cpu = p.views.GetCPUDescriptorHandleForHeapStart();
++        let gpu = p.views.GetGPUDescriptorHandleForHeapStart();
 +        device.CreateRenderTargetView(back, Some(&target_desc), target);
 +        device.CreateShaderResourceView(plane, Some(&view), cpu);
 +        list.SetDescriptorHeaps(&[Some(p.views.clone())]);
@@ -1932,25 +2079,18 @@ index 0000000..bfcb24e
 +mod readback;
 diff --git a/crates/victory-gpu/src/over/readback.rs b/crates/victory-gpu/src/over/readback.rs
 new file mode 100644
-index 0000000..dd42b07
+index 0000000..80bd5b4
 --- /dev/null
 +++ b/crates/victory-gpu/src/over/readback.rs
-@@ -0,0 +1,178 @@
+@@ -0,0 +1,205 @@
 +//! GPU readback for the two Series S display passes.
 +
 +use super::*;
++use crate::host::{Host, HostList, host, transition};
 +
-+/// Stretches a blue 3 by 2 scene to 5 by 3 and reads the result back, `None`
-+/// without a device. `padded`: the scene is the top left of a 4 by 3 texture
-+/// whose other texels are red, and the interface over it is empty; otherwise
-+/// the interface has a half green and a red strip.
-+fn stretched(padded: bool) -> Option<[[u8; 20]; 3]> {
-+    use crate::host::{host, transition};
++/// Records work without submitting, so two frames can be open together.
++fn recorded(host: &Host, padded: bool) -> (HostList, ID3D12Resource, Pass) {
 +    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM as RGBA8;
-+    let Some(host) = host() else {
-+        eprintln!("no D3D12 device; skipping display readback");
-+        return None;
-+    };
 +    let texture = |width: u32, height, flags, state| {
 +        let mut resource: Option<ID3D12Resource> = None;
 +        // SAFETY: plain creation of a texture with one RGBA8 subresource.
@@ -2023,6 +2163,7 @@ index 0000000..dd42b07
 +    let readback = host.read_back_buffer(768).unwrap();
 +    let commands = host.new_list().unwrap();
 +    let list = &commands.list;
++    let mut pass = None;
 +    // SAFETY: both views and all resources live through command completion.
 +    unsafe {
 +        let scene_view = host.rtv(Some(&scene), None);
@@ -2057,6 +2198,7 @@ index 0000000..dd42b07
 +        assert!(record_stretch(&host.device, list, &target, &scene, [3, 2]));
 +        list.ResourceBarrier(&[transition(&target, uav, rtv)]);
 +        assert!(record(
++            &mut pass,
 +            &host.device,
 +            list,
 +            &target,
@@ -2068,9 +2210,15 @@ index 0000000..dd42b07
 +        list.ResourceBarrier(&[transition(&target, rtv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
 +        list.CopyTextureRegion(&rows(&readback), 0, 0, 0, &sub(&target), None);
 +    }
++    for resource in [&scene, &ui, &target] {
++        commands.keep(resource);
++    }
 +    commands.close();
-+    host.execute(&[&commands]);
-+    // SAFETY: execute waited for the copy. Each row contains five texels.
++    (commands, readback, pass.unwrap())
++}
++
++/// Reads the pixels after the submission fence.
++fn pixels(readback: &ID3D12Resource) -> [[u8; 20]; 3] {
 +    let mut ptr = std::ptr::null_mut();
 +    let mut pixels = [[0u8; 20]; 3];
 +    unsafe {
@@ -2083,23 +2231,34 @@ index 0000000..dd42b07
 +        }
 +        readback.Unmap(0, None);
 +    }
-+    Some(pixels)
++    pixels
 +}
++
++fn stretched(padded: bool) -> Option<[[u8; 20]; 3]> {
++    let Some(host) = host() else {
++        eprintln!("no D3D12 device; skipping display readback");
++        return None;
++    };
++    let (commands, readback, _pass) = recorded(host, padded);
++    host.execute(&[&commands]);
++    Some(pixels(&readback))
++}
++
++const COMPOSITED: [[u8; 4]; 5] = [
++    [0, 0, 255, 255],
++    [0, 0, 255, 255],
++    [0, 128, 127, 255],
++    [255, 0, 0, 255],
++    [255, 0, 0, 255],
++];
 +
 +#[test]
 +fn stretch_and_overlay_preserve_the_expected_pixels() {
 +    let Some(pixels) = stretched(false) else {
 +        return;
 +    };
-+    let expected = [
-+        [0, 0, 255, 255],
-+        [0, 0, 255, 255],
-+        [0, 128, 127, 255],
-+        [255, 0, 0, 255],
-+        [255, 0, 0, 255],
-+    ];
 +    for row in pixels {
-+        assert_eq!(&row[..], expected.as_flattened());
++        assert_eq!(&row[..], COMPOSITED.as_flattened());
 +    }
 +}
 +
@@ -2111,6 +2270,21 @@ index 0000000..dd42b07
 +        return;
 +    };
 +    for row in pixels {
++        assert_eq!(&row[..], [[0u8, 0, 255, 255]; 5].as_flattened());
++    }
++}
++
++#[test]
++#[ignore = "requires a D3D12 adapter"]
++fn two_queued_presents_keep_their_own_overlay_descriptors() {
++    let host = host().expect("a D3D12 device");
++    let (first, first_readback, _first_pass) = recorded(host, false);
++    let (second, second_readback, _second_pass) = recorded(host, true);
++    host.execute(&[&first, &second]);
++    for row in pixels(&first_readback) {
++        assert_eq!(&row[..], COMPOSITED.as_flattened());
++    }
++    for row in pixels(&second_readback) {
 +        assert_eq!(&row[..], [[0u8, 0, 255, 255]; 5].as_flattened());
 +    }
 +}
@@ -2247,10 +2421,57 @@ index 43aaee7..7177ce6 100644
      #[test]
      fn skip_hashes_accepts_full_hashes_only() {
 diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
-index 9301295..d81fe50 100644
+index 9301295..15dc8fc 100644
 --- a/crates/victory-gpu/src/queue.rs
 +++ b/crates/victory-gpu/src/queue.rs
-@@ -734,11 +734,21 @@ fn join_parts() -> bool {
+@@ -60,9 +60,8 @@ enum Held {
+     /// this (the line is not empty), signals too.
+     Running,
+     /// With [`present_behind`]: the title's present of a frame, due after
+-    /// what the queue holds before it: the host texture shown, the state
+-    /// the title's lists leave it in, and the frame's number.
+-    Present(windows::Win32::Graphics::Direct3D12::ID3D12Resource, u32, u64),
++    /// what the queue holds before it: the host texture shown and the frame.
++    Present(std::sync::Arc<crate::resource::HostTexture>, u64),
+ }
+
+ /// Presents that are in a queue's line and have not run ([`Held::Present`]).
+@@ -158,7 +157,7 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool
+     }
+     // SAFETY: the plane lists `count` resources.
+     let resource = unsafe { *plane.resources };
+-    let Some(texture) = crate::resource::host_resource(resource) else {
++    let Some(texture) = crate::resource::host_copy(resource) else {
+         return false;
+     };
+     // The present before is still in a line ([`present_wait`]): until our
+@@ -180,15 +179,9 @@ fn send_behind(this: This, planes: u32, plane_parameters: *const Plane) -> bool
+         stat(a::PRESENT_OLD_STANDS, 1);
+         return false;
+     }
+-    // The state the lists recorded so far leave the texture in: what our
+-    // copy finds it in when it runs behind them (looked at, not changed).
+-    const COPY_SOURCE: u32 = 0x800;
+-    let state = crate::resource::host_transition(resource, COPY_SOURCE).map_or(COPY_SOURCE, |(_, before)| before);
+-    crate::resource::host_transition(resource, state);
+-    let texture = texture.clone();
+     let sent = hold(this, || {
+         PRESENTS_HELD.fetch_add(1, Ordering::Relaxed);
+-        Held::Present(texture, state, frame)
++        Held::Present(texture, frame)
+     });
+     if sent {
+         PRESENTS_BEHIND.fetch_add(1, Ordering::Relaxed);
+@@ -264,7 +257,7 @@ pub(crate) fn cuts() -> bool {
+ /// finding out whether the title's waits reach across its presents; a
+ /// wait nothing ever meets then stops the title for good.
+ #[cfg(windows)]
+-fn forces() -> bool {
++pub(crate) fn forces() -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("VICTORY_WAIT_FORCE").is_none_or(|v| v != "0"))
+ }
+@@ -734,11 +727,21 @@ fn join_parts() -> bool {
      }
  }
 
@@ -2274,7 +2495,20 @@ index 9301295..d81fe50 100644
  }
 
  /// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
-@@ -1862,7 +1872,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+@@ -1355,10 +1358,10 @@ fn release_held_now(all: bool) {
+                             }
+                         }
+                     }
+-                    Held::Present(texture, state, frame) => {
++                    Held::Present(texture, frame) => {
+                         let show = || {
+                             if let Some(host) = crate::host::host() {
+-                                let _ = host.present(&texture, state, frame);
++                                let _ = host.present(&texture, frame, None);
+                             }
+                         };
+                         if all {
+@@ -1862,7 +1865,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
      // With `present_behind`: the frame is shown by our thread, behind what
      // the queue holds, and nothing is run or waited for here.
      #[cfg(windows)]
@@ -2284,32 +2518,33 @@ index 9301295..d81fe50 100644
      #[cfg(not(windows))]
      let _ = this;
      // With `behind`: the title's thread waits on the lines from here
-@@ -1998,7 +2009,23 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
-         const COPY_SOURCE: u32 = 0x800;
-         let state = crate::resource::host_transition(resource, COPY_SOURCE)
-             .map_or(COPY_SOURCE, |(_, before)| before);
+@@ -1992,16 +1996,18 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+         && !plane.resources.is_null()
+         // SAFETY: the plane lists `count` resources.
+         && let resource = fresh_or_last(unsafe { *plane.resources })
+-        && let Some(texture) = crate::resource::host_resource(resource)
++        && let Some(texture) = crate::resource::host_copy(resource)
+         && let Some(host) = crate::host::host()
+     {
+-        const COPY_SOURCE: u32 = 0x800;
+-        let state = crate::resource::host_transition(resource, COPY_SOURCE)
+-            .map_or(COPY_SOURCE, |(_, before)| before);
 -        let shown = host.present(texture, state, frame);
-+        // A second plane (the title's interface over its game image, in
-+        // its Series S mode) is drawn over the first: `crate::over`. Each
-+        // plane's description is 0x48 bytes and starts as the first does.
-+        const READABLE: u32 = 0x80;
+-        crate::resource::host_transition(resource, state);
 +        // SAFETY: the title passes `planes` plane descriptions.
-+        let second = (crate::console::current() == crate::console::Console::SeriesS)
++        let over = (crate::console::current() == crate::console::Console::SeriesS)
 +            .then(|| unsafe { second_plane(planes, plane_parameters, resource) })
 +            .flatten()
-+            .and_then(|r| Some((r, crate::resource::host_copy(r)?)));
-+        let over = second.map(|(r, t)| {
-+            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
-+            (r, t, was)
-+        });
-+        let shown = host.present_planes(texture, state, frame, over.as_ref().map(|(_, t, was)| (&t.texture, *was)));
-+        if let Some((r, _, was)) = over {
-+            crate::resource::host_transition(r, was);
-+        }
-         crate::resource::host_transition(resource, state);
++            .and_then(crate::resource::host_copy)
++            .filter(|plane| !std::sync::Arc::ptr_eq(&texture, plane));
++        let shown = host.present(&texture, frame, over.as_ref());
          #[cfg(feature = "diagnostics")]
-         blinks(frame, resource, state, shown);
-@@ -2009,6 +2036,74 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+-        blinks(frame, resource, state, shown);
++        blinks(frame, resource, texture.state.load(Ordering::Relaxed), shown);
+         #[cfg(not(feature = "diagnostics"))]
+         let _ = shown;
+     }
+@@ -2009,6 +2015,74 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
      let _ = (planes, plane_parameters);
      S_OK
  }
@@ -2384,11 +2619,43 @@ index 9301295..d81fe50 100644
  /// Diagnostics: logs a presented frame that is black after one that was
  /// not, with what was presented and how many draws ran since.
  #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index f864c37..10fdcc9 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2198,7 +2198,7 @@ pub(crate) fn placed_textures() -> u64 {
+
+ /// Moves the host texture to `wanted` (a host texture state); the host
+ /// resource and the state it leaves, if that is a change.
+-#[cfg(windows)]
++#[cfg(all(windows, test))]
+ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u32)> {
+     use windows::core::Interface;
+     let (host, _) = hosted(this, true)?;
 diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
-index ce4218d..fbb7442 100644
+index ce4218d..e5feaf4 100644
 --- a/crates/victory-gpu/src/shadow.rs
 +++ b/crates/victory-gpu/src/shadow.rs
-@@ -8137,6 +8137,7 @@ mod card_merge_tests {
+@@ -5760,6 +5760,18 @@ impl Shadow {
+                     let held = unsafe { std::slice::from_raw_parts_mut(self.data.add(at), n) };
+                     let runs = joined_over(changed_runs(title, held), merge_gap());
+                     if runs.len() > *runs_left {
++                        if crate::cpuwait::trace_enabled() {
++                            tracing::info!(
++                                target: "victory_gpu::memory_wait",
++                                shadow = self.id,
++                                allocation_bytes = self.len,
++                                copy_offset = at,
++                                range_bytes = n,
++                                changed_runs = runs.len(),
++                                remaining_runs = *runs_left,
++                                "title writes exceeded the exact merge run budget"
++                            );
++                        }
+                         crate::cpuwait::stale_why(crate::cpuwait::stale::RUNS);
+                         MERGE_GAVE_UP[2].fetch_add(1, Ordering::Relaxed);
+                         return true;
+@@ -8137,6 +8149,7 @@ mod card_merge_tests {
                  staging: Some(staging.clone()),
                  mirror: None,
                  written: super::written_notes(title.as_ptr() as u64, LEN as u64),

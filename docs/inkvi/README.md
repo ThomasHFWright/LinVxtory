@@ -86,7 +86,8 @@ later chapters still need verification on this build.
 | inkVI reference tree | `3535e80cb6d1f7b4adff282678fe41d77f99a22c` |
 | Combined renderer tree used for the FPS table | `463835438f93e46dc7b905720b8434bf41355464` |
 | Ray-tracing preview tree | `c9e8e9e1eed6865010ff237a530cc1dcb33b11d1` |
-| LinVxtory overlay SHA-256 | `16be293bd1180a6bb31f4d93609f12df4894524dc2b6f78a89e311d45ba36d5f` |
+| Memory synchronization test tree | `917cc4867c53f9634fffaab3e15b25737812aa9d` |
+| LinVxtory overlay SHA-256 | `f54471336f5f72d8bfeb5e4f9868b79cd866e86a6d8efba334d8c7338dd1ed6d` |
 
 
 ## Ray-tracing preview
@@ -102,6 +103,7 @@ The same release build can enable the preview. After sourcing
 ```sh
 export VICTORY_BVH_BUILDER=1 VICTORY_BVH_HOLD=1 VICTORY_AMBIENT=0
 export VICTORY_GPU_UPLOAD_COPIES=0 VICTORY_CARD_WINDOWS_MB=6144
+export VICTORY_MERGE_RUNS=4096 VICTORY_MERGE_GAP=0
 ```
 
 The RTX 5090 and GE-Proton 11-14 replay created all 53 builder pipelines
@@ -117,3 +119,22 @@ of a warmed replay. The traversal run ended manually after 5 minutes
 43 seconds. Window speckling and slow streaming remain, and later
 areas are unverified. Keep a separate shader cache and save directory
 for the preview.
+
+
+## Memory synchronization test
+
+On RTX 5090 and GE-Proton 11-14, lifting the exact merge limit from
+512 to 4,096 reduced waits for CPU and GPU writes to overlapping ranges
+from 13 to 6 ms per frame. Median FPS in the fixed cell window went from
+4.4 to 4.7 in one pair of five-minute runs. The zero-byte merge gap
+preserves exact writes.
+
+The compositor resolves both input texture states at submission and
+uses descriptor slots owned by each present list. Three GPU readback
+tests passed, including two queued frames with different overlays.
+Asynchronous overlays remain experimental and off by default. They
+removed the synchronous present waits in a separate comparison, and
+median cell FPS fell from 6.35 to 5.55 as later waits grew. A
+follow-up with GPU-side constant-view and title buffer copies enabled
+reached 4.8 FPS. The recommended settings above use synchronous overlay
+presentation and the standard buffer-copy path.
