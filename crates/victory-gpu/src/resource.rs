@@ -1460,6 +1460,34 @@ fn make_texture(d: &ResourceDesc, state: u32, clear: *const c_void) -> Option<Ho
             tracing::warn!(error = %e, desc = ?d, "no host texture");
         }
     }
+    if texture.is_none()
+        && let Some((desc, state)) = without_unsupported_uses(d, state)
+    {
+        // SAFETY: as above; no clear value, which only render targets and
+        // depth take and this one may no longer be.
+        let made = unsafe {
+            host.device.CreateCommittedResource(
+                &heap,
+                D3D12_HEAP_FLAG_NONE,
+                std::ptr::from_ref(&desc).cast(),
+                D3D12_RESOURCE_STATES(state as i32),
+                None,
+                &mut texture,
+            )
+        };
+        match made {
+            Ok(()) => {
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| {
+                    tracing::info!(format = d.format, asked = d.flags, made = desc.flags, "a host texture without the uses its format does not support (render target or unordered access); it is written by copies");
+                });
+                initial = state;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, desc = ?desc, "no host texture without unsupported uses either")
+            }
+        }
+    }
     let texture = texture?;
     crate::host::name(&texture, || {
         // Its address, for the lifetime notes (`life`) of a freed one.
@@ -1488,6 +1516,59 @@ fn desc1_of(p: &windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_DESC) -> wi
         SamplerFeedbackMipRegion: Default::default(),
     }
 }
+
+/// `d` without the render target and unordered access uses the host does
+/// not support for its format, and its initial state for `state`; `None`
+/// if it asks for none of those. Some hosts refuse to make a texture with
+/// such a use (an RTX 3070 an RGB9E5 one with either); without it the
+/// texture exists, and is written by copies (`crate::rgb9e5`).
+#[cfg(windows)]
+fn without_unsupported_uses(d: &ResourceDesc, state: u32) -> Option<(ResourceDesc, u32)> {
+    use windows::Win32::Graphics::Direct3D12::*;
+    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+    const RENDER_TARGET: u32 = 1;
+    let host = crate::host::host()?;
+    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+        Format: DXGI_FORMAT(d.format as i32),
+        ..Default::default()
+    };
+    // SAFETY: a plain query into a struct of its size.
+    unsafe {
+        host.device.CheckFeatureSupport(
+            D3D12_FEATURE_FORMAT_SUPPORT,
+            (&raw mut support).cast(),
+            size_of_val(&support) as u32,
+        )
+    }
+    .ok()?;
+    let mut unsupported = 0;
+    if support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 == 0 {
+        unsupported |= RENDER_TARGET;
+    }
+    if support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 == 0 {
+        unsupported |= UNORDERED;
+    }
+    let dropped = d.flags & unsupported;
+    if dropped == 0 {
+        return None;
+    }
+    let desc = ResourceDesc {
+        flags: d.flags & !dropped,
+        ..*d
+    };
+    let state = crate::host::legal_for(desc.flags, crate::host::texture_state(state));
+    Some((desc, state))
+}
+
+/// Whether the host texture `texture` can be a render target (see
+/// [`without_unsupported_uses`]).
+#[cfg(windows)]
+pub(crate) fn renders(texture: &windows::Win32::Graphics::Direct3D12::ID3D12Resource) -> bool {
+    use windows::Win32::Graphics::Direct3D12::D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    // SAFETY: a live resource.
+    unsafe { texture.GetDesc() }.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET.0 != 0
+}
+
 
 /// A texture's console memory and description; `None` for buffers.
 pub(crate) fn texture_memory(this: This) -> Option<(*const u8, ResourceDesc)> {
@@ -2868,6 +2949,69 @@ mod tests {
             assert_eq!(sizes, [64, 32, 64, 32, 16, 8, 16, 8], "format {format}");
             assert_eq!(total, 24_072, "format {format}");
             assert!(subresource(&desc, 8).is_none(), "format {format}");
+        }
+    }
+
+    /// A texture asked for with render target and unordered access uses and
+    /// a clear value is made even in a format the host supports neither use
+    /// for (B4G4R4A4 or RGB9E5 on NVIDIA), without those uses; uses the
+    /// format supports are kept.
+    #[cfg(windows)]
+    #[test]
+    fn textures_are_made_without_uses_their_format_does_not_support() {
+        use windows::Win32::Graphics::Direct3D12::*;
+        use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT;
+        let Some(host) = crate::host::host() else {
+            return; // no host GPU here
+        };
+        const RENDER_TARGET: u32 = 1;
+        for format in [115, 67, 86, 28] {
+            let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
+                Format: DXGI_FORMAT(format as i32),
+                ..Default::default()
+            };
+            // SAFETY: a plain query into a struct of its size.
+            unsafe {
+                host.device.CheckFeatureSupport(
+                    D3D12_FEATURE_FORMAT_SUPPORT,
+                    (&raw mut support).cast(),
+                    size_of_val(&support) as u32,
+                )
+            }
+            .unwrap();
+            if support.Support1.0 & D3D12_FORMAT_SUPPORT1_TEXTURE2D.0 == 0 {
+                continue;
+            }
+            let renders = support.Support1.0 & D3D12_FORMAT_SUPPORT1_RENDER_TARGET.0 != 0;
+            let unordered =
+                support.Support1.0 & D3D12_FORMAT_SUPPORT1_TYPED_UNORDERED_ACCESS_VIEW.0 != 0;
+            let d = ResourceDesc {
+                flags: RENDER_TARGET | UNORDERED,
+                ..texture(64, 64, format, 1)
+            };
+            // With a clear value, as the title passes for its targets: an
+            // RTX 5070 makes a B4G4R4A4 or RGB9E5 render target without one
+            // but refuses it with one.
+            let clear = [format, 0, 0, 0, 0];
+            let made = make_texture(&d, 0, clear.as_ptr().cast())
+                .unwrap_or_else(|| panic!("no host texture of format {format}"));
+            // SAFETY: a live resource.
+            let flags = unsafe { made.texture.GetDesc() }.Flags.0 as u32;
+            // Supported uses are kept. An unsupported one goes only where the
+            // host refuses the texture with it: some take the flag anyway
+            // (an RTX 5070 an RGB9E5 texture with both).
+            assert!(
+                !renders || flags & RENDER_TARGET != 0,
+                "format {format}: render target use dropped"
+            );
+            assert!(
+                !unordered || flags & UNORDERED != 0,
+                "format {format}: unordered use dropped"
+            );
+            assert_eq!(
+                flags & RENDER_TARGET != 0,
+                crate::resource::renders(&made.texture)
+            );
         }
     }
 

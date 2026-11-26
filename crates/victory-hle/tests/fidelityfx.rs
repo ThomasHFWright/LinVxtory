@@ -1,6 +1,7 @@
 //! The host's FidelityFX through our entry points, called as the title
 //! calls the console's: the title's descriptions, console objects,
-//! one upscaling of a flat colour, the output read back. Needs the PC build
+//! flat-colour upscaling into FP16 and logical RGB9E5 outputs, read back.
+//! RGB9E5 may use this base's existing FP16 stand-in. Needs the PC build
 //! (`VICTORY_FIDELITYFX_DIR`) and a host GPU; skipped without them.
 #![cfg(windows)]
 
@@ -155,6 +156,12 @@ fn half(bits: u16) -> f32 {
     if sign == 1 { -value } else { value }
 }
 
+/// RGB9E5 by D3D's rule: three 9-bit mantissas over a shared exponent.
+fn rgb9e5(v: u32) -> [f32; 3] {
+    let scale = 2f32.powi((v >> 27) as i32 - 24);
+    [v & 511, (v >> 9) & 511, (v >> 18) & 511].map(|m| m as f32 * scale)
+}
+
 #[test]
 fn the_titles_upscaler_runs_on_the_host() {
     let Some(dir) = std::env::var_os("VICTORY_FIDELITYFX_DIR") else {
@@ -294,6 +301,12 @@ fn the_titles_upscaler_runs_on_the_host() {
     let upscaled = at(
         output,
         DXGI_FORMAT_R16G16B16A16_FLOAT,
+        target | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+    );
+    // The title's own output, with the uses it asks for.
+    let packed = at(
+        output,
+        DXGI_FORMAT_R9G9B9E5_SHAREDEXP,
         target | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
     );
 
@@ -447,20 +460,40 @@ fn the_titles_upscaler_runs_on_the_host() {
     eprintln!("provider {:#x} {:?}", provider.id, unsafe {
         std::ffi::CStr::from_ptr(provider.name)
     });
-    // Two frames: the first resets the history.
-    for reset in [1, 0] {
-        upscaling.reset = reset;
-        assert_eq!(dispatch(&mut context, &mut upscaling.header), 0);
+    // Whether the host can write the RGB9E5 output as the upscaler does;
+    // if not (NVIDIA), it is written through an FP16 texture.
+    const UNORDERED_ACCESS: u32 = 0x8;
+    let (texture, state) =
+        victory_gpu::external::host_texture(list, packed, UNORDERED_ACCESS).unwrap();
+    // This base may already represent the logical RGB9E5 output as FP16.
+    // SAFETY: a live resource.
+    let packed_format = unsafe { texture.GetDesc() }.Format;
+    assert!(matches!(packed_format, DXGI_FORMAT_R9G9B9E5_SHAREDEXP | DXGI_FORMAT_R16G16B16A16_FLOAT));
+    let packed_bytes = if packed_format == DXGI_FORMAT_R16G16B16A16_FLOAT { 8 } else { 4 };
+    eprintln!(
+        "logical RGB9E5 output (host format {}) {}", packed_format.0,
+        if state == UNORDERED_ACCESS && victory_gpu::rgb9e5::stores(&texture) {
+            "written directly"
+        } else {
+            "written through an FP16 texture"
+        }
+    );
+    // Two frames into each output: the first resets the history.
+    for out in [upscaled, packed] {
+        upscaling.resources[6] = described(out, 4, output, 2, 0x2);
+        for reset in [1, 0] {
+            upscaling.reset = reset;
+            assert_eq!(dispatch(&mut context, &mut upscaling.header), 0);
+        }
     }
 
     // Read the output back in the same list, run it as the title would.
-    let (texture, state) =
-        victory_gpu::external::host_texture(list, upscaled, COPY_SOURCE).unwrap();
-    assert_eq!(state, COPY_SOURCE);
     let (pitch, rows) = (
         u64::from(output[0]).next_multiple_of(32) * 8,
         u64::from(output[1]),
     );
+    // The RGB9E5 rows after the FP16 ones.
+    let packed_pitch = (u64::from(output[0]) * packed_bytes).next_multiple_of(256);
     // SAFETY: plain creation of a read-back buffer.
     let readback: ID3D12Resource = unsafe {
         let mut buffer = None;
@@ -472,7 +505,7 @@ fn the_titles_upscaler_runs_on_the_host() {
             D3D12_HEAP_FLAG_NONE,
             &D3D12_RESOURCE_DESC {
                 Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-                Width: pitch * rows,
+                Width: (pitch + packed_pitch) * rows,
                 Height: 1,
                 DepthOrArraySize: 1,
                 MipLevels: 1,
@@ -490,36 +523,49 @@ fn the_titles_upscaler_runs_on_the_host() {
         .unwrap();
         buffer.unwrap()
     };
-    victory_gpu::external::record(list, |l| {
-        let to = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: borrowed; the location never releases it.
-            pResource: unsafe { std::mem::transmute_copy(&readback) },
-            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
-                    Offset: 0,
-                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
-                        Width: output[0],
-                        Height: output[1],
-                        Depth: 1,
-                        RowPitch: pitch as u32,
+    for (resource, format, offset, row) in [
+        (upscaled, DXGI_FORMAT_R16G16B16A16_FLOAT, 0, pitch),
+        (
+            packed,
+            packed_format,
+            pitch * rows,
+            packed_pitch,
+        ),
+    ] {
+        let (texture, state) =
+            victory_gpu::external::host_texture(list, resource, COPY_SOURCE).unwrap();
+        assert_eq!(state, COPY_SOURCE);
+        victory_gpu::external::record(list, |l| {
+            let to = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: borrowed; the location never releases it.
+                pResource: unsafe { std::mem::transmute_copy(&readback) },
+                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+                        Offset: offset,
+                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                            Format: format,
+                            Width: output[0],
+                            Height: output[1],
+                            Depth: 1,
+                            RowPitch: row as u32,
+                        },
                     },
                 },
-            },
-        };
-        let from = D3D12_TEXTURE_COPY_LOCATION {
-            // SAFETY: as above.
-            pResource: unsafe { std::mem::transmute_copy(&texture) },
-            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
-                SubresourceIndex: 0,
-            },
-        };
-        // SAFETY: an open list and live resources.
-        unsafe { l.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
-    })
-    .unwrap();
+            };
+            let from = D3D12_TEXTURE_COPY_LOCATION {
+                // SAFETY: as above.
+                pResource: unsafe { std::mem::transmute_copy(&texture) },
+                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                    SubresourceIndex: 0,
+                },
+            };
+            // SAFETY: an open list and live resources.
+            unsafe { l.CopyTextureRegion(&to, 0, 0, 0, &from, None) };
+        })
+        .unwrap();
+    }
     slot::<extern "system" fn(This) -> i32>(list, 0x48)(list);
     slot::<extern "system" fn(This, u32, *const This)>(queue, 0x50)(queue, 1, &list);
 
@@ -527,7 +573,11 @@ fn the_titles_upscaler_runs_on_the_host() {
     let pixels = unsafe {
         let mut mapped = null_mut();
         readback.Map(0, None, Some(&mut mapped)).unwrap();
-        std::slice::from_raw_parts(mapped.cast::<u16>(), (pitch * rows / 2) as usize).to_vec()
+        std::slice::from_raw_parts(
+            mapped.cast::<u8>(),
+            ((pitch + packed_pitch) * rows) as usize,
+        )
+        .to_vec()
     };
     // No state the debug layer found wrong (if it is installed).
     if let Ok(messages) = host.cast::<ID3D12InfoQueue>() {
@@ -551,17 +601,27 @@ fn the_titles_upscaler_runs_on_the_host() {
     }
     // SAFETY: plain query.
     assert!(unsafe { host.GetDeviceRemovedReason() }.is_ok());
-    eprintln!(
-        "first pixels: {:?}",
-        pixels[..16].iter().map(|&h| half(h)).collect::<Vec<_>>()
-    );
-    for (i, pixel) in pixels.chunks(4).enumerate() {
-        let rgb: Vec<f32> = pixel[..3].iter().map(|&h| half(h)).collect();
-        for (c, (&got, &want)) in rgb.iter().zip(&flat).enumerate() {
-            assert!(
-                (got - want).abs() < 0.05,
-                "pixel {i} channel {c}: {got}, not {want}"
-            );
+    let (wide, packed_rows) = pixels.split_at((pitch * rows) as usize);
+    for y in 0..output[1] as usize {
+        for x in 0..output[0] as usize {
+            let at = y * pitch as usize + x * 8;
+            let fp16: Vec<f32> = (0..3)
+                .map(|c| half(u16::from_le_bytes([wide[at + 2 * c], wide[at + 2 * c + 1]])))
+                .collect();
+            let at = y * packed_pitch as usize + x * packed_bytes as usize;
+            let logical_rgb9e5 = if packed_format == DXGI_FORMAT_R16G16B16A16_FLOAT {
+                std::array::from_fn(|c| half(u16::from_le_bytes([packed_rows[at + 2*c], packed_rows[at + 2*c + 1]])))
+            } else {
+                rgb9e5(u32::from_le_bytes(packed_rows[at..at + 4].try_into().unwrap()))
+            };
+            for (name, rgb) in [("FP16", fp16.as_slice()), ("logical RGB9E5", &logical_rgb9e5[..])] {
+                for (c, (&got, &want)) in rgb.iter().zip(&flat).enumerate() {
+                    assert!(
+                        (got - want).abs() < 0.05,
+                        "{name} pixel ({x}, {y}) channel {c}: {got}, not {want}"
+                    );
+                }
+            }
         }
     }
     assert_eq!(destroy(&mut context, null()), 0);

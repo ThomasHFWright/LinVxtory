@@ -14,6 +14,12 @@
 //! through unchanged: sizes, flags, jitter, motion-vector scale, camera
 //! values, the resource descriptions, the context. Only the upscaler: other
 //! effects (frame generation) are refused.
+//!
+//! The title upscales into an RGB9E5 texture, which NVIDIA's GPUs cannot
+//! store to through an unordered access view, as the upscaler writes. Such
+//! an output is moved to `COPY_DEST` instead; the upscaler writes an FP16
+//! texture of ours, which is then packed into the title's
+//! (`victory_gpu::rgb9e5`).
 #![allow(non_snake_case)]
 // Title code calls these through its import table.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
@@ -46,6 +52,14 @@ const HOST_BACKEND: u64 = 2;
 const GET_VERSIONS: u64 = 4;
 const GET_PROVIDER_VERSION: u64 = 6;
 const MEMORY_USAGE_WITH_DEVICE: u64 = 0x1_0009;
+
+/// The output among a dispatch's resources.
+const OUTPUT: usize = 6;
+/// FidelityFX's surface format of the FP16 texture an RGB9E5 output is
+/// written through.
+const RGBA16_FLOAT: u32 = 4;
+/// The host state for copies into a resource.
+const COPY_DEST: u32 = 0x400;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -404,16 +418,50 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     let list = dispatch.list.cast::<Object>().cast_const();
     // Alive for the call (the list holds them too).
     let mut textures = Vec::new();
-    for r in dispatch
-        .resources
-        .iter_mut()
-        .filter(|r| !r.resource.is_null())
-    {
+    // An output the host cannot write as the upscaler does, and its bridge.
+    let mut packed = None;
+    for (i, r) in dispatch.resources.iter_mut().enumerate() {
+        if r.resource.is_null() {
+            continue;
+        }
         let wanted = host_state(r.state);
-        let texture = wanted.and_then(|w| {
+        let in_state = |w| {
             victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
                 .filter(|&(_, state)| state == w)
+        };
+        // Keep the host resource even if it cannot take the requested UAV
+        // state: the RGB9E5 bridge only needs COPY_DEST. Other formats retain
+        // the original refusal rather than being packed as RGB9E5.
+        let candidate = wanted.and_then(|w| {
+            victory_gpu::external::host_texture(list, r.resource.cast::<Object>(), w)
         });
+        let host_format = candidate.as_ref().map(|(t, _)| {
+            // SAFETY: a live host texture.
+            unsafe { t.GetDesc() }.Format.0
+        });
+        let needs_pack = i == OUTPUT && host_format == Some(67)
+            && candidate.as_ref().is_some_and(|(t, _)| !victory_gpu::rgb9e5::stores(t));
+        let mut texture = candidate.filter(|(_, state)| Some(*state) == wanted);
+        // Existing FP16 stand-ins and all other formats retain the original
+        // descriptor and direct dispatch path.
+        if needs_pack {
+            let size = [r.description[2], r.description[3]];
+            if wanted == Some(0x8)
+                && let Some(bridge) = victory_gpu::rgb9e5::bridge(size)
+                && let Some((title, _)) = in_state(COPY_DEST)
+            {
+                once!(
+                    info,
+                    ?size,
+                    "FidelityFX: the output is written through an FP16 texture"
+                );
+                r.description[1] = RGBA16_FLOAT;
+                packed = Some((bridge, title));
+                texture = Some((bridge.texture().clone(), 0x8));
+            } else {
+                texture = None;
+            }
+        }
         let Some((texture, _)) = texture else {
             once!(
                 warn,
@@ -432,7 +480,13 @@ extern "C" fn ffxDispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
     victory_gpu::external::record(list, |host_list| {
         dispatch.list = host_list.as_raw();
         // SAFETY: the PC dispatch on host objects; the context is the host's.
-        unsafe { (host.dispatch)(context, &raw mut dispatch.header) }
+        let code = unsafe { (host.dispatch)(context, &raw mut dispatch.header) };
+        if code == OK
+            && let Some((bridge, title)) = &packed
+        {
+            bridge.write(host_list, title);
+        }
+        code
     })
     .unwrap_or(PARAMETER)
 }

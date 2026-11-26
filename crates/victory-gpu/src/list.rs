@@ -1043,6 +1043,10 @@ extern "system" fn clear_rtv(
             // SAFETY: the title passes `count` rectangles, laid out as the host's.
             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
         });
+        // A view of a copy-only texture would remove the device.
+        if !crate::resource::renders(&texture) {
+            return;
+        }
         list.gather_close();
         const RENDER_TARGET: u32 = 0x4;
         let rtv = host.rtv(Some(&texture), record.desc().as_ref());

@@ -446,6 +446,14 @@ impl State {
                 }
                 continue;
             };
+            if !crate::resource::renders(&texture) {
+                once!(handle = format_args!("{h:#x}"), "render target whose host texture cannot be one; not bound");
+                // Keep later colour outputs in their original MRT slots.
+                if let Some(desc) = record.desc().filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0) {
+                    rtvs.push(host.rtv(None, Some(&desc)));
+                }
+                continue;
+            }
             self.targets.push(record.resource as usize);
             #[cfg(feature = "diagnostics")]
             crate::capture::note_target(list, record.resource);
