@@ -209,5 +209,5 @@ The side views retained the same swept crown and hanging hair. The matched
 near-frontal views still showed exposed eyes and teeth, with the cheek, lips
 and jaw missing. The launch harness ended by signal after about 572 seconds,
 after both camera turns. The control completed its 600-second limit. The
-candidate log contains no device-loss or fatal-error report. The port remains
-a private source candidate while the visible defects are investigated.
+candidate log contains no device-loss or fatal-error report. The source kit
+is available on `faces-hair` for reproduction.
