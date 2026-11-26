@@ -19,7 +19,8 @@ the inputs, crashes and remaining rendering defects alongside the results.
 The build uses OctoAlgo’s pinned inkVI stack for facial skin, hair,
 shadows and Wave64 translation. LinVxtory adds its Series S presentation
 repair, fresh constant-buffer tables after command-list waits, and the
-7900XTX performance changes. [inkVI](https://github.com/OctoAlgo/inkVI/tree/7031c8259f4c8a906d06c1e3f4726d455126bfca) · [Build and test details](docs/inkvi/README.md)
+7900XTX performance changes. The same build includes an opt-in ray-tracing
+preview. [inkVI](https://github.com/OctoAlgo/inkVI/tree/7031c8259f4c8a906d06c1e3f4726d455126bfca) · [Build and test details](docs/inkvi/README.md)
 
 ## Build the renderer
 
@@ -37,7 +38,13 @@ one release executable. Supply your own game files at runtime.
 
 ## Gameplay status
 
-In the RTX 5090 test, the current Series S build reached the cell with
+With ray tracing enabled on the RTX 5090, the Series S build reached the
+cell with visible indirect light and a median of **5.1 FPS**. The comparison
+run held ray traversal and reached **7.3 FPS**, with the wall and shelving
+nearly black. Both runs disabled the ambient substitute.
+[Ray-tracing setup, results and credits](docs/inkvi/README.md#ray-tracing-preview)
+
+In the earlier RTX 5090 Series S replay with the ambient substitute, the build reached the cell with
 individual hair strands, the ponytail, the lit wall and the window mesh.
 Facial skin rendered in the early close-up. One NPC temporarily had a black
 skin texture while streaming. Cell samples averaged **9.03 FPS** with a
