@@ -185,8 +185,11 @@ the same shader-cache directory. From 180 to 330 seconds after the first bind of
 compute `02384a60fda6f2d0`, stock GE-Proton 11-14 advanced 59 frames in 146.3
 seconds (0.40 FPS). A private GE11-14 wineserver with indexed view lookup
 advanced 148 in 149.2 seconds (0.99 FPS). Rates use the first and last logged
-present in the window. The camera sequence advances with the title and cache
-contents changed between runs, so the visible workload can differ.
+present in the window. The camera sequence advances with the title, so the
+visible workload can differ. Both runs reused translated shaders. vkd3d
+reported that it could not open its disk archive in the configured directory,
+which the launcher had omitted to create. Both also logged that the application
+could not create its D3D12 pipeline library.
 
 The indexed run closed itself after 393.28 seconds at `0x5149aec`. Its own
 report listed frame 1488, 1,586 streaming requests, 22,478 of 22,500 building
@@ -207,3 +210,23 @@ early drops in the retained trace preceded the respective pipeline's creation.
 The title still stopped at frame 1510, with 45,000 of 45,000 instance slots
 and 22,495 of 22,500 building slots occupied. The trace leaves the shaders'
 output values and the title's consumption of those outputs unresolved.
+
+### Empty pipeline library on Proton
+
+The Windows Rust binding supplies a non-null pointer for an empty slice.
+vkd3d-proton rejects that pointer at zero length. Creating an empty library
+now passes a null pointer and a zero length. Existing nonempty libraries
+continue to use the slice binding. On the RTX 5090, all 10 library tests,
+8 pipeline-host tests and 4 bindless tests passed. This includes four
+previously failing tests for creation, concurrent loading, mesh pipelines and
+depth bounds. Frame-rate impact has not been established.
+
+### First locally generated story save
+
+The unmodified 10532b2 executable ran for 1,801.67 seconds in Series S mode
+on indexed GE11-14. The harness stopped it at the time limit. The title wrote
+a new story slot about eight minutes in. The developer build used stock pool
+sizes and a private copy of the original settings. The picture was largely
+black or white with the title's own upscaler. A separate GPU integration test
+using the official PC upscaler passed for an FP16 output. Player control and
+the result of loading the new save on Series X require separate verification.

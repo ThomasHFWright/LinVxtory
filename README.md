@@ -39,7 +39,10 @@ before a title breakpoint. Its streaming report showed all 45,000 instance slots
 occupied. World rendering measured 0.42 FPS over a three-minute sample.
 On the same executable, a private indexed GE-Proton 11-14 wineserver improved a
 150-second world sample from 0.40 to 0.99 FPS. The title still filled its
-instance list and closed before player control could be verified.
+instance list and closed before player control could be verified. With the
+Series S profile, the same executable generated a story save and ran for the full
+30-minute test. The screen was mostly white, so input could not be confirmed
+visually. The Series X reload uses a separate copy of that save.
 
 The world-rendering observations below describe the preserved pre-merge build.
 
