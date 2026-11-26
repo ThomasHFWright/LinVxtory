@@ -39,7 +39,7 @@ set -a
 set +a
 export WINEDLLOVERRIDES='d3d12=n;d3d12core=n;dxgi=n'
 export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
-export VICTORY_SHADER_LOOP_LIMIT=32 VICTORY_NO_WATCHDOG=1 VICTORY_LOG=info
+export VICTORY_NO_WATCHDOG=1 VICTORY_LOG=info
 "$PROTON_WINE" "$src/target/x86_64-pc-windows-msvc/release/victory.exe" \
   run "$TITLE_EXE" --execute --console series-s
 ```
@@ -49,6 +49,11 @@ cold cache that can spend several minutes on the first world frame. Press
 the start button once if you want to see the prologue close-ups. Use an
 external time limit for watchdog-disabled tests.
 [Upstream settings and known issues](https://github.com/OctoAlgo/inkVI/blob/7031c8259f4c8a906d06c1e3f4726d455126bfca/docs/known-issues.md)
+
+The release uses its built-in shader loop limits. In diagnostics builds,
+a global limit of 32 can cut the strand simulation short. Upstream tested
+`VICTORY_SHADER_LOOP_LIMIT_CS=128` to keep the strand simulation intact
+with the lower global limit. [Compute loop fix](https://github.com/fxceless/victory-fork/pull/683)
 
 ## RTX 5090 observations
 
