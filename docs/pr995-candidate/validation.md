@@ -48,7 +48,7 @@ replaces the digest for the already tracked `shadow.rs`.
 | Published three-PR checkpoint `91b6968` | `cc6e33fe99572a2d433e82a49e8429678b70ca5a` | `c47ca445f08f13a27d4b9b9a98b4d4e0d22ed510613ca4ad1bd50836c48b28c2` |
 | Five-file follow-up `f0ca006` | `0c158597c6af5254c2d29422bda9ddd9b6b34065` | `fb1113a16121e61d9ec59e3cbcf5f01b05b01f684935c453417fe4616cc596ac` |
 | Three-file performance follow-up | `9087a7f7796671ddec0f176aa5931be73c514624` | `2bd39cdda0174091632022ad0e075510beaa91014fa397cd6d12932fba025d36` |
-| Small-buffer eligibility | `2806f9ebe7de5001094b06ee6f38a5ead98b81c1` | `d1e5ea6eafafc6794fb6903b768eb5fc80cfa12b5f97e37f6a6f944b9c1fafd0` |
+| Small-buffer eligibility | `2806f9ebe7de5001094b06ee6f38a5ead98b81c1` | `072321b791027cfcf33e768951ce6a64368d3bce33da05756756885ffbc7001a` |
 
 The five-file patch changes `crates/victory-gpu/src/descriptor/host.rs`, `shadow.rs`
 and `texture.rs` in the GPU crate, and `lower.rs` and `mod.rs` in
