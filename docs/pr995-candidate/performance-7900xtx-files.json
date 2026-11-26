@@ -1,0 +1,9 @@
+{
+  "apps/victory/src/shader.rs": "30d1b236061a3b8940e25e415951df09ca96f9a0ff2c592af2bba14c1c515fff",
+  "crates/victory-gpu/src/descriptor.rs": "d3caa3c7d49b661dd916c4772fe671c83e71391cf7a2c6925dca2395894356d6",
+  "crates/victory-gpu/src/queue.rs": "ae776b1df20563a14d61a97fb4637c9f718cfa232281672ce84d8c3548f9180d",
+  "crates/victory-shader/src/dxbc.rs": "ce8745ad8abd886da2b02f09dd9cc6459f3b554263c9e4223c5d5ca639cb6847",
+  "crates/victory-shader/src/emit/wave64_tests.rs": "814d31a440db13f8748d7f138985edab66459fda40ea482acdd8907142b670e2",
+  "crates/victory-shader/src/gfx10/fields.rs": "73e553ec94d2215ecdbd5ae9ab84299ed6c528ec65b0ec3d6d75ccb0c4766e0d",
+  "crates/victory-shader/src/ir.rs": "54a3ea4dbe1f3dba95881ef6eb7b29030e4789a83a28888806e014529e5fbd5c"
+}

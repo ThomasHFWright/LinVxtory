@@ -32,6 +32,12 @@ fi
 if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" >/dev/null 2>&1; then
     git -C "$src" apply "$kit/card-buffers-min-kb.patch.txt"
 fi
+if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" "$kit/card-buffers-files.json" >/dev/null 2>&1; then
+    git -C "$src" apply "$kit/series-s.patch.txt"
+fi
+if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" "$kit/card-buffers-files.json" "$kit/series-s-files.json" >/dev/null 2>&1; then
+    git -C "$src" apply "$kit/performance-7900xtx.patch.txt"
+fi
 sh "$kit/verify.sh" "$src"
 cd "$src"
 exec cargo build --locked --offline --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc

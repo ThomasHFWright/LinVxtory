@@ -1,0 +1,1332 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 647349c..47ab351 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -519,8 +519,8 @@ pub(crate) struct State {
+     host_roots: [usize; 2],
+     host_heaps: [usize; 2],
+     /// Tables made afresh in this list: (table, slot count, contents) → first
+-    /// dynamic slot.
+-    fresh_tables: std::collections::HashMap<(u64, u32, u64), u32>,
++    /// dynamic slot and whether the table binds constant buffers.
++    fresh_tables: std::collections::HashMap<(u64, u32, u64), (u32, bool)>,
+     /// The dynamic slots the list holds: title heap, first, count; given
+     /// back when the list has run, is reset or released.
+     dynamic: Vec<(usize, u32, u32)>,
+@@ -1537,6 +1537,8 @@ impl State {
+     /// descriptors as they are now, not as they were when the title set
+     /// the targets (a descriptor rewritten in between names another view).
+     pub(crate) fn replay(&mut self, list: &HostList) {
++        // Constant buffers need this host list's own fills and refreshes.
++        self.fresh_tables.retain(|_, (_, has_constants)| !*has_constants);
+         self.host_pipeline = 0;
+         self.host_roots = [0; 2];
+         self.host_heaps = [0; 2];
+@@ -3934,7 +3936,7 @@ impl State {
+                 }
+                 (table, n, h.finish())
+             };
+-            if let Some(&first) = self.fresh_tables.get(&key) {
++            if let Some(&(first, _)) = self.fresh_tables.get(&key) {
+                 if let Some(title) = heap.index(table) {
+                     for k in 0..n {
+                         host.drawn_fresh(title + k, seq, read[k as usize]);
+@@ -3966,7 +3968,7 @@ impl State {
+                 made.push((slot, u32::MAX));
+                 continue;
+             };
+-            self.fresh_tables.insert(key, first);
++            let mut has_constants = false;
+             self.dynamic
+                 .push((std::ptr::from_ref(heap) as usize, first, n));
+             // The title's own slots of this table: what the draw reads of
+@@ -3982,6 +3984,7 @@ impl State {
+                 let used = entries.iter().find(|u| u.table_offset_dwords / 8 == k);
+                 match crate::descriptor::view(table + u64::from(k) * 32) {
+                     Some(View::Constant(address, size)) => {
++                        has_constants = true;
+                         if let Some(gpu) = table_constant_on_card(list, address, size) {
+                             host.constant_at(index, gpu, size);
+                             continue;
+@@ -4029,6 +4032,7 @@ impl State {
+                     }
+                 }
+             }
++            self.fresh_tables.insert(key, (first, has_constants));
+             made.push((slot, first * 32));
+         }
+         made
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index dc5bf71..9c1befe 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -73,6 +73,11 @@ pub fn run(
+     println!("console        {}", victory_hle::console::current().name());
+     let dlls = victory_loader::load_title_dlls(image.info(), title_dir, &images, &wanted)?;
+     for (name, dll) in &dlls {
++        if name.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
++            && let Some(real) = dll.export("ffxDispatch")
++        {
++            victory_hle::modules::ffx::set_real_dispatch(real);
++        }
+         println!("title dll      {name} at {:#x}", dll.base());
+         victory_hle::runtime::set_image_path(dll.base(), &title_dir.join(name));
+     }
+@@ -101,7 +106,33 @@ pub fn run(
+         show(name, dll.bind_imports(&with_dlls, policy)?);
+     }
+     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
+-    show(&exe_name, image.bind_imports(&with_dlls, policy)?);
++    // The upscale dispatch is ours (`victory_hle::modules::ffx`); the rest of
++    // that DLL is the title's own.
++    struct TakeDispatch<'a>(&'a dyn victory_loader::ImportResolver);
++    impl victory_loader::ImportResolver for TakeDispatch<'_> {
++        fn resolve(
++            &self,
++            dll: &str,
++            symbol: &victory_pe::ImportSymbol,
++        ) -> victory_loader::Resolution {
++            let ours = dll.eq_ignore_ascii_case(victory_hle::modules::ffx::LOADER)
++                && matches!(symbol, victory_pe::ImportSymbol::Name { name, .. } if name == "ffxDispatch");
++            if ours {
++                return victory_loader::Resolution::Found {
++                    address: victory_hle::modules::ffx::dispatch_address(),
++                    provenance: victory_loader::Provenance::Hle,
++                };
++            }
++            self.0.resolve(dll, symbol)
++        }
++    }
++    let dispatch = TakeDispatch(&with_dlls);
++    let executable_resolver: &dyn victory_loader::ImportResolver = if matches!(console, Console::SeriesS) {
++        &dispatch
++    } else {
++        &with_dlls
++    };
++    show(&exe_name, image.bind_imports(executable_resolver, policy)?);
+     if !execute {
+         println!("not executing (pass --execute to start the title)");
+         return Ok(());
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index eeb0be3..84f9479 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -13812,13 +13812,29 @@ impl Host {
+     /// as frame `frame` (saved if captures are on). `None` if nothing was
+     /// shown; else, in diagnostics builds, whether the frame was black.
+     pub(crate) fn present(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
++        self.present_planes(texture, state, frame, None)
++    }
++
++    pub(crate) fn present_planes(
++        &self,
++        texture: &ID3D12Resource,
++        state: u32,
++        frame: u64,
++        over: Option<(&ID3D12Resource, u32)>,
++    ) -> Option<bool> {
+         let showing = std::time::Instant::now();
+-        let shown = self.present_now(texture, state, frame);
++        let shown = self.present_now(texture, state, frame, over);
+         crate::framelog::add(crate::framelog::T::PresentShowUs, showing.elapsed().as_micros() as u64);
+         shown
+     }
+
+-    fn present_now(&self, texture: &ID3D12Resource, state: u32, frame: u64) -> Option<bool> {
++    fn present_now(
++        &self,
++        texture: &ID3D12Resource,
++        state: u32,
++        frame: u64,
++        over: Option<(&ID3D12Resource, u32)>,
++    ) -> Option<bool> {
+         // SAFETY: a live resource.
+         let desc = unsafe { texture.GetDesc() };
+         let Some(format) = swap_format(desc.Format) else {
+@@ -13877,7 +13893,7 @@ impl Host {
+             let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
+             #[cfg(not(feature = "diagnostics"))]
+             let read_now = false;
+-            let slot = if late_free_present() && !read_now {
++            let slot = if late_free_present() && !read_now && over.is_none() {
+                 let finished = FINISHED.load(Ordering::Acquire);
+                 p.ahead.iter().position(|(_, flown)| *flown <= finished).or_else(|| {
+                     let list = self.new_list().ok()?;
+@@ -13936,33 +13952,43 @@ impl Host {
+                 .then(|| crate::capture::read_back(&self.device, list, texture))
+                 .flatten();
+             #[cfg(feature = "diagnostics")]
+-            let probe = if slot.is_some() || bright.is_some() {
++            let probe = if slot.is_some() || bright.is_some() || over.is_some() {
+                 None
+             } else {
+                 crate::capture::probe(&self.device, list, texture)
+             };
+             #[cfg(not(feature = "diagnostics"))]
+             let _ = frame;
+-            match &bright {
+-                Some(bright) => {
+-                    crate::brighten::Brighten::after_copy(list, bright);
+-                    crate::barstat::record(&list, crate::barstat::Why::Present, &[transition(
+-                        &back,
+-                        D3D12_RESOURCE_STATE_COPY_DEST,
+-                        D3D12_RESOURCE_STATE_PRESENT,
+-                    )]);
+-                }
+-                None => {
+-                    crate::barstat::record(&list, crate::barstat::Why::Present, &[
+-                        transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
+-                        transition(
+-                            &back,
+-                            D3D12_RESOURCE_STATE_COPY_DEST,
+-                            D3D12_RESOURCE_STATE_PRESENT,
+-                        ),
+-                    ]);
+-                }
++            if let Some(bright) = &bright {
++                crate::brighten::Brighten::after_copy(list, bright);
++            } else {
++                crate::barstat::record(list, crate::barstat::Why::Present, &[
++                    transition(texture, D3D12_RESOURCE_STATE_COPY_SOURCE, state),
++                ]);
+             }
++            let readable = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
++            let overlay = over.and_then(|(plane, prior)| {
++                Some((plane, D3D12_RESOURCE_STATES(prior as i32), swap_format(plane.GetDesc().Format)?))
++            });
++            let back_state = if let Some((plane, prior, plane_format)) = overlay {
++                let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
++                let moved = prior.0 & readable.0 == 0;
++                let mut barriers = vec![transition(&back, D3D12_RESOURCE_STATE_COPY_DEST, target)];
++                if moved {
++                    barriers.push(transition(plane, prior, readable));
++                }
++                crate::barstat::record(list, crate::barstat::Why::Present, &barriers);
++                crate::over::record(&self.device, list, &back, format, (width, height), plane, plane_format);
++                if moved {
++                    crate::barstat::record(list, crate::barstat::Why::Present, &[transition(plane, readable, prior)]);
++                }
++                target
++            } else {
++                D3D12_RESOURCE_STATE_COPY_DEST
++            };
++            crate::barstat::record(list, crate::barstat::Why::Present, &[
++                transition(&back, back_state, D3D12_RESOURCE_STATE_PRESENT),
++            ]);
+             copy.close();
+             match slot {
+                 Some(i) => {
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index cba2148..e4a3312 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -53,6 +53,8 @@ pub mod framelog;
+ #[cfg(windows)]
+ mod host;
+ #[cfg(windows)]
++mod over;
++#[cfg(windows)]
+ mod indirect;
+ #[cfg(windows)]
+ mod inplace;
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index eb77555..3662821 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -866,6 +866,48 @@ fn may_write(this: This) {
+     }
+ }
+
++/// Stands in for the console upscaler's dispatch on title list `this`:
++/// `output` gets the stretched top-left `render` texels of `colour`
++/// ([`crate::over`]). False if nothing was recorded (no host GPU, textures
++/// we do not hold, an output shaders cannot write).
++///
++/// The real dispatch leaves its own state in the list, so the title sets
++/// its own again afterwards; ours is replayed all the same.
++#[cfg(windows)]
++pub fn upscale_stretch(
++    this: *const std::ffi::c_void,
++    colour: *const std::ffi::c_void,
++    output: *const std::ffi::c_void,
++    render: [u32; 2],
++) -> bool {
++    const SHADER_READ: u32 = 0x40;
++    const UNORDERED: u32 = 0x8;
++    let (this, colour, output): (This, This, This) = (this.cast(), colour.cast(), output.cast());
++    if this.is_null() || colour.is_null() || output.is_null() {
++        return false;
++    }
++    let mut done = false;
++    with_state(this, |list, state| {
++        let (Some(to), Some(from), Some(host)) = (
++            crate::resource::host_resource(output),
++            crate::resource::host_resource(colour),
++            crate::host::host(),
++        ) else {
++            return;
++        };
++        list.keep(to);
++        list.keep(from);
++        ensure_state(list, colour, SHADER_READ);
++        ensure_state(list, output, UNORDERED);
++        done = crate::over::record_stretch(&host.device, &list.list, to, from, render);
++        if done {
++            crate::texture::host_written(output);
++        }
++        state.replay(list);
++    });
++    done
++}
++
+ /// Moves a title texture's host copy to `state` in the list, if needed.
+ #[cfg(windows)]
+ pub(crate) fn ensure_state(list: &crate::host::HostList, resource: This, state: u32) {
+diff --git a/crates/victory-gpu/src/over.rs b/crates/victory-gpu/src/over.rs
+new file mode 100644
+index 0000000..68c328c
+--- /dev/null
++++ b/crates/victory-gpu/src/over.rs
+@@ -0,0 +1,555 @@
++//! A present's second plane, drawn over the first in our window.
++//!
++//! The console's display composes the planes of a present. The title in
++//! its Series S mode presents two: its game image at 1920x1080 and its
++//! interface at 3840x2160, whose empty texels are zero with alpha zero. A
++//! window showing the first plane alone is black wherever the game plane
++//! is, the menus and loading screens included.
++//!
++//! The pass here draws the second plane over the back buffer once the first
++//! has been copied there: one triangle, the plane sampled across the whole
++//! buffer (stretched to it), blended by its alpha.
++//!
++//! shortcut: the alpha is taken as premultiplied (what an interface drawn
++//! onto a cleared target with the usual blending holds); planes after the
++//! second, and the placement and scaling a plane's parameters can ask for,
++//! are not read.
++
++use std::sync::Mutex;
++
++use windows::Win32::Foundation::RECT;
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT, DXGI_SAMPLE_DESC};
++
++const SOURCE: &str = r#"
++Texture2D<float4> plane : register(t0);
++SamplerState bilinear : register(s0);
++struct Corner { float4 position : SV_Position; float2 at : TEXCOORD0; };
++Corner corner(uint i : SV_VertexID) {
++    Corner c;
++    c.at = float2(float(i & 1) * 2.0, float(i >> 1) * 2.0);
++    c.position = float4(c.at.x * 2.0 - 1.0, 1.0 - c.at.y * 2.0, 0.0, 1.0);
++    return c;
++}
++float4 over(Corner c) : SV_Target { return plane.Sample(bilinear, c.at); }
++"#;
++
++/// Views kept until the list that uses them has run: a present can be sent
++/// ahead of the card, so a view is not reused for this many presents.
++///
++/// shortcut: a fixed count, not derived from how many presents are in
++/// flight. Presents sent ahead each hold a back buffer and the swap chain
++/// has two, so no more than a few lists are ever waiting; 16 is well past
++/// that.
++const RING: u32 = 16;
++
++struct Pass {
++    format: i32,
++    root: ID3D12RootSignature,
++    pipeline: ID3D12PipelineState,
++    targets: ID3D12DescriptorHeap,
++    views: ID3D12DescriptorHeap,
++    target_step: usize,
++    view_step: u32,
++    next: u32,
++}
++
++// SAFETY: D3D12 objects are free-threaded.
++unsafe impl Send for Pass {}
++
++static PASS: Mutex<Option<Pass>> = Mutex::new(None);
++
++/// A bilinear, clamping sampler at `s0` for the stages `visibility` names.
++fn bilinear(visibility: D3D12_SHADER_VISIBILITY) -> D3D12_STATIC_SAMPLER_DESC {
++    D3D12_STATIC_SAMPLER_DESC {
++        Filter: D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT,
++        AddressU: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++        AddressV: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++        AddressW: D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++        ComparisonFunc: D3D12_COMPARISON_FUNC_NEVER,
++        MaxLOD: f32::MAX,
++        ShaderRegister: 0,
++        RegisterSpace: 0,
++        ShaderVisibility: visibility,
++        ..Default::default()
++    }
++}
++
++/// A root signature of `parameters` and one bilinear sampler, serialized by
++/// the runtime and not taken from a shader: the system compiler under Wine
++/// compiles a `[RootSignature]` attribute without writing the signature
++/// into the shader, and `CreateRootSignature` then fails on it (#188).
++fn root_signature(
++    device: &ID3D12Device,
++    parameters: &[D3D12_ROOT_PARAMETER],
++    sampler: D3D12_SHADER_VISIBILITY,
++    flags: D3D12_ROOT_SIGNATURE_FLAGS,
++) -> windows::core::Result<ID3D12RootSignature> {
++    use windows::Win32::Graphics::Direct3D::ID3DBlob;
++    let samplers = [bilinear(sampler)];
++    let desc = D3D12_ROOT_SIGNATURE_DESC {
++        NumParameters: parameters.len() as u32,
++        pParameters: parameters.as_ptr(),
++        NumStaticSamplers: 1,
++        pStaticSamplers: samplers.as_ptr(),
++        Flags: flags,
++    };
++    let mut blob: Option<ID3DBlob> = None;
++    // SAFETY: the description points at live slices; the blob is the
++    // runtime's own, read while it lives.
++    unsafe {
++        D3D12SerializeRootSignature(&desc, D3D_ROOT_SIGNATURE_VERSION_1, &mut blob, None)?;
++        let blob = blob.ok_or_else(windows::core::Error::empty)?;
++        let bytes =
++            std::slice::from_raw_parts(blob.GetBufferPointer().cast::<u8>(), blob.GetBufferSize());
++        device.CreateRootSignature(0, bytes)
++    }
++}
++
++/// One descriptor range of one view at register 0, at `offset` in its table.
++fn range(kind: D3D12_DESCRIPTOR_RANGE_TYPE, offset: u32) -> D3D12_DESCRIPTOR_RANGE {
++    D3D12_DESCRIPTOR_RANGE {
++        RangeType: kind,
++        NumDescriptors: 1,
++        BaseShaderRegister: 0,
++        RegisterSpace: 0,
++        OffsetInDescriptorsFromTableStart: offset,
++    }
++}
++
++/// A root parameter that is a table of `ranges`, for the stages `visibility`
++/// names.
++fn table(ranges: &[D3D12_DESCRIPTOR_RANGE], visibility: D3D12_SHADER_VISIBILITY) -> D3D12_ROOT_PARAMETER {
++    D3D12_ROOT_PARAMETER {
++        ParameterType: D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE,
++        Anonymous: D3D12_ROOT_PARAMETER_0 {
++            DescriptorTable: D3D12_ROOT_DESCRIPTOR_TABLE {
++                NumDescriptorRanges: ranges.len() as u32,
++                pDescriptorRanges: ranges.as_ptr(),
++            },
++        },
++        ShaderVisibility: visibility,
++    }
++}
++
++fn make(device: &ID3D12Device, format: DXGI_FORMAT) -> windows::core::Result<Pass> {
++    use windows::core::s;
++    let vs = crate::host::compile(SOURCE, s!("corner"), s!("vs_5_1"))?;
++    let ps = crate::host::compile(SOURCE, s!("over"), s!("ps_5_1"))?;
++    let code = |bytes: &[u8]| D3D12_SHADER_BYTECODE {
++        pShaderBytecode: bytes.as_ptr().cast(),
++        BytecodeLength: bytes.len(),
++    };
++    let plane = [range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0)];
++    let root = root_signature(
++        device,
++        &[table(&plane, D3D12_SHADER_VISIBILITY_PIXEL)],
++        D3D12_SHADER_VISIBILITY_PIXEL,
++        D3D12_ROOT_SIGNATURE_FLAG_NONE,
++    )?;
++    // SAFETY: the description points at live data and never releases its
++    // pointer.
++    unsafe {
++        let mut desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
++            pRootSignature: std::mem::transmute_copy(&root),
++            VS: code(&vs[..]),
++            PS: code(&ps[..]),
++            SampleMask: u32::MAX,
++            RasterizerState: D3D12_RASTERIZER_DESC {
++                FillMode: D3D12_FILL_MODE_SOLID,
++                CullMode: D3D12_CULL_MODE_NONE,
++                DepthClipEnable: true.into(),
++                ..Default::default()
++            },
++            PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
++            NumRenderTargets: 1,
++            SampleDesc: DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            ..Default::default()
++        };
++        desc.RTVFormats[0] = format;
++        desc.BlendState.RenderTarget[0] = D3D12_RENDER_TARGET_BLEND_DESC {
++            BlendEnable: true.into(),
++            SrcBlend: D3D12_BLEND_ONE,
++            DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
++            BlendOp: D3D12_BLEND_OP_ADD,
++            SrcBlendAlpha: D3D12_BLEND_ONE,
++            DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
++            BlendOpAlpha: D3D12_BLEND_OP_ADD,
++            RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as u8,
++            ..Default::default()
++        };
++        let pipeline: ID3D12PipelineState = device.CreateGraphicsPipelineState(&desc)?;
++        let targets: ID3D12DescriptorHeap =
++            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
++                NumDescriptors: RING,
++                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
++                NodeMask: 0,
++            })?;
++        let views: ID3D12DescriptorHeap =
++            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++                NumDescriptors: RING,
++                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                NodeMask: 0,
++            })?;
++        Ok(Pass {
++            format: format.0,
++            root,
++            pipeline,
++            target_step: device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV)
++                as usize,
++            view_step: device
++                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
++            targets,
++            views,
++            next: 0,
++        })
++    }
++}
++
++/// Records into `list` the draw of `plane` (readable by pixel shaders, read
++/// as `plane_format`) over `back` (in the render-target state, `width` by
++/// `height`, of `format`). False if the pass could not be made: nothing was
++/// recorded then.
++///
++/// The pass sets the list's descriptor heap, root signature, pipeline,
++/// target, viewport, scissor and topology and puts none of them back: it is
++/// for a list of ours that records nothing of the title's.
++pub(crate) fn record(
++    device: &ID3D12Device,
++    list: &ID3D12GraphicsCommandList,
++    back: &ID3D12Resource,
++    format: DXGI_FORMAT,
++    (width, height): (u32, u32),
++    plane: &ID3D12Resource,
++    plane_format: DXGI_FORMAT,
++) -> bool {
++    let mut pass = PASS.lock().unwrap_or_else(|e| e.into_inner());
++    if pass.as_ref().is_none_or(|p| p.format != format.0) {
++        *pass = match make(device, format) {
++            Ok(p) => Some(p),
++            Err(e) => {
++                static TOLD: std::sync::Once = std::sync::Once::new();
++                TOLD.call_once(|| {
++                    tracing::warn!(error = %e, "no pass to draw a present's second plane: it is not shown");
++                });
++                return false;
++            }
++        };
++        tracing::info!(format = format.0, "a present's second plane is drawn over the first");
++    }
++    let Some(p) = pass.as_mut() else { return false };
++    let slot = p.next % RING;
++    p.next = p.next.wrapping_add(1);
++    let view = D3D12_SHADER_RESOURCE_VIEW_DESC {
++        Format: plane_format,
++        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++            Texture2D: D3D12_TEX2D_SRV {
++                MostDetailedMip: 0,
++                MipLevels: 1,
++                ..Default::default()
++            },
++        },
++    };
++    let target_desc = D3D12_RENDER_TARGET_VIEW_DESC {
++        Format: format,
++        ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
++        ..Default::default()
++    };
++    // SAFETY: an open list; slots of our heaps; live resources and objects
++    // (the pass's own live as long as the process or until remade, and a
++    // list holds what it was recorded with).
++    unsafe {
++        let target = D3D12_CPU_DESCRIPTOR_HANDLE {
++            ptr: p.targets.GetCPUDescriptorHandleForHeapStart().ptr + slot as usize * p.target_step,
++        };
++        let cpu = D3D12_CPU_DESCRIPTOR_HANDLE {
++            ptr: p.views.GetCPUDescriptorHandleForHeapStart().ptr
++                + (slot * p.view_step) as usize,
++        };
++        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
++            ptr: p.views.GetGPUDescriptorHandleForHeapStart().ptr
++                + u64::from(slot * p.view_step),
++        };
++        device.CreateRenderTargetView(back, Some(&target_desc), target);
++        device.CreateShaderResourceView(plane, Some(&view), cpu);
++        list.SetDescriptorHeaps(&[Some(p.views.clone())]);
++        list.SetGraphicsRootSignature(&p.root);
++        list.SetPipelineState(&p.pipeline);
++        list.SetGraphicsRootDescriptorTable(0, gpu);
++        list.OMSetRenderTargets(1, Some(&target), false, None);
++        list.RSSetViewports(&[D3D12_VIEWPORT {
++            TopLeftX: 0.0,
++            TopLeftY: 0.0,
++            Width: width as f32,
++            Height: height as f32,
++            MinDepth: 0.0,
++            MaxDepth: 1.0,
++        }]);
++        list.RSSetScissorRects(&[RECT {
++            left: 0,
++            top: 0,
++            right: width as i32,
++            bottom: height as i32,
++        }]);
++        list.IASetPrimitiveTopology(windows::Win32::Graphics::Direct3D::D3D_PRIMITIVE_TOPOLOGY(4));
++        list.DrawInstanced(3, 1, 0, 0);
++    }
++    true
++}
++
++// ---------------------------------------------------------------------------
++// The upscaler's output, by a plain stretch
++// ---------------------------------------------------------------------------
++
++/// The title in its Series S mode renders below its output size and has the
++/// console's upscaler (its `ffxDispatch`) write the output. That upscaler's
++/// passes are compute pipelines in a container we do not translate, so the
++/// output stayed black. This pass stands in for it: each output texel is the
++/// bilinear sample of the rendered part of the colour input.
++///
++/// shortcut: no temporal accumulation, sharpening or use of the depth and
++/// motion inputs: an image, not the upscaler's quality.
++const STRETCH: &str = r#"
++cbuffer Sizes : register(b0) { float2 scale; float2 texel; };
++Texture2D<float4> source : register(t0);
++RWTexture2D<float4> target : register(u0);
++SamplerState bilinear : register(s0);
++[numthreads(8, 8, 1)]
++void stretch(uint3 id : SV_DispatchThreadID) {
++    // Groups are 8 by 8: the last ones reach past a size that is not a
++    // multiple of 8.
++    uint width, height;
++    target.GetDimensions(width, height);
++    if (id.x >= width || id.y >= height) return;
++    float2 at = (float2(id.xy) + 0.5) * texel * scale;
++    // The rendered size can be the top left of a larger texture: stay half a
++    // texel inside it, or the filter takes in what is beside it.
++    uint sw, sh;
++    source.GetDimensions(sw, sh);
++    at = min(at, scale - 0.5 / float2(sw, sh));
++    target[id.xy] = source.SampleLevel(bilinear, at, 0);
++}
++"#;
++
++struct Stretch {
++    root: ID3D12RootSignature,
++    pipeline: ID3D12PipelineState,
++    views: ID3D12DescriptorHeap,
++    step: u32,
++    next: u32,
++}
++
++// SAFETY: D3D12 objects are free-threaded.
++unsafe impl Send for Stretch {}
++
++static STRETCHER: Mutex<Option<Stretch>> = Mutex::new(None);
++
++/// Views of a stretch are kept this many stretches (two views each).
++///
++/// shortcut: a fixed count. The title dispatches the upscaler once a frame
++/// and a list runs within the frames the title keeps in flight; 64 frames
++/// is far more than it keeps.
++const STRETCH_RING: u32 = 64;
++
++fn make_stretch(device: &ID3D12Device) -> windows::core::Result<Stretch> {
++    use windows::core::s;
++    let cs = crate::host::compile(STRETCH, s!("stretch"), s!("cs_5_1"))?;
++    let views = [
++        range(D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 0),
++        range(D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1),
++    ];
++    let sizes = D3D12_ROOT_PARAMETER {
++        ParameterType: D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS,
++        Anonymous: D3D12_ROOT_PARAMETER_0 {
++            Constants: D3D12_ROOT_CONSTANTS {
++                ShaderRegister: 0,
++                RegisterSpace: 0,
++                Num32BitValues: 4,
++            },
++        },
++        ShaderVisibility: D3D12_SHADER_VISIBILITY_ALL,
++    };
++    let root = root_signature(
++        device,
++        &[sizes, table(&views, D3D12_SHADER_VISIBILITY_ALL)],
++        D3D12_SHADER_VISIBILITY_ALL,
++        D3D12_ROOT_SIGNATURE_FLAG_NONE,
++    )?;
++    // SAFETY: the description points at live data and never releases its
++    // pointer.
++    unsafe {
++        let desc = D3D12_COMPUTE_PIPELINE_STATE_DESC {
++            pRootSignature: std::mem::transmute_copy(&root),
++            CS: D3D12_SHADER_BYTECODE {
++                pShaderBytecode: cs.as_ptr().cast(),
++                BytecodeLength: cs.len(),
++            },
++            ..Default::default()
++        };
++        let pipeline: ID3D12PipelineState = device.CreateComputePipelineState(&desc)?;
++        let views: ID3D12DescriptorHeap =
++            device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++                NumDescriptors: STRETCH_RING * 2,
++                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                NodeMask: 0,
++            })?;
++        Ok(Stretch {
++            root,
++            pipeline,
++            step: device
++                .GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV),
++            views,
++            next: 0,
++        })
++    }
++}
++
++/// A typeless colour format as the typed one shaders read and write.
++fn typed(format: DXGI_FORMAT) -> DXGI_FORMAT {
++    DXGI_FORMAT(match format.0 {
++        1 => 2,
++        9 => 10,
++        23 => 24,
++        27 => 28,
++        f => f,
++    })
++}
++
++/// Records into `list` the stretch of the top-left `render` texels of
++/// `source` (readable by compute shaders) over the whole of `target` (in
++/// the unordered-access state). False if nothing was recorded.
++///
++/// The pass sets the list's descriptor heap, compute root signature and
++/// pipeline and puts none of them back: the caller replays the title's.
++pub(crate) fn record_stretch(
++    device: &ID3D12Device,
++    list: &ID3D12GraphicsCommandList,
++    target: &ID3D12Resource,
++    source: &ID3D12Resource,
++    render: [u32; 2],
++) -> bool {
++    // SAFETY: live resources.
++    let (to, from) = unsafe { (target.GetDesc(), source.GetDesc()) };
++    if to.Flags.0 & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS.0 == 0
++        || to.Width == 0
++        || from.Width == 0
++    {
++        return false;
++    }
++    let mut made = STRETCHER.lock().unwrap_or_else(|e| e.into_inner());
++    if made.is_none() {
++        // Tried again at the next dispatch if it fails, as the pass over a
++        // present is: a failure need not last.
++        *made = match make_stretch(device) {
++            Ok(p) => {
++                tracing::info!("the upscaler's output is made by a plain stretch of its colour input");
++                Some(p)
++            }
++            Err(e) => {
++                static TOLD: std::sync::Once = std::sync::Once::new();
++                TOLD.call_once(|| {
++                    tracing::warn!(error = %e, "no pass to stretch the upscaler's input: its output stays as it is");
++                });
++                None
++            }
++        };
++    }
++    let Some(p) = made.as_mut() else { return false };
++    let slot = (p.next % STRETCH_RING) * 2;
++    p.next = p.next.wrapping_add(1);
++    let (width, height) = (to.Width as u32, to.Height);
++    let rendered = [
++        if render[0] == 0 { from.Width as u32 } else { render[0].min(from.Width as u32) },
++        if render[1] == 0 { from.Height } else { render[1].min(from.Height) },
++    ];
++    let sizes = [
++        rendered[0] as f32 / from.Width as f32,
++        rendered[1] as f32 / from.Height as f32,
++        1.0 / width as f32,
++        1.0 / height as f32,
++    ];
++    let read = D3D12_SHADER_RESOURCE_VIEW_DESC {
++        Format: typed(from.Format),
++        ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++        Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++            Texture2D: D3D12_TEX2D_SRV {
++                MostDetailedMip: 0,
++                MipLevels: 1,
++                ..Default::default()
++            },
++        },
++    };
++    let written = D3D12_UNORDERED_ACCESS_VIEW_DESC {
++        Format: typed(to.Format),
++        ViewDimension: D3D12_UAV_DIMENSION_TEXTURE2D,
++        ..Default::default()
++    };
++    // SAFETY: an open list; slots of our heap; live resources and objects
++    // (the pass's own live as long as the process).
++    unsafe {
++        let cpu = |i: u32| D3D12_CPU_DESCRIPTOR_HANDLE {
++            ptr: p.views.GetCPUDescriptorHandleForHeapStart().ptr + ((slot + i) * p.step) as usize,
++        };
++        let gpu = D3D12_GPU_DESCRIPTOR_HANDLE {
++            ptr: p.views.GetGPUDescriptorHandleForHeapStart().ptr + u64::from(slot * p.step),
++        };
++        device.CreateShaderResourceView(source, Some(&read), cpu(0));
++        device.CreateUnorderedAccessView(target, None, Some(&written), cpu(1));
++        list.SetDescriptorHeaps(&[Some(p.views.clone())]);
++        list.SetComputeRootSignature(&p.root);
++        list.SetPipelineState(&p.pipeline);
++        list.SetComputeRoot32BitConstants(0, 4, sizes.as_ptr().cast(), 0);
++        list.SetComputeRootDescriptorTable(1, gpu);
++        list.Dispatch(width.div_ceil(8), height.div_ceil(8), 1);
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// Typeless colour formats are read and written as their typed ones;
++    /// typed formats, and formats with no typeless form here, stay.
++    #[test]
++    fn typeless_formats_get_their_typed_one() {
++        for (typeless, typed_one) in [(1, 2), (9, 10), (23, 24), (27, 28)] {
++            assert_eq!(typed(DXGI_FORMAT(typeless)).0, typed_one);
++            assert_eq!(typed(DXGI_FORMAT(typed_one)).0, typed_one);
++        }
++        // R11G11B10_FLOAT, R8G8B8A8_UNORM_SRGB and the FP16 stand-in's own.
++        for format in [26, 29, 10, 0] {
++            assert_eq!(typed(DXGI_FORMAT(format)).0, format);
++        }
++    }
++
++    /// The passes' root signatures are serialized by the runtime: neither
++    /// source asks the compiler for one (Wine's writes none).
++    #[test]
++    fn the_sources_carry_no_root_signature() {
++        for source in [SOURCE, STRETCH] {
++            assert!(!source.contains("RootSignature"));
++            assert!(!source.contains("#define RS"));
++        }
++    }
++
++    /// The stretch's source guards its writes: groups of 8 reach past sizes
++    /// that are not multiples of 8.
++    #[test]
++    fn the_stretch_writes_inside_its_target_only() {
++        assert!(STRETCH.contains("numthreads(8, 8, 1)"));
++        assert!(STRETCH.contains("if (id.x >= width || id.y >= height) return;"));
++    }
++}
++
++#[cfg(test)]
++mod readback;
+diff --git a/crates/victory-gpu/src/over/readback.rs b/crates/victory-gpu/src/over/readback.rs
+new file mode 100644
+index 0000000..dd42b07
+--- /dev/null
++++ b/crates/victory-gpu/src/over/readback.rs
+@@ -0,0 +1,178 @@
++//! GPU readback for the two Series S display passes.
++
++use super::*;
++
++/// Stretches a blue 3 by 2 scene to 5 by 3 and reads the result back, `None`
++/// without a device. `padded`: the scene is the top left of a 4 by 3 texture
++/// whose other texels are red, and the interface over it is empty; otherwise
++/// the interface has a half green and a red strip.
++fn stretched(padded: bool) -> Option<[[u8; 20]; 3]> {
++    use crate::host::{host, transition};
++    use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R8G8B8A8_UNORM as RGBA8;
++    let Some(host) = host() else {
++        eprintln!("no D3D12 device; skipping display readback");
++        return None;
++    };
++    let texture = |width: u32, height, flags, state| {
++        let mut resource: Option<ID3D12Resource> = None;
++        // SAFETY: plain creation of a texture with one RGBA8 subresource.
++        unsafe {
++            host.device
++                .CreateCommittedResource(
++                    &D3D12_HEAP_PROPERTIES {
++                        Type: D3D12_HEAP_TYPE_DEFAULT,
++                        ..Default::default()
++                    },
++                    D3D12_HEAP_FLAG_NONE,
++                    &D3D12_RESOURCE_DESC {
++                        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++                        Width: u64::from(width),
++                        Height: height,
++                        DepthOrArraySize: 1,
++                        MipLevels: 1,
++                        Format: RGBA8,
++                        SampleDesc: DXGI_SAMPLE_DESC {
++                            Count: 1,
++                            Quality: 0,
++                        },
++                        Flags: flags,
++                        ..Default::default()
++                    },
++                    state,
++                    None,
++                    &mut resource,
++                )
++                .unwrap();
++        }
++        resource.unwrap()
++    };
++    let sub = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
++        // SAFETY: the copy location borrows this resource.
++        pResource: unsafe { std::mem::transmute_copy(r) },
++        Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++            SubresourceIndex: 0,
++        },
++    };
++    let rows = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
++        // SAFETY: the copy location borrows this resource.
++        pResource: unsafe { std::mem::transmute_copy(r) },
++        Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++        Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++            PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                Offset: 0,
++                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                    Format: RGBA8,
++                    Width: 5,
++                    Height: 3,
++                    Depth: 1,
++                    RowPitch: 256,
++                },
++            },
++        },
++    };
++    let uav = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    let rtv = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    let (width, height) = if padded { (4, 3) } else { (3, 2) };
++    let scene = texture(width, height, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
++    let ui = texture(5, 3, D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, rtv);
++    let target = texture(
++        5,
++        3,
++        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++        uav,
++    );
++    let readback = host.read_back_buffer(768).unwrap();
++    let commands = host.new_list().unwrap();
++    let list = &commands.list;
++    // SAFETY: both views and all resources live through command completion.
++    unsafe {
++        let scene_view = host.rtv(Some(&scene), None);
++        let ui_view = host.rtv(Some(&ui), None);
++        list.ClearRenderTargetView(scene_view, &[1.0, 0.0, 0.0, 1.0], None);
++        let drawn = RECT {
++            left: 0,
++            right: 3,
++            top: 0,
++            bottom: 2,
++        };
++        list.ClearRenderTargetView(scene_view, &[0.0, 0.0, 1.0, 1.0], Some(&[drawn]));
++        list.ClearRenderTargetView(ui_view, &[0.0; 4], None);
++        let strip = |left, right| RECT {
++            left,
++            right,
++            top: 0,
++            bottom: 3,
++        };
++        if !padded {
++            list.ClearRenderTargetView(
++                ui_view,
++                &[0.0, 128.0 / 255.0, 0.0, 128.0 / 255.0],
++                Some(&[strip(2, 3)]),
++            );
++            list.ClearRenderTargetView(ui_view, &[1.0, 0.0, 0.0, 1.0], Some(&[strip(3, 5)]));
++        }
++        list.ResourceBarrier(&[
++            transition(&scene, rtv, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE),
++            transition(&ui, rtv, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE),
++        ]);
++        assert!(record_stretch(&host.device, list, &target, &scene, [3, 2]));
++        list.ResourceBarrier(&[transition(&target, uav, rtv)]);
++        assert!(record(
++            &host.device,
++            list,
++            &target,
++            RGBA8,
++            (5, 3),
++            &ui,
++            RGBA8
++        ));
++        list.ResourceBarrier(&[transition(&target, rtv, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++        list.CopyTextureRegion(&rows(&readback), 0, 0, 0, &sub(&target), None);
++    }
++    commands.close();
++    host.execute(&[&commands]);
++    // SAFETY: execute waited for the copy. Each row contains five texels.
++    let mut ptr = std::ptr::null_mut();
++    let mut pixels = [[0u8; 20]; 3];
++    unsafe {
++        readback.Map(0, None, Some(&mut ptr)).unwrap();
++        for (y, row) in pixels.iter_mut().enumerate() {
++            row.copy_from_slice(std::slice::from_raw_parts(
++                ptr.cast::<u8>().add(y * 256),
++                20,
++            ));
++        }
++        readback.Unmap(0, None);
++    }
++    Some(pixels)
++}
++
++#[test]
++fn stretch_and_overlay_preserve_the_expected_pixels() {
++    let Some(pixels) = stretched(false) else {
++        return;
++    };
++    let expected = [
++        [0, 0, 255, 255],
++        [0, 0, 255, 255],
++        [0, 128, 127, 255],
++        [255, 0, 0, 255],
++        [255, 0, 0, 255],
++    ];
++    for row in pixels {
++        assert_eq!(&row[..], expected.as_flattened());
++    }
++}
++
++/// The title's colour is the top left of a larger texture: what is beside
++/// the rendered size must not be filtered into the right and bottom edges.
++#[test]
++fn stretch_does_not_filter_in_what_is_beside_the_rendered_size() {
++    let Some(pixels) = stretched(true) else {
++        return;
++    };
++    for row in pixels {
++        assert_eq!(&row[..], [[0u8, 0, 255, 255]; 5].as_flattened());
++    }
++}
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index aca7ef3..0f64024 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -1844,7 +1844,8 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+     // With `present_behind`: the frame is shown by our thread, behind what
+     // the queue holds, and nothing is run or waited for here.
+     #[cfg(windows)]
+-    let sent_behind = present_behind() && send_behind(this, planes, plane_parameters);
++    let sent_behind = (planes < 2 || crate::console::current() != crate::console::Console::SeriesS)
++        && present_behind() && send_behind(this, planes, plane_parameters);
+     #[cfg(not(windows))]
+     let _ = this;
+     // With `behind`: the title's thread waits on the lines from here
+@@ -1975,7 +1976,23 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+         const COPY_SOURCE: u32 = 0x800;
+         let state = crate::resource::host_transition(resource, COPY_SOURCE)
+             .map_or(COPY_SOURCE, |(_, before)| before);
+-        let shown = host.present(texture, state, frame);
++        // A second plane (the title's interface over its game image, in
++        // its Series S mode) is drawn over the first: `crate::over`. Each
++        // plane's description is 0x48 bytes and starts as the first does.
++        const READABLE: u32 = 0x80;
++        // SAFETY: the title passes `planes` plane descriptions.
++        let second = (crate::console::current() == crate::console::Console::SeriesS)
++            .then(|| unsafe { second_plane(planes, plane_parameters, resource) })
++            .flatten()
++            .and_then(|r| Some((r, crate::resource::host_copy(r)?)));
++        let over = second.map(|(r, t)| {
++            let was = crate::resource::host_transition(r, READABLE).map_or(READABLE, |(_, before)| before);
++            (r, t, was)
++        });
++        let shown = host.present_planes(texture, state, frame, over.as_ref().map(|(_, t, was)| (&t.texture, *was)));
++        if let Some((r, _, was)) = over {
++            crate::resource::host_transition(r, was);
++        }
+         crate::resource::host_transition(resource, state);
+         #[cfg(feature = "diagnostics")]
+         blinks(frame, resource, state, shown);
+@@ -1986,6 +2003,74 @@ fn present_now(this: This, planes: u32, plane_parameters: *const Plane, _paramet
+     let _ = (planes, plane_parameters);
+     S_OK
+ }
++/// The bytes from one plane's description to the next in a present.
++const PLANE_STRIDE: usize = 0x48;
++
++/// The first resource of a present's second plane, if it has one that is not
++/// the first plane's (`first`): what is drawn over the first.
++///
++/// # Safety
++/// `parameters` is null or points at `planes` plane descriptions,
++/// [`PLANE_STRIDE`] bytes apart, each listing `count` resources.
++unsafe fn second_plane(planes: u32, parameters: *const Plane, first: This) -> Option<This> {
++    if planes < 2 || parameters.is_null() {
++        return None;
++    }
++    // SAFETY: the caller's: a second description follows the first.
++    let plane = unsafe { &*parameters.cast::<u8>().add(PLANE_STRIDE).cast::<Plane>() };
++    if plane.count == 0 || plane.resources.is_null() {
++        return None;
++    }
++    // SAFETY: the caller's: the plane lists `count` resources.
++    let resource = unsafe { *plane.resources };
++    (!resource.is_null() && resource != first).then_some(resource)
++}
++
++#[cfg(test)]
++mod plane_tests {
++    use super::*;
++
++    /// Two plane descriptions as a title lays them out, [`PLANE_STRIDE`]
++    /// bytes apart, the second naming `count` resources at `resources`.
++    fn two(count: u32, resources: *const This) -> [u64; 2 * PLANE_STRIDE / 8] {
++        let mut words = [0u64; 2 * PLANE_STRIDE / 8];
++        let second = PLANE_STRIDE / 8;
++        words[second] = 7; // frame token
++        words[second + 1] = u64::from(count);
++        words[second + 2] = resources as u64;
++        words
++    }
++
++    #[test]
++    fn the_second_plane_is_chosen_only_when_it_names_another_resource() {
++        let (a, b) = (0x1000 as This, 0x2000 as This);
++        let other = [b];
++        let same = [a];
++        let none = [std::ptr::null::<crate::object::Object>()];
++        // SAFETY: each description is a whole local array laid out as the
++        // title's; resource lists are local arrays of one.
++        unsafe {
++            let with_other = two(1, other.as_ptr());
++            let p = with_other.as_ptr().cast::<Plane>();
++            assert_eq!(second_plane(2, p, a), Some(b));
++            // One plane, or no descriptions at all: nothing over the first.
++            assert_eq!(second_plane(1, p, a), None);
++            assert_eq!(second_plane(0, p, a), None);
++            assert_eq!(second_plane(2, std::ptr::null(), a), None);
++            // The same resource twice is not drawn over itself.
++            let with_same = two(1, same.as_ptr());
++            assert_eq!(second_plane(2, with_same.as_ptr().cast(), a), None);
++            // An empty plane, a plane without a list, a null resource.
++            let empty = two(0, other.as_ptr());
++            assert_eq!(second_plane(2, empty.as_ptr().cast(), a), None);
++            let unlisted = two(1, std::ptr::null());
++            assert_eq!(second_plane(2, unlisted.as_ptr().cast(), a), None);
++            let with_null = two(1, none.as_ptr());
++            assert_eq!(second_plane(2, with_null.as_ptr().cast(), a), None);
++        }
++    }
++}
++
+ /// Diagnostics: logs a presented frame that is black after one that was
+ /// not, with what was presented and how many draws ran since.
+ #[cfg(all(windows, feature = "diagnostics"))]
+diff --git a/crates/victory-hle/src/modules/ffx.rs b/crates/victory-hle/src/modules/ffx.rs
+new file mode 100644
+index 0000000..c0e5af5
+--- /dev/null
++++ b/crates/victory-hle/src/modules/ffx.rs
+@@ -0,0 +1,171 @@
++//! `amd_fidelityfx_loader_xbox.dll`: the upscale dispatch.
++//!
++//! The title's Series S mode renders below its output size and calls the
++//! console's FidelityFX upscaler to make the output. The loader and the
++//! upscaler are the title's own DLLs and run as they are, but the
++//! upscaler's passes are compute pipelines in a container we do not
++//! translate: its output stayed black. `ffxDispatch` alone is taken here:
++//! an upscale dispatch becomes a plain stretch of the colour input
++//! (`victory_gpu::list::upscale_stretch`); anything else, and an upscale we
++//! could not stretch, goes to the title's DLL.
++//!
++//! The structures are the public FidelityFX API's (`ffx_api.h`,
++//! `ffx_upscale.h`): a header of a type and a next pointer, and resources of
++//! a pointer, a 32-byte description and a state.
++
++use std::ffi::c_void;
++use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
++
++
++/// The DLL whose `ffxDispatch` is taken.
++pub const LOADER: &str = "amd_fidelityfx_loader_xbox.dll";
++
++static REAL: AtomicUsize = AtomicUsize::new(0);
++
++/// The title's own `ffxDispatch`, for what is not stretched here.
++pub fn set_real_dispatch(address: usize) {
++    REAL.store(address, Ordering::Relaxed);
++}
++
++#[repr(C)]
++struct Header {
++    kind: u64,
++    next: *const Header,
++}
++
++#[repr(C)]
++struct Resource {
++    resource: *const c_void,
++    description: [u32; 8],
++    state: u32,
++}
++
++#[repr(C)]
++struct Upscale {
++    header: Header,
++    list: *const c_void,
++    colour: Resource,
++    depth: Resource,
++    motion: Resource,
++    exposure: Resource,
++    reactive: Resource,
++    composition: Resource,
++    output: Resource,
++    jitter: [f32; 2],
++    motion_scale: [f32; 2],
++    render: [u32; 2],
++    upscale: [u32; 2],
++}
++
++const _: () = assert!(size_of::<Resource>() == 48);
++const _: () = assert!(std::mem::offset_of!(Upscale, output) == 0x138);
++
++/// `FFX_API_RETURN_ERROR`: what a dispatch nothing could answer returns.
++const ERROR: u32 = 1;
++
++/// `FFX_API_DISPATCH_DESC_TYPE_UPSCALE`.
++const UPSCALE: u64 = 0x0001_0001;
++
++type Dispatch = extern "system" fn(*mut *mut c_void, *const Header) -> u32;
++
++extern "system" fn dispatch(context: *mut *mut c_void, desc: *const Header) -> u32 {
++    // SAFETY: the title passes a dispatch description, whose header says
++    // what follows it.
++    if let Some(header) = unsafe { desc.as_ref() } {
++        static SEEN: AtomicU32 = AtomicU32::new(0);
++        let first = SEEN.fetch_add(1, Ordering::Relaxed) < 4;
++        if header.kind == UPSCALE {
++            // SAFETY: an upscale description, by its type.
++            let d = unsafe { &*desc.cast::<Upscale>() };
++            if first {
++                tracing::info!(
++                    list = ?d.list,
++                    colour = ?d.colour.resource,
++                    colour_size = ?(d.colour.description[2], d.colour.description[3]),
++                    output = ?d.output.resource,
++                    output_size = ?(d.output.description[2], d.output.description[3]),
++                    render = ?d.render,
++                    upscale = ?d.upscale,
++                    "upscale dispatch"
++                );
++            }
++            #[cfg(windows)]
++            if victory_gpu::list::upscale_stretch(
++                d.list,
++                d.colour.resource,
++                d.output.resource,
++                d.render,
++            ) {
++                return 0;
++            }
++            if first {
++                tracing::warn!("upscale dispatch not stretched: left to the title's upscaler");
++            }
++        } else if first {
++            tracing::info!(
++                kind = format_args!("{:#x}", header.kind),
++                "another FidelityFX dispatch"
++            );
++        }
++    }
++    match REAL.load(Ordering::Relaxed) {
++        // Neither stretched nor passed on: the output was not written, and
++        // the title is told so instead of presenting it as it is.
++        0 => {
++            static TOLD: std::sync::Once = std::sync::Once::new();
++            TOLD.call_once(|| {
++                tracing::error!(
++                    "a FidelityFX dispatch was not answered: no stretch was recorded and the title's own ffxDispatch was not found"
++                );
++            });
++            ERROR
++        }
++        // SAFETY: the title's own `ffxDispatch`, with its own arguments.
++        real => unsafe { std::mem::transmute::<usize, Dispatch>(real)(context, desc) },
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::mem::offset_of;
++
++    /// The upscale description as the public API lays it out: what the
++    /// stretch reads sits where the title wrote it.
++    #[test]
++    fn the_upscale_description_is_laid_out_as_the_public_api() {
++        assert_eq!(size_of::<Header>(), 16);
++        assert_eq!(offset_of!(Upscale, list), 0x10);
++        assert_eq!(offset_of!(Upscale, colour), 0x18);
++        assert_eq!(offset_of!(Upscale, depth), 0x48);
++        assert_eq!(offset_of!(Upscale, motion), 0x78);
++        assert_eq!(offset_of!(Upscale, output), 0x138);
++        assert_eq!(offset_of!(Upscale, jitter), 0x168);
++        assert_eq!(offset_of!(Upscale, motion_scale), 0x170);
++        assert_eq!(offset_of!(Upscale, render), 0x178);
++        assert_eq!(offset_of!(Upscale, upscale), 0x180);
++        assert_eq!(offset_of!(Resource, description), 8);
++        assert_eq!(offset_of!(Resource, state), 40);
++    }
++
++    /// A dispatch that is not an upscale, with no DLL of the title's to
++    /// pass it to, is an error and not a silent success.
++    #[test]
++    fn a_dispatch_nothing_answers_is_an_error() {
++        let before = REAL.swap(0, Ordering::Relaxed);
++        let other = Header {
++            kind: 0x0002_0001,
++            next: std::ptr::null(),
++        };
++        assert_eq!(dispatch(std::ptr::null_mut(), &other), ERROR);
++        assert_eq!(dispatch(std::ptr::null_mut(), std::ptr::null()), ERROR);
++        REAL.store(before, Ordering::Relaxed);
++    }
++}
++
++/// What the title's import of `ffxDispatch` is bound to. The DLL is not an
++/// HLE module: the title's own must load, for its other entry points and
++/// for the dispatches passed on.
++pub fn dispatch_address() -> usize {
++    dispatch as *const () as usize
++}
+diff --git a/crates/victory-hle/src/modules/mod.rs b/crates/victory-hle/src/modules/mod.rs
+index 51e3590..4e7f910 100644
+--- a/crates/victory-hle/src/modules/mod.rs
++++ b/crates/victory-hle/src/modules/mod.rs
+@@ -12,6 +12,7 @@
+ pub mod apu;
+ pub mod audio;
+ pub mod d3d12x;
++pub mod ffx;
+ pub mod display;
+ pub mod dsp;
+ #[cfg(windows)]

@@ -1,11 +1,11 @@
 # PR995 Linux candidate: source and reproduction kit
 
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
-The finished source tree is `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
+The earlier small-buffer checkpoint is tree `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
 It retains the published `91b6968` checkpoint, where a player confirmed
 walking, camera control, conversation and mouth movement on an Xbox Wireless
-Controller. The texture and scheduling update changed five files. The latest
-performance patch touches three, including the existing shader lowering file.
+Controller. The current kit adds Series S rendering and selected
+VIctory-7900XTX performance changes to that source history.
 [PR995](https://github.com/fxceless/victory-fork/pull/995) · [Source verification and checkpoint results](validation.md#updated-source-verification)
 
 ## Historical PR995 Linux baseline
@@ -52,7 +52,9 @@ To verify the finished source without building, run
 `sh docs/pr995-candidate/verify.sh "../linvxtory-renderer"`. The wrapper
 verifies the 188-input Linux baseline before applying the published three-PR
 delta. At the exact `91b6968` checkpoint it applies the five-file follow-up.
-It applies the three-file performance patch to the verified `f0ca006` source. Every path verifies all 190 final inputs before Cargo.
+It applies the three-file performance patch to verified `f0ca006` source,
+then applies the small-buffer, Series S and 7900XTX updates. Every path
+verifies all 193 final inputs before Cargo.
 
 The zero-context patch deliberately excludes untouched upstream text; use
 `--unidiff-zero` only after checking the pinned clean base. All patch content is
@@ -78,6 +80,29 @@ cargo test -p victory-shader --lib --all-features --offline --locked
 The historical PR995 source passed 187 native shader tests, with two ignored, including
 code-table boundaries, paired-wave guards and retained host annotations. Native exact-input tests can use a private external
 directory; no such inputs are distributed. The final donor and this candidate each passed all four GPU pipeline-creation checks.
+
+## Series S and 7900XTX changes
+
+- The Series S presentation repair combines the interface plane and expands
+  the 1280×720 image to 1920×1080. Both stretch and overlay pixel checks
+  passed on the RTX 5090 under GE-Proton. [sagouindupm, fxceless PR188](https://github.com/fxceless/victory-fork/pull/188)
+- The Series S default joins up to eight submission parts. Series X joins up
+  to four parts. Explicit `VICTORY_JOIN_MOST` continues to take precedence.
+  The Series S trial rose from 6.20 to 6.62 FPS in the same world-relative
+  window, with a median of zero indirect drops in both replays.
+  [VIctory-7900XTX setup](https://github.com/avatarmanz/VIctory-7900XTX/tree/c9c932cbcc38defd8f1683d62dd298187f565031)
+- Placed views reuse identical shapes across addresses and use a hash index
+  to find existing entries. Buffer descriptors ignore padding while preserving
+  meaningful SRV and UAV fields. A hash collision still uses exact equality.
+  [kripotker, 7900XTX PR206](https://github.com/avatarmanz/VIctory-7900XTX/pull/206)
+- Shader translation skips the lane-unspill analysis for programs without
+  lane parking instructions and avoids a temporary allocation per VALU
+  opcode. The native shader suite passed 190 tests with two ignored.
+  [Amine El Mahouti and Claude Opus 5.5, 7900XTX PR268](https://github.com/avatarmanz/VIctory-7900XTX/pull/268)
+- The offline shader scanner reads and hashes only the declared DXBC container
+  bytes. An identical embedded shader now has the same inventory and warm-up
+  hash regardless of surrounding archive bytes. Prior lists for padded raw
+  containers may need regenerating. [AgonisingBasher, 7900XTX PR322](https://github.com/avatarmanz/VIctory-7900XTX/pull/322)
 
 ## Performance changes since f0ca006
 
@@ -200,6 +225,17 @@ invoking Cargo. [Upstream threshold port](https://github.com/fxceless/victory-fo
 
 OctoAlgo measured the threshold on their fork and ran a combined experiment
 on PR995. [RTX 5090 measurements](../linux-notes-5090.md) · [Local RTX 5090 comparison](validation.md#small-buffer-eligibility-on-an-rtx-5090)
+
+## Series S display and constant-buffer snapshot fixes
+
+The standard build applies [series-s.patch.txt](series-s.patch.txt) after
+the card-buffer update. It rebuilds constant-buffer tables after a list
+splits at a title wait, then includes the Series S presentation and
+upscale passes adapted from sagouindupm's
+[fxceless PR188](https://github.com/fxceless/victory-fork/pull/188)
+at `2f81ff8`. The build checks the resulting source against
+[series-s-files.json](series-s-files.json).
+To select the Series S profile, add `--console series-s` to `victory run`.
 
 ## Linux preset and runtime
 

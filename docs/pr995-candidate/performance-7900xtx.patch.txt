@@ -1,0 +1,362 @@
+diff --git a/apps/victory/src/shader.rs b/apps/victory/src/shader.rs
+index 49180ea..8685c1a 100644
+--- a/apps/victory/src/shader.rs
++++ b/apps/victory/src/shader.rs
+@@ -43,10 +43,12 @@ pub(crate) fn sources(data: &[u8]) -> Vec<Source<'_>> {
+         out.extend(sgd5::records(data).map(Source::Packed));
+     }
+     let raw = memchr::memmem::find_iter(data, b"DXBC")
+-        .filter(|&offset| Container::parse(&data[offset..]).is_ok())
+-        .map(|offset| Source::Raw {
+-            offset,
+-            data: &data[offset..],
++        .filter_map(|offset| {
++            let container = Container::parse(&data[offset..]).ok()?;
++            Some(Source::Raw {
++                offset,
++                data: container.as_bytes(),
++            })
+         });
+     out.extend(raw);
+     out
+@@ -225,3 +227,28 @@ fn format_instruction(i: &Instruction, wave64: bool) -> String {
+     };
+     format!("    {:06x}: {:<44} {text}", i.offset, words.join(" "))
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn identical_embedded_containers_have_the_same_bytes() {
++        let mut container = [0; 32];
++        container[..4].copy_from_slice(b"DXBC");
++        container[0x14] = 1;
++        container[0x18] = 32;
++        let mut file = b"prefix".to_vec();
++        file.extend_from_slice(&container);
++        file.extend_from_slice(b"padding");
++        file.extend_from_slice(&container);
++        file.extend_from_slice(b"trailer");
++
++        let found = sources(&file);
++
++        assert_eq!(found.len(), 2);
++        for source in found {
++            assert_eq!(source.bytes().unwrap().as_ref(), &container);
++        }
++    }
++}
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 1b40a54..dc73e28 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -977,9 +977,12 @@ struct Views {
+     /// Entries naming each resource.
+     by_resource: std::collections::BTreeMap<usize, Vec<u32>>,
+     free: Vec<u32>,
+-    /// The shapes of views of placed memory, and where each is.
++    /// The shapes of views of placed memory, and where each is by its
++    /// hash ([`shape_key`]): keyed by the shape itself the index held a
++    /// second copy of each, 2.4 million of them (some 900 MB with the list)
++    /// 18 minutes into the world.
+     shapes: Vec<Shape>,
+-    shape_index: std::collections::BTreeMap<Shape, u32>,
++    shape_index: std::collections::BTreeMap<u64, u32>,
+ }
+
+ /// Read far more often than written: every slot a draw reads through a
+@@ -1079,6 +1082,11 @@ fn shape_of(unordered: bool, resource: &[u32; 14], desc: &[u32; 16]) -> (Shape,
+     )
+ }
+
++fn shape_key(shape: &Shape) -> u64 {
++    use std::hash::BuildHasher;
++    std::hash::BuildHasherDefault::<std::hash::DefaultHasher>::default().hash_one(shape)
++}
++
+ /// The record words that name the view of placed memory at `address` with
+ /// shape number `shape`.
+ fn placed_words(shape: u32, address: u64) -> [u32; 2] {
+@@ -1089,18 +1097,26 @@ impl Views {
+     /// The number of `shape`, a new one if it is not there yet; `None` when
+     /// the shapes are full (the view is then a table entry).
+     fn shape(&mut self, shape: Shape) -> Option<u32> {
+-        if let Some(&at) = self.shape_index.get(&shape) {
+-            return Some(at);
++        let key = shape_key(&shape);
++        if let Some(&at) = self.shape_index.get(&key) {
++            // shortcut: of two shapes with one hash the second is a table entry, as when the shapes are full.
++            return (self.shapes[at as usize] == shape).then_some(at);
+         }
+         if self.shapes.len() >= SHAPES {
+             return None;
+         }
+         let at = self.shapes.len() as u32;
+         self.shapes.push(shape);
+-        self.shape_index.insert(shape, at);
++        self.shape_index.insert(key, at);
+         Some(at)
+     }
+
++    /// The number of `shape` if it is there already.
++    fn known_shape(&self, shape: &Shape) -> Option<u32> {
++        let &at = self.shape_index.get(&shape_key(shape))?;
++        (self.shapes[at as usize] == *shape).then_some(at)
++    }
++
+     /// The view of placed memory [`placed_words`] named.
+     fn placed_of(&self, i: u32, generation: u32) -> Option<View> {
+         let payload = payload(i, generation);
+@@ -1162,7 +1178,7 @@ fn words_for(view: View) -> [u32; 2] {
+                 let (shape, address) = shape_of(*unordered, resource, desc);
+                 if address >> PLACED_ADDRESS_BITS == 0 {
+                     // Nearly every placed view has a shape seen before.
+-                    let known = views_read().shape_index.get(&shape).copied();
++                    let known = views_read().known_shape(&shape);
+                     let shape = known.or_else(|| views_write().shape(shape));
+                     if let Some(shape) = shape {
+                         NAMED_WHOLE[1].fetch_add(1, Relaxed);
+@@ -1216,7 +1232,7 @@ pub(crate) fn views_kept() -> [u64; 8] {
+         views.list.capacity() as u64 * each
+             + views.index.len() as u64 * each * 3 / 2
+             + views.shapes.capacity() as u64 * shape
+-            + views.shape_index.len() as u64 * shape * 3 / 2,
++            + views.shape_index.len() as u64 * size_of::<(u64, u32)>() as u64 * 3 / 2,
+         constants,
+         placed,
+         views.shapes.len() as u64,
+@@ -1471,7 +1487,7 @@ pub(crate) extern "system" fn create_placed_srv(
+     handle: u64,
+ ) {
+     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+-        record(handle, View::Placed(false, resource, desc));
++        record(handle, placed(false, resource, desc));
+     }
+ }
+
+@@ -1482,8 +1498,28 @@ pub(crate) extern "system" fn create_placed_uav(
+     handle: u64,
+ ) {
+     if let (Some(resource), Some(desc)) = (words(resource), words(desc)) {
+-        record(handle, View::Placed(true, resource, desc));
++        record(handle, placed(true, resource, desc));
++    }
++}
++
++/// A placed view without the padding words of its descriptions, which hold
++/// whatever the title's stack held: Direct3D reads none of them, but each
++/// new value made a new shape, 4 million (the most there are) in 30 minutes
++/// of run xtx-memcuts, after which every placed view was a table entry kept
++/// for good. Zeroed: the resource description's words 1 (before Alignment)
++/// and 13 (its end); a shader resource view's word 3 (before the union); a
++/// buffer view's word 9 (after the union's buffer member, shader resource
++/// and unordered access alike).
++fn placed(unordered: bool, mut resource: [u32; 14], mut desc: [u32; 16]) -> View {
++    const BUFFER: u32 = 1;
++    (resource[1], resource[13]) = (0, 0);
++    if !unordered {
++        desc[3] = 0;
++    }
++    if desc[1] == BUFFER {
++        desc[9] = 0;
+     }
++    View::Placed(unordered, resource, desc)
+ }
+
+ /// Device method.
+@@ -1902,6 +1938,40 @@ mod tests {
+         assert_ne!(constant_words(0x1000, 1 << 14), constant_words(0x1000, 64));
+     }
+
++    #[test]
++    fn placed_buffer_shapes_ignore_padding_but_keep_buffer_fields() {
++        let resource = [0; 14];
++        let mut desc = std::array::from_fn(|i| i as u32 + 100);
++        desc[1] = 1; // D3D12 buffer view
++        let mut expected = desc;
++        expected[9] = 0;
++        // The UAV's high FirstElement dword is part of the view.
++        assert_eq!(placed(true, resource, desc), View::Placed(true, resource, expected));
++        expected[3] = 0;
++        assert_eq!(placed(false, resource, desc), View::Placed(false, resource, expected));
++        desc[1] = 4; // D3D12 texture view
++        assert_eq!(placed(true, resource, desc), View::Placed(true, resource, desc));
++    }
++
++    #[test]
++    fn a_shape_hash_collision_falls_back_to_a_table_entry() {
++        let mut views = Views {
++            list: Vec::new(),
++            index: Default::default(),
++            by_resource: Default::default(),
++            free: Vec::new(),
++            shapes: Vec::new(),
++            shape_index: Default::default(),
++        };
++        let first = (false, [0; 14], [0; 14]);
++        let other = (true, [0; 14], [0; 14]);
++        let slot = views.shape(first).unwrap();
++        views.shape_index.insert(shape_key(&other), slot);
++        assert_eq!(views.known_shape(&other), None);
++        assert_eq!(views.shape(other), None);
++        assert_eq!(views.known_shape(&first), Some(slot));
++    }
++
+     /// The leak of run 65: a title that writes constant buffer views and
+     /// views of placed memory at ever new addresses adds nothing to the
+     /// table; one shape stands for all the placed views alike.
+@@ -1914,8 +1984,9 @@ mod tests {
+         let slots = [0u64; 4];
+         let at = slots.as_ptr() as u64;
+         // A resource description and a view no other test uses.
+-        let resource: [u32; 14] = std::array::from_fn(|k| 0x5ee0_0000 + k as u32);
+-        let mut desc: [u32; 16] = std::array::from_fn(|k| 0x7a70_0000 + k as u32);
++        // (Padding words zero, as `placed` keeps them.)
++        let resource: [u32; 14] = std::array::from_fn(|k| if k == 1 || k == 13 { 0 } else { 0x5ee0_0000 + k as u32 });
++        let mut desc: [u32; 16] = std::array::from_fn(|k| if k == 3 { 0 } else { 0x7a70_0000 + k as u32 });
+         let mine = |v: &View| match v {
+             View::Constant(address, _) => (0x6_0000_0000..0x6_1000_0000).contains(address),
+             View::Placed(_, r, _) => *r == resource,
+@@ -1934,6 +2005,12 @@ mod tests {
+         }
+         assert_eq!(entries(), 0, "no table entries");
+         assert_eq!(shapes(), 1, "one shape for 20,000 placed views");
++        // Junk in the padding words: the same view and shape.
++        let (mut junk_resource, mut junk_desc) = (resource, desc);
++        (junk_resource[1], junk_resource[13], junk_desc[3]) = (0xbf80_0000, 0xc0, 0xb717_5a38);
++        create_placed_srv(null, &junk_resource, &junk_desc, at);
++        assert_eq!(view(at), Some(View::Placed(false, resource, desc)));
++        assert_eq!(shapes(), 1, "padding makes no shape");
+         // The same shape, unordered: another shape.
+         create_placed_uav(null, &resource, &desc, at);
+         assert_eq!(view(at), Some(View::Placed(true, resource, desc)));
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 0f64024..9906024 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -716,11 +716,21 @@ fn join_parts() -> bool {
+     }
+ }
+
+-/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
++/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`).
+ #[cfg(windows)]
+ fn join_most() -> usize {
+     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+-    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(4))
++    *N.get_or_init(|| {
++        let default = match crate::console::current() {
++            crate::console::Console::SeriesS => 8,
++            crate::console::Console::SeriesX => 4,
++        };
++        std::env::var("VICTORY_JOIN_MOST")
++            .ok()
++            .and_then(|v| v.parse().ok())
++            .filter(|&n| n >= 1)
++            .unwrap_or(default)
++    })
+ }
+
+ /// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
+diff --git a/crates/victory-shader/src/dxbc.rs b/crates/victory-shader/src/dxbc.rs
+index 7a20963..b36b512 100644
+--- a/crates/victory-shader/src/dxbc.rs
++++ b/crates/victory-shader/src/dxbc.rs
+@@ -56,6 +56,7 @@ pub struct Part<'a> {
+
+ #[derive(Debug, Clone)]
+ pub struct Container<'a> {
++    bytes: &'a [u8],
+     pub digest: [u8; 16],
+     pub version: (u16, u16),
+     pub parts: Vec<Part<'a>>,
+@@ -100,12 +101,18 @@ impl<'a> Container<'a> {
+             });
+         }
+         Ok(Container {
++            bytes: data,
+             digest,
+             version,
+             parts,
+         })
+     }
+
++    /// The declared container bytes, excluding anything after it.
++    pub fn as_bytes(&self) -> &'a [u8] {
++        self.bytes
++    }
++
+     pub fn part(&self, fourcc: FourCC) -> Option<&Part<'a>> {
+         self.parts.iter().find(|p| p.fourcc == fourcc)
+     }
+diff --git a/crates/victory-shader/src/emit/wave64_tests.rs b/crates/victory-shader/src/emit/wave64_tests.rs
+index 2b06326..6970f77 100644
+--- a/crates/victory-shader/src/emit/wave64_tests.rs
++++ b/crates/victory-shader/src/emit/wave64_tests.rs
+@@ -821,7 +821,11 @@ fn shared_in_a_branch(in_loop: bool) -> NativeProgram {
+ /// The program, its form for a host of 32-lane waves, and what `f` makes of it.
+ fn on_a_32_lane_host<R>(native: &NativeProgram, f: impl FnOnce(&crate::dxbc::Container, &ir::Program) -> R) -> R {
+     let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
+-    let c = crate::dxbc::Container { digest: [0; 16], version: (1, 0), parts: Vec::new() };
++    let mut header = [0; 32];
++    header[..4].copy_from_slice(b"DXBC");
++    header[0x14] = 1;
++    header[0x18] = 32;
++    let c = crate::dxbc::Container::parse(&header).expect("fixture DXBC header");
+     let was = lower::TEST_HOST_WAVE.replace(Some(32));
+     let r = f(&c, &p);
+     lower::TEST_HOST_WAVE.set(was);
+diff --git a/crates/victory-shader/src/gfx10/fields.rs b/crates/victory-shader/src/gfx10/fields.rs
+index 2773b3c..faddc7e 100644
+--- a/crates/victory-shader/src/gfx10/fields.rs
++++ b/crates/victory-shader/src/gfx10/fields.rs
+@@ -727,7 +727,16 @@ fn salu_dwords(name: &str) -> (u8, u8, u8) {
+
+ /// (vdst, [src0, src1, src2]) dwords of a VALU opcode.
+ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
+-    let parts: Vec<&str> = name.split('_').collect();
++    // The first four `_` parts and how many there are (no allocation: this
++    // runs for every VALU instruction).
++    let mut parts = [""; 4];
++    let mut count = 0;
++    for (k, part) in name.split('_').enumerate() {
++        if let Some(slot) = parts.get_mut(k) {
++            *slot = part;
++        }
++        count = k + 1;
++    }
+     match name {
+         "v_lshlrev_b64" | "v_lshrrev_b64" | "v_ashrrev_i64" => (2, [1, 2, 2]),
+         "v_ldexp_f64" | "v_trig_preop_f64" | "v_cmp_class_f64" | "v_cmpx_class_f64" => {
+@@ -737,11 +746,11 @@ fn valu_dwords(name: &str) -> (u8, [u8; 3]) {
+         "v_qsad_pk_u16_u8" | "v_mqsad_pk_u16_u8" => (2, [2, 1, 2]),
+         "v_mqsad_u32_u8" => (4, [2, 1, 4]),
+         "v_frexp_exp_i32_f64" => (1, [2; 3]),
+-        _ if parts.len() == 4 && parts[1] == "cvt" => {
++        _ if count == 4 && parts[1] == "cvt" => {
+             (type_dwords(parts[2]), [type_dwords(parts[3]); 3])
+         }
+         _ => {
+-            let n = type_dwords(parts.last().copied().unwrap_or(""));
++            let n = type_dwords(name.rsplit('_').next().unwrap_or(""));
+             (n, [n; 3])
+         }
+     }
+diff --git a/crates/victory-shader/src/ir.rs b/crates/victory-shader/src/ir.rs
+index cda9373..541c24a 100644
+--- a/crates/victory-shader/src/ir.rs
++++ b/crates/victory-shader/src/ir.rs
+@@ -406,6 +406,11 @@ fn unspill(
+             _ => None,
+         }
+     }
++    // Nothing parked (most programs): nothing to undo, and no need to work
++    // out every instruction's effects.
++    if !list.iter().any(|i| matches!(i.name(), Some("v_writelane_b32" | "v_readlane_b32"))) {
++        return Vec::new();
++    }
+     // VGPRs used by parking alone, the scalar codes the program uses, and
+     // per instruction the scalar codes it writes.
+     let mut stores = [false; 256];

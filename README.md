@@ -18,8 +18,9 @@ the inputs, crashes and remaining rendering defects alongside the results.
 
 The single build combines the controller-tested renderer with texture recovery,
 faster copy-worker completion and bounded texture-queue selection. The latest
-changes batch memory-protection calls and simplify two shader instructions.
-[Port scope and measurements](docs/pr995-candidate/README.md#performance-changes-since-f0ca006)
+updates add Series S presentation, larger Series S submission batches, a
+smaller placed-view cache and less work during shader preparation.
+[Port scope and measurements](docs/pr995-candidate/README.md#series-s-and-7900xtx-changes)
 
 ## Build the renderer
 
@@ -31,17 +32,26 @@ sh build.sh "../linvxtory-renderer"
 
 The wrapper fetches the pinned public source for a new directory or reuses an
 existing pinned checkout. It accepts the reconstructed Linux baseline and the
-published `91b6968` and `f0ca006` sources as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 190 build inputs before invoking Cargo.
+published `91b6968` and `f0ca006` sources as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 193 build inputs before invoking Cargo.
 Supply your own game files at runtime. The default target path in the external checkout is `target/x86_64-pc-windows-msvc/diag/victory.exe`. [Toolchain and preset](docs/pr995-candidate/README.md) · [Proton runtime setup](docs/linux-runtime.md) · [Indexed wineserver source kit](docs/runtime/indexed-server/README.md)
 
 ## Gameplay status
+
+Append `--console series-s` to the normal `victory run` command for the
+lower-resolution profile. This uses a 720p game image stretched to 1080p
+and composites the title interface. The latest offline RTX 5090 checkpoint
+run averaged **7.11 FPS** from 180 to 330 seconds after the first world shader
+bind, up from **6.20 FPS** with the initial Series S repair alone. The earlier
+Series X replay averaged **4.24 FPS** in the same interval. The cell and
+window mesh were visible. Facial skin and hair still have rendering defects.
+[Series S benchmark](docs/pr995-candidate/validation.md#series-s-checkpoint-benchmark)
 
 The Linux preset enables descriptor slot caching. On our RTX 5090, two cold
 room replays with this preset delivered **3.89 and 4.07 FPS** against **3.57 FPS**
 with caching off on the same executable. The wall, window mesh and yard posts
 were visible in the sampled frames. [Repeated cache measurements](docs/pr995-candidate/validation.md#descriptor-slot-cache)
 
-On CachyOS with an RTX 5090, the current build ran for 30 minutes and
+On CachyOS with an RTX 5090, the earlier Series X build ran for 30 minutes and
 stopped at the scheduled limit. With descriptor slot caching off, it averaged **4.24 FPS** over the last
 25.9 measured minutes. In the fixed world +180 to +330 second interval,
 it delivered **3.57 FPS**, versus **3.15 FPS** for `f0ca006` in one replay
@@ -64,6 +74,16 @@ The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the w
 ## Attribution
 
 **Default Linux build and runtime**
+
+- **sagouindupm** contributed the second presentation plane and the
+  bilinear upscale fallback used for Series S. LinVxtory adapts them to
+  its present queue and retains the texture resources through GPU
+  execution. [fxceless PR188](https://github.com/fxceless/victory-fork/pull/188)
+- **kripotker** contributed placed-view deduplication and shape lookup.
+  **Amine El Mahouti**, with co-author **Claude Opus 5.5**, reduced shader
+  translation work. **AgonisingBasher** corrected the bounds of embedded
+  shader scans. **avatarmanz and the VIctory-7900XTX contributors** provided the
+  performance settings tested here. [VIctory-7900XTX changes](docs/pr995-candidate/README.md#series-s-and-7900xtx-changes)
 
 - **UwUCammie** contributed coalesced memory protection. **Ingenioeren**, with co-author **Claude Opus 5.5**, contributed the vector bitfield shader optimization. [fxceless PR1059](https://github.com/fxceless/victory-fork/pull/1059) · [Marvisak PR2954](https://github.com/Marvisak/VIctory/pull/2954)
 - **tunczzz** contributed the frame-rate work underlying the tested PR995 renderer. **fxceless and the victory-fork contributors** supplied the rendering base and its Windows investigation. [PR995](https://github.com/fxceless/victory-fork/pull/995)

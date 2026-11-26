@@ -1,3 +1,46 @@
+# Series S and 7900XTX source verification
+
+The source kit still starts at public PR995 commit
+`7406afbbd9cef0dcddef0b0a23b4855437715eb5`. Fresh reconstruction, upgrade
+from the Series S layer and repeated verification passed all 193 build inputs.
+Changing a locked source file was rejected. The build used the reconstructed
+Cargo, application and crate inputs.
+
+| Source layer | Tree after applying | Patch SHA-256 |
+| --- | --- | --- |
+| Series S presentation and CBV wait reduction | `c878cf0172c3865c747a3cdd454b9ac1db3a3dfa` | `c294d64e326f18130893a813b23b69f52cb43db2e0ec59ec38bcbf2ea6b20c42` |
+| 7900XTX performance changes | `0e9fb75bb652be0ee760cf1df8f3a6553f347f55` | `eba8a98b62877f8c855050993d9ac8821fe05925f657a76bd2485bd062dad219` |
+
+The Windows diagnostics app built offline with one inherited dead-code
+warning. The native shader suite passed 190 tests with two ignored. Two
+offline scanner fixtures verified declared DXBC lengths and preserved
+valid-container offsets. Three Proton fixtures covered placed views at new
+addresses, descriptor padding and hash-collision fallback. The RTX 5090
+passed both synthetic Series S pixel checks for composition and stretching.
+[Series S file lock](series-s-files.json) · [7900XTX file lock](performance-7900xtx-files.json)
+
+## Series S checkpoint benchmark
+
+One cold replay per configuration used the same checkpoint on CachyOS,
+GE-Proton 11-14 and an RTX 5090. FPS counts presents between 180 and 330
+seconds after the first world shader bind.
+
+| Series S build | Presents / measured seconds | FPS |
+| --- | ---: | ---: |
+| Display repair and four-part batching | 882 / 142.367 | 6.20 |
+| Same executable, eight-part batching | 944 / 142.704 | 6.62 |
+| Eight-part default with the 7900XTX ports | 1,045 / 147.054 | 7.11 |
+
+At about 15.4 million placed-view requests, the combined build kept
+20,411 shapes versus 122,974 with eight-part batching alone. From 240 to
+450 seconds after launch, median draws per frame were 4,382 versus 4,148
+and median missing-pipeline drops were 257 versus 285. Median indirect
+drops were zero in both replays. The combined build rendered the cell
+and window mesh and completed the scheduled 450 seconds. No GPU reset or
+kernel out-of-memory kill was observed. This is a cold checkpoint
+comparison of the combined changes. It does not isolate the FPS effect of
+individual shader changes or establish later-game performance.
+
 # Historical PR995 source verification
 
 The published patch is intended for public PR995 commit
