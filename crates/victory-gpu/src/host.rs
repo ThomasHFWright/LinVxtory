@@ -2574,13 +2574,20 @@ struct Batch {
 
 impl Batch {
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
+        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
+        // Already current in this batch: avoid polling its pools before the
+        // same skip. Title-writing steps clear this coverage.
+        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
+            #[cfg(feature = "diagnostics")]
+            {
+                crate::copystat::add(crate::copystat::C::Skipped, 1);
+                crate::copystat::add(crate::copystat::C::SkippedBytes, len as u64);
+            }
+            return;
+        }
         // Nothing to copy: a world submission asks for every copy its heaps'
         // views and page tables reach (~9,000), a few of them written.
         if shadow.clean() {
-            return;
-        }
-        let (key, end) = (std::sync::Arc::as_ptr(shadow) as usize, address + len);
-        if self.current.get(&key).is_some_and(|&(_, a, b)| a <= address && end <= b) {
             return;
         }
         match self.pending.get(&key) {
@@ -3668,6 +3675,95 @@ fn pump() {
 #[cfg(test)]
 mod batch {   // `mod tests` is already taken at the top of this file
     use super::Batch;
+
+    /// A covered batch range must skip the clean check itself, which would
+    /// consume native pool writes even though the refresh is then skipped.
+    #[test]
+    fn covered_batch_ranges_skip_pool_polling_until_title_written() {
+        use crate::watch::PAGE;
+        use windows_sys::Win32::System::Memory::{
+            GetWriteWatch, MEM_COMMIT, MEM_DECOMMIT, PAGE_READWRITE, ResetWriteWatch,
+            VirtualAlloc, VirtualFree,
+        };
+        struct Pool(usize);
+        impl Drop for Pool {
+            fn drop(&mut self) {
+                crate::shadow::unregister(self.0, self.0 as u64);
+                crate::watch::tests::free(self.0);
+            }
+        }
+        let pool = Pool(crate::watch::tests::pool(2));
+        let p = pool.0;
+        crate::shadow::register(p, p as u64, (2 * PAGE) as u64);
+        let copy = crate::shadow::find(p as u64, (2 * PAGE) as u64)
+            .expect("this batch regression needs a host buffer");
+        let mut initial = Batch::default();
+        initial.add(&copy, p, 2 * PAGE);
+        assert_eq!(initial.flush(), 2 * PAGE);
+        drop(initial);
+        // SAFETY: our committed pool; this write is observed by the guard.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x11) };
+        let mut batch = Batch::default();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0], 0x11);
+
+        // Replace backing without a runtime notification: only the kernel's
+        // write watch knows about this write, until someone polls the pool.
+        // SAFETY: retain our reservation, recommit its first page, then write it.
+        unsafe {
+            assert_eq!(ResetWriteWatch(p as *const _, 2 * PAGE), 0);
+            assert_ne!(VirtualFree(p as *mut _, PAGE, MEM_DECOMMIT), 0);
+            assert_eq!(VirtualAlloc(p as *const _, PAGE, MEM_COMMIT, PAGE_READWRITE) as usize, p);
+            ((p + 16) as *mut u8).write_volatile(0x33);
+        }
+        let native_writes = || {
+            let mut found = [0usize; PAGE / 4096];
+            let (mut count, mut granularity) = (found.len(), 0);
+            // SAFETY: enough entries for our whole first page; do not reset.
+            assert_eq!(unsafe {
+                GetWriteWatch(0, p as *const _, PAGE, found.as_mut_ptr().cast(),
+                    &mut count, &mut granularity)
+            }, 0);
+            count
+        };
+        assert!(native_writes() > 0, "the native write must be visible before the check");
+        batch.add(&copy, p, PAGE);
+        batch.add(&copy, p + 8, 32);
+        assert!(native_writes() > 0,
+            "covered ranges must not call clean() and consume pool history");
+        assert_eq!(batch.flush(), 0);
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0], 0x11,
+            "the batch still holds its original bytes");
+
+        // An uncovered page is still refreshed, even for the same object.
+        // SAFETY: the second page remains committed and guarded.
+        unsafe { ((p + PAGE + 16) as *mut u8).write_volatile(0x44) };
+        batch.add(&copy, p + PAGE, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host((p + PAGE + 16) as u64, 1)[0], 0x44);
+        // A separate host copy of overlapping bytes must not inherit coverage.
+        let (other, separate) = crate::shadow::for_view((p + 4) as u64, (PAGE - 4) as u64, 8)
+            .expect("an off-element view gets its own host copy");
+        assert!(separate && !std::sync::Arc::ptr_eq(&copy, &other));
+        batch.add(&other, p + 4, PAGE - 4);
+        assert_eq!(batch.flush(), PAGE - 4);
+        assert_eq!(other.read_host((p + 16) as u64, 1)[0], 0x33);
+
+        // The same boundary used by ordered Step::Copy/Step::Run must allow
+        // the original copy to consume the write and rearm its guard.
+        batch.title_written();
+        batch.add(&copy, p, PAGE);
+        assert_eq!(batch.flush(), PAGE);
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0], 0x33);
+        drop(batch);
+        // SAFETY: first page is guarded again; a new submission must see it.
+        unsafe { ((p + 16) as *mut u8).write_volatile(0x55) };
+        let mut next = Batch::default();
+        next.add(&copy, p, PAGE);
+        assert_eq!(next.flush(), PAGE);
+        assert_eq!(copy.read_host((p + 16) as u64, 1)[0], 0x55);
+    }
 
     /// A host copy of tracked title memory: a submission whose lists all ask
     /// for it whole copies the one page the title wrote, once, and again
