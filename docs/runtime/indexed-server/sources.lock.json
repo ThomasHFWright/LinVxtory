@@ -1,0 +1,870 @@
+{
+  "sources": [
+    {
+      "name": "ge",
+      "url": "https://codeload.github.com/GloriousEggroll/proton-ge-custom/tar.gz/refs/tags/GE-Proton11-14",
+      "archive": "ge.tar.gz",
+      "root": "proton-ge-custom-GE-Proton11-14",
+      "sha256": "fb512b55e312befdbe4404393d26054df3183ecb419ecffb82bafeab494bacb6"
+    },
+    {
+      "name": "wine",
+      "url": "https://codeload.github.com/ValveSoftware/wine/tar.gz/a47c73f52fd7b2efafc1c560710f3a5099ae51e0",
+      "archive": "wine.tar.gz",
+      "root": "wine-a47c73f52fd7b2efafc1c560710f3a5099ae51e0",
+      "sha256": "b93c1f6dce3c082b21b08d2dd8ab129c4a25ada741deead3267ebbadd532097f"
+    },
+    {
+      "name": "staging",
+      "url": "https://codeload.github.com/wine-staging/wine-staging/tar.gz/6cc805ea57132eeaf44764e9213823c9b8d0d300",
+      "archive": "staging.tar.gz",
+      "root": "wine-staging-6cc805ea57132eeaf44764e9213823c9b8d0d300",
+      "sha256": "46fccc6412d5a0ac5e02047a545bba21c3db45abfa1c161119a1de2f7b8cb360"
+    },
+    {
+      "name": "vulkan-headers",
+      "url": "https://codeload.github.com/KhronosGroup/Vulkan-Headers/tar.gz/refs/tags/v1.4.363",
+      "archive": "vulkan-headers.tar.gz",
+      "root": "Vulkan-Headers-1.4.363",
+      "sha256": "cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68"
+    }
+  ],
+  "patches": [
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0018-server-Fix-numpad-vkey-handling.patch",
+      "sha256": "43d0916a072379bea24ca77acc3a7a872dd02b58711355991ad9b1f58aa1c34e",
+      "files": [
+        "server/queue.c",
+        "server/user.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0027-winewayland-Use-update_client_surfaces-to-detach-cli.patch",
+      "sha256": "40410aa1294b4ce112cf7174866c3c60234151b824e3b9633ebae620338ff5c1",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0071-server-Add-kernel-obj-list-for-tokens.patch",
+      "sha256": "d72c1be159eca011a70b38c76446384dc0fedf983c2ac05c9181df800abcb517",
+      "files": [
+        "server/token.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0073-server-Allow-creating-directory-kernel-objects.patch",
+      "sha256": "7f442cf4babeb07fc97056255247fa232e4d6002feea99caf56140ba60366a91",
+      "files": [
+        "server/change.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0084-win32u-Track-swapchain-opengl-reference-of-client-su.patch",
+      "sha256": "9cae71340195053ea660644000bd4c11eae97f4403c5af1f4dd6b96159788a35",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0099-server-Store-keyboard-layout-in-thread-struct.patch",
+      "sha256": "b58c1bbcf770ba4a2c3631b9d4bf0985c2a6ee61d089b148e68feba5830bffaa",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/thread.c",
+        "server/thread.h",
+        "server/winstation.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0121-win32u-Implement-user-driver-colorspace-overrides.patch",
+      "sha256": "6b775d4b39026759d307d9ba492d7bebc43c98ea3c54cee365d776b52e7a80d3",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0140-win32u-Remove-duplicate-definition.patch",
+      "sha256": "879a7f3b1a1b91276f7a476e765ab215dc079bd48519b84d0a660848513d346f",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0175-server-Use-MOUSEEVENTF_MOVE-if-the-cursor-win-change.patch",
+      "sha256": "9d153793e7f9c4dc2412b5e95d9ec78cff73c3cdd843d105cfc62ff9b2c7712f",
+      "files": [
+        "server/queue.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0198-winewayland-win32u-Improve-colorspace-conversion.patch",
+      "sha256": "fc1fdef29fe934542508d50b1d2157c22eb1b5b62167e4c284df9c52fd928c92",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0253-win32u-Introduce-pEnableIMEContext-driver-call.patch",
+      "sha256": "56b203b7a468fa24c4e54d4535a28729f93e09b55f812dd29eeea70944c8a64a",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-wayland/0268-win32u-Implement-common-EDID-emulation-code.patch",
+      "sha256": "98d3f80fd299af10d1132d2aeabb6bf1c6c38d36a631d0a4755353f3e01ffece",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0001-winewayland-add-SNI-tray-icons-and-native-context-me.patch",
+      "sha256": "ad293c0f2b1585c2de5c31c24d097adc3f3f350265c18e5b1b15200d73c7183f",
+      "files": [
+        "include/ntuser.h",
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0001-winewayland-win32u-Add-cross-process-dmabuf-composit.patch",
+      "sha256": "6188c91419816c2d19eddf9bce312f1265aab012acdda638effd96904625a98d",
+      "files": [
+        "include/Makefile.in",
+        "include/wine/hwnd_dmabuf.h",
+        "include/wine/server_protocol.h",
+        "include/wine/vulkan_driver.h",
+        "server/file.c",
+        "server/file.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0010-winewayland-Respect-xdg-toplevel-configure-bounds.patch",
+      "sha256": "b2c46735d6fa8af872cd9de15ff8f69d9dc516eb266741cb2986fccbac7839a3",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0016-wined3d-opengl32-win32u-Add-GL-HWND-dmabuf-bridge.patch",
+      "sha256": "ced2730a45b1aae5f0babd467023a213ed4ac07ada523ce6bf9783b6a91b4978",
+      "files": [
+        "include/ntuser.h",
+        "include/wine/hwnd_dmabuf.h",
+        "include/wine/opengl_driver.h",
+        "include/wine/server_protocol.h",
+        "include/wine/wgl.h",
+        "include/wine/wined3d.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0017-winewayland-Use-linux-dmabuf-feedback-for-dmabuf-cap.patch",
+      "sha256": "dfaf5b427a6592c69ff3a7cdc35c6e6e7117ba1c551d666198e72a88a21da67a",
+      "files": [
+        "include/wine/hwnd_dmabuf.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0022-win32u-Clip-foreign-direct-draw-children-out-of-pare.patch",
+      "sha256": "c62280d9dd4292d34e9d90870b3a0bc57bc51e153b744286e12f92cd55ac1170",
+      "files": [
+        "include/ntuser.h",
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0024-winewayland-Use-punch-through-compositing-for-child-.patch",
+      "sha256": "0555e2cdafebeb4fca414389f1db5d4b1fa90b760a9502305ec7b204a7260ae0",
+      "files": [
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0027-win32u-Forward-foreign-GDI-window-surfaces-on-Waylan.patch",
+      "sha256": "1173f894e0ece18109376f03f3e0f8aecb380e84ba79e2669465c56bdcdb1f9a",
+      "files": [
+        "include/wine/gdi_driver.h",
+        "include/wine/hwnd_dmabuf.h",
+        "include/wine/server_protocol.h",
+        "server/protocol.def"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0028-winewayland-Preserve-GDI-pixels-above-self-presentin.patch",
+      "sha256": "efbf1048db42a8e04df812e663bc442d4c8008046396fb7823ae64a320c735b9",
+      "files": [
+        "include/wine/gdi_driver.h",
+        "include/wine/hwnd_dmabuf.h",
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0031-winewayland-Refine-punch-through-activation.patch",
+      "sha256": "23645557e7525b41947a22684c7e0621180e389b223d9bea1b06b8d189231278",
+      "files": [
+        "include/wine/gdi_driver.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0032-win32u-Avoid-extra-server-call-in-GetWindowPlacement.patch",
+      "sha256": "a4496a57343f54c4948fdf530de4a30829ca03cb2e2c8a5a1ac56b5f97bd2fc1",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0033-win32u-Avoid-full-hit-test-list-for-mouse-tracking.patch",
+      "sha256": "4fc458b86286099cd22d527e6435888099f8e74dc747ae775d624e05f3f6658f",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0034-server-Avoid-unchanged-key-state-serial-bumps.patch",
+      "sha256": "766d05fe02b2fe811f012c710ad962c15fb93cae45cbe36dffe81f494d9ab80c",
+      "files": [
+        "server/queue.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0035-server-Avoid-heap-allocation-for-small-hit-test-lists.patch",
+      "sha256": "09bdaa49dceacc475d7b89ad2fb31a2e48de2d962a46b0139b598f315201351b",
+      "files": [
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0040-win32u-Handle-stale-Vulkan-swapchains.patch",
+      "sha256": "e920425994b4342c2311aec8818427603e57224bcd4f8ac0647820485d28fe31",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0041-win32u-Handle-managed-Vulkan-swapchain-extensions.patch",
+      "sha256": "d8697fa10d67d8fcc5613ea734688242438d15511539243728866bd5ef805350",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0049-wined3d-Cache-exported-dmabuf-ring-slots.patch",
+      "sha256": "fccf95601c05ffd71abd87f7845a632e686efd7e3805d10ff46a57643421cbd6",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/protocol.def"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0054-vulkan-Preserve-Wayland-swapchain-alpha-configuratio.patch",
+      "sha256": "632da641b0199f728d01e1e90c22512f4dfc6db51409330bc96181f15a951b3b",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0064-win32u-winewayland-Optimize-CPU-backed-surface-updat.patch",
+      "sha256": "1efe50c98176b14956b9e98cc27e898c3b6031b7ce9f6caa96ae3482ef8aa4cf",
+      "files": [
+        "include/wine/gdi_driver.h",
+        "include/wine/hwnd_dmabuf.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0065-win32u-Complete-managed-Vulkan-latency-extension-h.patch",
+      "sha256": "b3ca0f7707639b8da3c5b17976f8d98a5c8fcb377b5f500311de35e85f5746f5",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0066-winevulkan-Skip-present-waits-when-the-window-is-not.patch",
+      "sha256": "c003efe53d93912a9489cfb4f41f192c7b14bfbc21751b632c1a613c5c306a05",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wineland-child-rendering/0068-win32u-winewayland-Avoid-blocking-managed-dma-buf-pr.patch",
+      "sha256": "0c7354eff70117d27860dccb13a627b79d77bce18afc659555ebf08a923e4751",
+      "files": [
+        "include/wine/hwnd_dmabuf.h",
+        "include/wine/server_protocol.h",
+        "server/protocol.def"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0002-winewayland-route-tray-balloons-through-desktop-notifications.patch",
+      "sha256": "ce46bbaaca7de447ac0e075049279a00be7a28024b1df624c2db2b7277858664",
+      "files": [
+        "include/ntuser.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0024-win32u-winewayland-recover-client-presentation-after-surface-transitions.patch",
+      "sha256": "9281b67393d563c72473f805904f0541077fd3f8264df355ec07541f9f98e6b2",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0026-win32u-winewayland-coordinate-native-presenters-per-window.patch",
+      "sha256": "22abaf9050d6c5a7f12d98f41452fda685a7ebc266d3084d90790bd4dba2acaf",
+      "files": [
+        "include/wine/gdi_driver.h",
+        "include/wine/opengl_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0027-win32u-winewayland-retire-background-Vulkan-presenters-locally.patch",
+      "sha256": "92ecd03216552dda4d43fafd6a9296039f38d16e491f10633d82982248d2bb14",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0028-win32u-winewayland-preserve-GDI-over-native-window-content.patch",
+      "sha256": "3038eb0e1c636ab6c33bbe37ab9de6e7872c4562ebbd24d011425b20a7ecb7db",
+      "files": [
+        "include/wine/gdi_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0030-ntdll-export-PsCreateSystemThread.patch",
+      "sha256": "542b0a2ad570c058c368dbe6811ccf4dd88bb88c2663da26104e7e4f63460386",
+      "files": [
+        "include/winternl.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0032-server-add-support-for-system-threads.patch",
+      "sha256": "bf51a07fd69fe23cfa8055ed162ca03267982cb232d8be5e154a04053bf09ec0",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/thread.c",
+        "server/thread.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0033-server-hide-system-threads-from-enumeration.patch",
+      "sha256": "55b2da719caea9a9dc4d1549dc2d4e5742160cc05bd128b1e067eda21e8de401",
+      "files": [
+        "server/process.c",
+        "server/process.h",
+        "server/request.c",
+        "server/thread.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0034-server-deny-context-access-to-system-threads.patch",
+      "sha256": "3841ad8ea2491fda15fcbcd67cd81da293eaa360dc62cf7e482288922b30094a",
+      "files": [
+        "server/thread.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0035-server-suppress-debug-events-for-system-threads.patch",
+      "sha256": "69c4e1eb90caa13666927058265a26379b6c3bad4cfe8d0d1f7ceada823cef3e",
+      "files": [
+        "server/mapping.c",
+        "server/process.c",
+        "server/thread.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0037-server-terminate-system-threads-with-last-user-thread.patch",
+      "sha256": "96e4e35365fb2d1ac988a0a89c9ef45d9460fba4759d7a3bd3556628f5eb4dbe",
+      "files": [
+        "server/process.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0040-win32u-clean-up-windows-of-terminated-threads.patch",
+      "sha256": "aeea8e966e24ce110e00339125ec72823ffc6185686271e721877194848fd077",
+      "files": [
+        "include/ntuser.h",
+        "server/queue.c",
+        "server/user.h",
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0044-win32u-notify-applications-of-native-interactive-resizing.patch",
+      "sha256": "5e9a9c17ddb56745c72767174cdbd66a51cbf6cff2ec29feeed7ca36e76314b0",
+      "files": [
+        "include/ntuser.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/em-fixups/0063-explorer-forward-tray-click-foreground-permission.patch",
+      "sha256": "b82fcba0a84adbd86722a579856adf621edeb4b657ca71af401040958acbe211",
+      "files": [
+        "include/ntuser.h",
+        "server/protocol.def",
+        "server/queue.c"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/inseng-Implementation/0001-inseng-Implement-CIF-reader-and-download-functions.patch",
+      "sha256": "582f3a249667894d93e907c198348ea59498b048260c408cb847eb4218188826",
+      "files": [
+        "include/inseng.idl"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/stdole32.idl-Typelib/0001-include-Make-stdole32.idl-a-public-component.patch",
+      "sha256": "452e06a460f39f0d9035af499b6535b4ee6fd8204f0c9e16e7c9b994c6a192c6",
+      "files": [
+        "include/Makefile.in",
+        "include/stdole32.idl"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/ws2_32-af_unix/0002-ws2_32-Add-support-for-AF_UNIX-sockets.patch",
+      "sha256": "c95b8d19838dddddbfb7d76b293f1e6106c99200f404d96c67576802f80b1a75",
+      "files": [
+        "server/sock.c"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/ws2_32-af_unix/0003-server-Allow-for-deletion-of-socket-files.patch",
+      "sha256": "12ef186cf12e845c7aed93f1ab67e0bdd9701d61f86d6f2bba150a36d83dcea4",
+      "files": [
+        "server/fd.c"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/ws2_32-af_unix/0004-server-Introduce-error-when-attempting-to-create-a-S.patch",
+      "sha256": "03c3f7e4786ac92c584a6e38b4fe910ac0ef458dd66dbf90a9200e54df91379d",
+      "files": [
+        "server/sock.c"
+      ]
+    },
+    {
+      "source": "staging",
+      "path": "patches/ws2_32-af_unix/0005-server-Fix-getsockname-and-accept-on-AF_UNIX-sockets.patch",
+      "sha256": "d2ac47caca6ace538dee6b53cc81c7ce669ba4d8e68ce1ad5ff0a245ea4e335e",
+      "files": [
+        "server/sock.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/wine-staging/winedevice-Default_Drivers/0001-win32k.sys-Add-stub-driver.patch",
+      "sha256": "77a72f2f152c3d3a20d454e5201041df64c31235404203e8c490c95429ee58df",
+      "files": [
+        "tools/make_specfiles"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/game-patches/ace-ntoskrnl-mmcopymemory-stub.patch",
+      "sha256": "d142e9174ad1edb6a7a79ec436d2f89b6be70898804c4e278fe512faf94fdc66",
+      "files": [
+        "include/ddk/wdm.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/crypt32-reject-ncrypt-only-private-keys.patch",
+      "sha256": "5b6e3a1ac218c6b2d6cf4b92e97f005d5c012e16492ff5d7cf90f09ac322d597",
+      "files": [
+        "include/wincrypt.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/crypt32-wc3-modern-chain-engine-config.patch",
+      "sha256": "781ca839657d6690e786a6f52a444112fa14e67a5122bebe63bc9476369e8e39",
+      "files": [
+        "include/wincrypt.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/mta-certificate/0001-crypt32-support-sha256-certificate-properties.patch",
+      "sha256": "9fe2f9ad65d1d04974cbe7b6eab206ae88369e9cc26ac36058b9298daa6216ed",
+      "files": [
+        "include/wincrypt.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/d2d1-register-tint-effect.patch",
+      "sha256": "8d08b5d0e7e75c1e36ffacf70ef0656b877a34f5429dd1deb9ec7977a2f8cb8f",
+      "files": [
+        "include/d2d1effects_2.idl"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/version-GetFileVersionInfoByHandle-stub.patch",
+      "sha256": "835d2efafaad53655bc3382c29b343e4a15714e58ced8951b6a6ba16eedf837e",
+      "files": [
+        "include/winver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/server-clip-off-desktop-minimized-window-paint.patch",
+      "sha256": "efd1f4677f5ad98792f8965a2efcdd90f5d1736db4566dcde76712ddb58ca6c8",
+      "files": [
+        "server/window.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/server-dont-touch-freed-handle-table-in-close-handle.patch",
+      "sha256": "4f1f966765ce4c829cd93ac3e6b63276816ad3b4974a2a4c7795ab04fdb0862b",
+      "files": [
+        "server/handle.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/ntdll-prefer-native-version-resource-heuristics.patch",
+      "sha256": "05033c4446893dc85bddef002ac9f8bc00f2257bd59281308c3b4520a0423c59",
+      "files": [
+        "include/wine/server_protocol.h",
+        "server/mapping.c",
+        "server/protocol.def",
+        "server/request_handlers.h",
+        "server/request_trace.h",
+        "server/trace.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/icuuc-icuin-forwarder-dlls.patch",
+      "sha256": "df69d43bd8a251233f4a6a39a468fb2520b70a46df4c941b69e3e40b0c630562",
+      "files": [
+        "tools/make_specfiles"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/0001-server-Dynamically-relocate-.exes-by-default-too.patch",
+      "sha256": "267a1cbf34fa3771954048cd291affa0c2abd0482a2efc84b476b55e73570ce2",
+      "files": [
+        "server/mapping.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton/0001-win32u-Implement-NtGdiDdDDIQueryAdapterInfo-cases.patch",
+      "sha256": "c1dca6fa55925952d58e374808630245f237a8d65cdd946c75f1c50b3e37bb68",
+      "files": [
+        "include/ddk/d3dkmthk.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton/83-nv_low_latency_wine.patch",
+      "sha256": "5f75d7764dda25a9c7fa3595a945fa6d0ec9da3c747811baa1111445e22ce742",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton/build_failure_prevention-add-nls.patch",
+      "sha256": "856e64a818cc23a2cd18c47fdaa0960bebad7e841051050467102ed5f4161f0e",
+      "files": [
+        "tools/makedep.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/ge-video-rework/0001-winedmo-remove-winegstreamer-media-backend.patch",
+      "sha256": "0dbf62faf1856b946f69fb55cf8ff11057ebbbefea99ebf322b9da28f2c62e54",
+      "files": [
+        "include/wine/winedmo.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/ge-video-rework/0002-mfreadwrite-make-source-reader-video-playback-resili.patch",
+      "sha256": "04d318323e9a2e7411d8e9d3373f8143cef4388f2242a1a9d0aafc612363ec3f",
+      "files": [
+        "include/mediaobj.idl",
+        "include/nserror.h",
+        "include/wine/mfinternal.idl"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/ge-video-rework/0004-quartz-adapt-legacy-video-paths-for-winedmo.patch",
+      "sha256": "0b433d515eea629d3d3de5305b86604d7db563fa0051c914f924567de3a28e21",
+      "files": [
+        "libs/strmbase/pin.c",
+        "libs/strmbase/renderer.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/ge-video-rework/0006-proton-update-runtime-support-for-media-rework.patch",
+      "sha256": "1ab1afed4da0f0894a8a1916fa4ba143d9648e66fd5084e5075184350aea0839",
+      "files": [
+        "tools/gitlab/image.docker"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/ge-video-rework/0128-evr-notify-the-presenter-clock-state-sink.patch",
+      "sha256": "389d1587789ad8b18706b8f1edd5adb62a87c8222dfb3e8550b9247d6395dca5",
+      "files": [
+        "include/wine/strmbase.h",
+        "libs/strmbase/renderer.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0004-xaudio2-faudio-Implement-taking-device-ids-to-create.patch",
+      "sha256": "6c8056cfbbe93d134cec7e581871a3947c95f7bb63cb7c3c7fcc48c8a09c8c2d",
+      "files": [
+        "libs/faudio/src/FACT.c",
+        "libs/faudio/src/FAudio.c",
+        "libs/faudio/src/FAudio_internal.h",
+        "libs/faudio/src/FAudio_platform_win32.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0008-faudio-xaudio2-Partially-rewrite-asserts-to-error-ha.patch",
+      "sha256": "fbe721f8cbe2b29c21775c3615302c7cf9f9ae7b41614ca72d55e3e7f346659c",
+      "files": [
+        "libs/faudio/src/FAudio_platform_win32.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0009-mmdevapi-faudio-xaudio2-Reorganize-create-thread-for.patch",
+      "sha256": "6be6f8414f8772f806331823d3b8b007571a57fef68bbf27a5ca47fd5d45f799",
+      "files": [
+        "libs/faudio/src/FAudio.c",
+        "libs/faudio/src/FAudio_internal.h",
+        "libs/faudio/src/FAudio_platform_win32.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0191-route-sony-effects-by-active-hid-controller.patch",
+      "sha256": "a73b50a1b8d6a0c5d555d111fc6da72a9e442684aec5b19fc8008a6a64fdd8b9",
+      "files": [
+        "server/device.c",
+        "server/protocol.def"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0197-xinput-automatic-sony-fallback-with-native-takeover.patch",
+      "sha256": "0f993b91347be1b3031b4a3fd994f943a04ea8863da35893977b77415aac72ef",
+      "files": [
+        "include/wine/hid.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0202-dinput-exclude-generic-reads-from-sony-native-takeover.patch",
+      "sha256": "60a7c97e105cd164327f991f4743cfac97e8c6b9c12b13a6a6fdaabff68647ed",
+      "files": [
+        "include/wine/hid.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/proton-ds5-haptic/0209-sony-fix-bluetooth-dualshock4-xinput-rumble.patch",
+      "sha256": "18130ccdcff9ae286dbc2ee5dff42f234e9aa9fb4a8f3963372d13488b4db100",
+      "files": [
+        "include/wine/hid.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/win32u-release-images-presented-to-hidden-windows.patch",
+      "sha256": "26e2e31de1353e46437a3ea0a4c9acadf677e59668d5ce9d0aab9fb8e7662267",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/server-keep-owned-ntsync-mutex-until-owner-releases-or-dies.patch",
+      "sha256": "c02ff9bf06c8cea3056f18b1e0a27b64b33a740623042494d561036a6c0634ce",
+      "files": [
+        "server/inproc_sync.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/server-keep-in-process-mutex-closed-while-in-use.patch",
+      "sha256": "141d8520c50080cc53170953e07f82bbd066c452328166291974169a2f35bd55",
+      "files": [
+        "server/inproc_sync.c",
+        "server/object.h",
+        "server/process.c",
+        "server/protocol.def"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/bluetooth-le/0001-winebth.sys-bluetoothapis-windows.devices.bluetooth-.patch",
+      "sha256": "d8ee812931033619ace205f350a0f4f471d0167f4991fcf81e25006e17d08b29",
+      "files": [
+        "include/bluetoothleapis.h",
+        "include/bthledef.h",
+        "include/ddk/bthguid.h",
+        "include/windows.devices.bluetooth.idl",
+        "include/wine/winebth.h"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/bluetooth-le/0002-windows.devices.radios-Return-Bluetooth-radios-from-.patch",
+      "sha256": "1760bd368e8d4eb880dba978a8801b7221d8731b6352ca16fa18efa2b4825b9d",
+      "files": [
+        "include/windows.devices.radios.idl"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/bluetooth-le/0003-windows.devices.bluetooth-Add-BluetoothUuidHelper.patch",
+      "sha256": "0d8782313a80a754e24b30302c9978ada307528a19890125a1b6187fe75cffd2",
+      "files": [
+        "include/windows.devices.bluetooth.idl"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/bluetooth-le/0004-wintypes-Add-DataReader-and-implement-the-DataWriter.patch",
+      "sha256": "ec4f2cd7eb458ec7d75fce8b29dbc35b9b4d9eb4ecc3dfe730a577dbefe3d0d6",
+      "files": [
+        "include/windows.storage.streams.idl"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/server-keep-request-status-when-dropping-stale-fd.patch",
+      "sha256": "b74b518cf3880661de35c19310226a1290cdf04399abce26172b854b64e2b098",
+      "files": [
+        "server/request.c"
+      ]
+    },
+    {
+      "source": "ge",
+      "path": "patches/wine-hotfixes/pending/win32u-let-host-layers-see-the-hdr-colorspace-of-pass-through-swapchains.patch",
+      "sha256": "f853392590a989ecbd3f7de33a600b7bf63feb6496b99a5ac8316e41998646b8",
+      "files": [
+        "include/wine/vulkan_driver.h"
+      ]
+    }
+  ],
+  "upstream_patch": {
+    "url": "https://api.github.com/repos/fxceless/victory-fork/issues/184/comments",
+    "author": "UwUCammie",
+    "sha256": "ea256fd6da8f84d2a739513a07a69066c6539f51e5386083e7a9a634fa89a10b",
+    "comment_id": 7148271684
+  },
+  "baseline": {
+    "file.h": "e03b8cf494b7a5d5031e00374441cdb32614a0b02d567a458f4fccf52e26e6d7",
+    "mapping.c": "4553e278ebbb08e2e0eb2ca1994cce18adef8b41ea9fec0e5c2843ecb3a12569",
+    "process.c": "fdc11bc7854f184acb165f4316ea60eac18d6dba409be440f564ad086e1254cd",
+    "process.h": "a621926bf8587d602f7ba7414aa38b0ee6b12dc9baf5f9e9c5ff05f6c2db2c8c"
+  },
+  "indexed": {
+    "file.h": "73df6f5d9f95463abf0e9f1e02a3c0523afac258fe5630f6cb9e29971f222521",
+    "mapping.c": "976c58c3831a572df13e960351f8f4dcd12f68c9102010517747b41f68574770",
+    "process.c": "6f10113a6f9f8e991ec2329128459f8a78dfa258f3e583e6c81d688e09c68a21",
+    "process.h": "bd496c853e77643a50a54a94b397f1ce3f65f54e3d3861ac7aabaf98a78f5fc0"
+  },
+  "protocol_sha256": "06ee611e9f349b2b4fde8de9d4f88ca6fa976465195687ee52a294a1007794cf",
+  "protocol": 938,
+  "stock_runtime_sha256": "8c40e10ab3555e74c75aabe784df7fe55ac0c6a78880698930d856886961b119",
+  "runtime_client_sha256": {
+    "bin/wine": "7b0ca4538f365d8a225afdfe5f872715bb5f7c1908dbdcb522c9519cac7c8714",
+    "lib/wine/x86_64-unix/ntdll.so": "0f6dbc59c4fad2bfecf054bd4b0547f983eaaff87a3d7d5ef7e865e56d4fd3ad",
+    "lib/wine/x86_64-windows/ntdll.dll": "8d2eba56b344ac038dccc844a51d1e7c29237505c6cafc473691e2ec390a287c"
+  }
+}
