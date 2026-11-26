@@ -16,37 +16,37 @@ the inputs, crashes and remaining rendering defects alongside the results.
 
 ## What this kit builds
 
-The single build combines the controller-tested renderer with texture recovery,
-faster copy-worker completion and bounded texture-queue selection. The latest
-updates add Series S presentation, larger Series S submission batches, a
-smaller placed-view cache and less work during shader preparation.
-[Port scope and measurements](docs/pr995-candidate/README.md#series-s-and-7900xtx-changes)
+The build uses OctoAlgo’s pinned inkVI stack for facial skin, hair,
+shadows and Wave64 translation. LinVxtory adds its Series S presentation
+repair, fresh constant-buffer tables after command-list waits, and the
+7900XTX performance changes. [inkVI](https://github.com/OctoAlgo/inkVI/tree/7031c8259f4c8a906d06c1e3f4726d455126bfca) · [Build and test details](docs/inkvi/README.md)
 
 ## Build the renderer
 
-From this checkout, with the Rust toolchain, cached Cargo dependencies and Windows cross-compilation SDK configured, run:
+With the Rust toolchain, cached Cargo dependencies and MSVC SDK configured,
+run this from the LinVxtory checkout.
 
 ```sh
 sh build.sh "../linvxtory-renderer"
 ```
 
-The wrapper fetches the pinned public source for a new directory or reuses an
-existing pinned checkout. It accepts the reconstructed Linux baseline and the
-published `91b6968` and `f0ca006` sources as upgrade inputs. An already-current checkout proceeds directly to final verification. It checks all 193 build inputs before invoking Cargo.
-Supply your own game files at runtime. The default target path in the external checkout is `target/x86_64-pc-windows-msvc/diag/victory.exe`. [Toolchain and preset](docs/pr995-candidate/README.md) · [Proton runtime setup](docs/linux-runtime.md) · [Indexed wineserver source kit](docs/runtime/indexed-server/README.md)
+Use a new output path when upgrading from the earlier PR995 kit. The wrapper
+fetches the pinned public inputs, applies the verified patches and builds
+one release executable. Supply your own game files at runtime.
+[Launch instructions](docs/inkvi/README.md#launch) · [Proton runtime setup](docs/linux-runtime.md)
 
 ## Gameplay status
 
-Append `--console series-s` to the normal `victory run` command for the
-lower-resolution profile. This uses a 720p game image stretched to 1080p
-and composites the title interface. The latest offline RTX 5090 checkpoint
-run averaged **7.11 FPS** from 180 to 330 seconds after the first world shader
-bind, up from **6.20 FPS** with the initial Series S repair alone. The earlier
-Series X replay averaged **4.24 FPS** in the same interval. The cell and
-window mesh were visible. Facial skin and hair still have rendering defects.
-[Series S benchmark](docs/pr995-candidate/validation.md#series-s-checkpoint-benchmark)
+In the RTX 5090 test, the current Series S build reached the cell with
+individual hair strands, the ponytail, the lit wall and the window mesh.
+Facial skin rendered in the early close-up. One NPC temporarily had a black
+skin texture while streaming. Cell samples averaged **9.03 FPS** with a
+median of **9.8 FPS**. [Source and test notes](docs/inkvi/README.md#rtx-5090-observations)
 
-The Linux preset enables descriptor slot caching. On our RTX 5090, two cold
+The previous Series S renderer reached **7.11 FPS** in the cell in a
+fixed checkpoint replay. [Previous Series S benchmark](docs/pr995-candidate/validation.md#series-s-checkpoint-benchmark)
+
+The previous Linux preset enabled descriptor slot caching. On our RTX 5090, two cold
 room replays with this preset delivered **3.89 and 4.07 FPS** against **3.57 FPS**
 with caching off on the same executable. The wall, window mesh and yard posts
 were visible in the sampled frames. [Repeated cache measurements](docs/pr995-candidate/validation.md#descriptor-slot-cache)
@@ -75,6 +75,9 @@ The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the w
 
 **Default Linux build and runtime**
 
+- **OctoAlgo and the inkVI contributors** published the verified face and
+  hair stack and identified the cold first-draw pipeline wait. Its patch
+  history credits the original PR authors. [inkVI patch credits](https://github.com/OctoAlgo/inkVI/blob/7031c8259f4c8a906d06c1e3f4726d455126bfca/patches/README.md)
 - **sagouindupm** contributed the second presentation plane and the
   bilinear upscale fallback used for Series S. LinVxtory adapts them to
   its present queue and retains the texture resources through GPU

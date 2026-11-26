@@ -1,43 +1,71 @@
 #!/bin/sh
-# Reconstruct a locked renderer in a user-owned PR995 checkout.
+# Reconstruct the pinned inkVI renderer and apply LinVxtory's Linux overlay.
 set -eu
-kit=$(CDPATH= cd -- "$(dirname -- "$0")/docs/pr995-candidate" && pwd)
+root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-    echo 'Usage: sh build.sh /path/to/pr995-source' >&2
+    echo 'Usage: sh build.sh /path/to/renderer-source' >&2
     exit 1
 fi
+
 src=$1
-commit=7406afbbd9cef0dcddef0b0a23b4855437715eb5
+base=ceb9e1f7a0180e61961bfde85d69d24e2dd84b39
+inkvi=7031c8259f4c8a906d06c1e3f4726d455126bfca
+stack_tree=3535e80cb6d1f7b4adff282678fe41d77f99a22c
+base_url=https://github.com/fxceless/victory-fork.git
+
 if [ ! -e "$src" ]; then
     git init -q -- "$src"
-    git -C "$src" fetch --depth=1 https://github.com/fxceless/victory-fork.git "$commit"
+fi
+src=$(CDPATH= cd -- "$src" && pwd)
+if [ ! -d "$src/.git" ]; then
+    echo 'Use a new path or the pinned renderer checkout.' >&2
+    exit 1
+fi
+if ! git -C "$src" rev-parse --verify HEAD >/dev/null 2>&1; then
+    test -z "$(git -C "$src" status --porcelain)"
+    git -C "$src" fetch -q --no-tags --depth=1 "$base_url" "$base"
     git -C "$src" checkout -q --detach FETCH_HEAD
 fi
-test "$(git -C "$src" rev-parse HEAD)" = "$commit" || {
-    echo 'Expected the pinned PR995 checkout.' >&2
+head=$(git -C "$src" rev-parse HEAD)
+if [ "$head" != "$base" ] && [ "$(git -C "$src" rev-parse 'HEAD^{tree}')" != "$stack_tree" ]; then
+    echo 'Expected the pinned inkVI stack. Use a new output path to build it.' >&2
     exit 1
-}
+fi
+
+kit="$src/.git/inkvi-kit"
+if [ ! -d "$kit/.git" ]; then
+    git init -q -- "$kit"
+fi
+if ! git -C "$kit" rev-parse --verify HEAD >/dev/null 2>&1; then
+    git -C "$kit" fetch -q --no-tags --depth=1 https://github.com/OctoAlgo/inkVI.git "$inkvi"
+    git -C "$kit" checkout -q --detach FETCH_HEAD
+fi
+test "$(git -C "$kit" rev-parse HEAD)" = "$inkvi"
+git -C "$kit" diff --quiet HEAD
+if [ "$head" = "$base" ]; then
+    test -z "$(git -C "$src" status --porcelain)" || {
+        echo 'The pinned base has local changes.' >&2
+        exit 1
+    }
+    (cd "$kit/patches" && sha256sum --check --quiet SHA256SUMS)
+    set --
+    while IFS= read -r patch; do
+        set -- "$@" "$kit/patches/$patch"
+    done < "$kit/patches/series"
+    git -C "$src" -c user.name=inkvi -c user.email=inkvi@localhost -c commit.gpgsign=false \
+        am -q --committer-date-is-author-date "$@"
+fi
+test "$(git -C "$src" rev-parse 'HEAD^{tree}')" = "$stack_tree"
 if [ -z "$(git -C "$src" status --porcelain)" ]; then
-    git -C "$src" apply --unidiff-zero "$kit/candidate.patch.txt"
+    git -C "$src" apply "$root/docs/inkvi/linux-overlay.patch.txt"
 fi
-if python3 "$kit/check_inputs.py" "$src" >/dev/null 2>&1; then
-    git -C "$src" apply --unidiff-zero "$kit/upstream.patch.txt"
+
+helper=crates/victory-gpu/src/brighten.cso
+if [ ! -f "$src/$helper" ]; then
+    from=7406afbbd9cef0dcddef0b0a23b4855437715eb5
+    git -C "$src" fetch -q --no-tags --depth=1 "$base_url" "$from"
+    git -C "$src" show "$from:$helper" > "$src/$helper"
 fi
-if python3 "$kit/check_inputs.py" "$src" "$kit/upstream-files.json" >/dev/null 2>&1; then
-    git -C "$src" apply --unidiff-zero "$kit/next.patch.txt"
-fi
-if python3 "$kit/check_inputs.py" "$src" "$kit/final-files.json" >/dev/null 2>&1; then
-    git -C "$src" apply --unidiff-zero "$kit/followup.patch.txt"
-fi
-if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" >/dev/null 2>&1; then
-    git -C "$src" apply "$kit/card-buffers-min-kb.patch.txt"
-fi
-if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" "$kit/card-buffers-files.json" >/dev/null 2>&1; then
-    git -C "$src" apply "$kit/series-s.patch.txt"
-fi
-if python3 "$kit/check_inputs.py" "$src" "$kit/followup-files.json" "$kit/card-buffers-files.json" "$kit/series-s-files.json" >/dev/null 2>&1; then
-    git -C "$src" apply "$kit/performance-7900xtx.patch.txt"
-fi
-sh "$kit/verify.sh" "$src"
+python3 "$root/docs/inkvi/verify.py" "$src"
 cd "$src"
-exec cargo build --locked --offline --profile diag -p victory --features diagnostics --target x86_64-pc-windows-msvc
+exec cargo build --locked --offline --release -p victory --target x86_64-pc-windows-msvc

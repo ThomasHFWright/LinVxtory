@@ -1,5 +1,10 @@
 # PR995 Linux candidate: source and reproduction kit
 
+This page records the earlier PR995 build. The current build starts from
+inkVI. The build commands below refer to the
+PR995 kit at commit `45fb193`.
+[Current build](../inkvi/README.md)
+
 The public renderer pin is `7406afbbd9cef0dcddef0b0a23b4855437715eb5`.
 The earlier small-buffer checkpoint is tree `2806f9ebe7de5001094b06ee6f38a5ead98b81c1`.
 It retains the published `91b6968` checkpoint, where a player confirmed
