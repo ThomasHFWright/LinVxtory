@@ -368,3 +368,26 @@ feeds particle shading and transmission. Skipping those passes without
 valid replacement outputs changes scene lighting. A separate 4K dithering
 draw follows the current NGX handoff. Its contribution to visible grain
 has yet to be measured.
+
+## Reflection bypass test in the playable cell
+
+After movement and camera prompts appeared in the AOC window, a five-frame
+capture compared the native filters with the renderer's bypass flag. The
+flag was set, and the opaque and alpha resolves received private
+current-frame history controls. Nevertheless, fence-retired GPU counters
+measured **49,537, 49,537, 48,897, 49,281 and 49,985** compute invocations
+in each of opaque bilateral and history update. A separate hardware
+predication fixture had skipped its dispatch successfully. The title test
+failed the bypass criterion. The player was still seeing 4K SR.
+
+The real sparse reflection classifier found 146–150 freshly traced hits
+and 795–832 screen-space hits per 640×360 input on three cell frames. It
+checked the same opaque depth serial, camera and native write sequence.
+Most positions had insufficient evidence of a fresh hit. Matching actual
+guide coverage and confirming a presented feature-13 frame are still open.
+
+The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
+introduces a different NVIDIA renderer baseline. Its [DLSS implementation
+notes](https://github.com/fxceless/victory-fork/blob/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea/docs/dlss.md)
+describe Streamline Super Resolution and Frame Generation. The 4K control
+here remains pinned to the tested renderer.
