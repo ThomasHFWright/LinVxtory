@@ -974,6 +974,35 @@ the under-bunk metal dropping by 3.15 EV in the color entering RR and
 pre-exposure and an empty optical layer at that patch. The image
 variation begins upstream of RR on that pair.
 
+### Default preset replay
+
+The exact default renderer tree `d6adab8` and native-GI preset ran on
+CachyOS, GE-Proton 11-14 and an RTX 5090 with the signed DLSS 310.9.16
+runtime. The replay used read-only input and a separate offline prefix,
+save and cache. It ran on the physical AOC with 1280×720 input and
+3840×2160 output, without a timed RR trigger.
+
+The first 720p-to-4K upscale used SR. The first verified full 4K RR
+Present arrived 63.4 seconds later during the transition into the cell.
+The quiet profile gives an upper bound for RR activation because the
+earliest intro operations lack full-display attribution. A separate
+startup diagnostic with the same lighting reached its first fenced RR
+evaluation on the fourth upscale, 0.81 seconds after the first
+upscale submitted to the GPU.
+
+Over seconds 240–295 in the loaded cell, 451 of 453 verified Presents
+used RR with native GI and the original optical input. The other two
+used stock SR. The capture-free interval measured **8.37 median FPS**
+and **133.31 ms p95 Present interval**. This is one default-preset
+measurement with no paired performance control.
+
+The wavy pane and hair remained visible. Separate exact taps at the
+reported through-glass tree and dark post found temporal variation
+before RR. Pane coverage stayed steady in the sampled tree tile. RR
+reduced the variation, with residual fine shimmer visible through the
+glass. Native sampling and subpixel jitter are still combined in those
+measurements.
+
 ### Capture-free timing with the stock fallback guard
 
 The historical hybrid-GI experiment used the same executable for both
