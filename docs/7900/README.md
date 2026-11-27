@@ -1,7 +1,8 @@
 # Series S 4K DLSS replay on RTX 5090
 
 This is the renderer built by the root [build script](../../build.sh). It uses
-[VIctory-7900XTX at 014d52d](https://github.com/avatarmanz/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
+avatarmanz’s VIctory-7900XTX source at 014d52d from the
+[public source mirror](https://github.com/TheInfamous404/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
 with LinVxtory's Linux and face/hair work, CPU submission changes, bounded
 readback capture, and direct 4K DLSS Super Resolution. The patches are
 GPL-3.0-or-later like the renderer. The kit provides source, settings, and
@@ -25,6 +26,33 @@ ponytail, wire window and lighting remained visible in the cell.
 This is one 4K baseline replay. A matched speed comparison and longer
 session have yet to run. The feature in this build is Super Resolution.
 
+The [Ray Reconstruction research](ray-reconstruction.md) includes separate
+4K hardware probes and the submitted cell-frame graph.
+
+## Offline shader lookup
+
+The current build uses the validated byte range of each embedded DXBC
+container to match offline shader keys to runtime keys. Existing shader
+lists based on the old carrier-tail hashes may need regeneration. The
+same source change applies to both Super Resolution and Ray Reconstruction.
+On a synthetic 64 MiB carrier with 256 valid containers, four alternating
+Windows CLI runs under Wine reduced median `shader-info --verbose` time
+from 0.775 s to 0.051 s and preserved all 256 offsets. A separate fixture
+confirmed that identical containers in different carriers share a key.
+[Upstream fix](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/b1369afb40017099471223ff61327c4550669a61)
+
+Use `sh build.sh --control <renderer-directory>` to reproduce the original
+source lock. Add `--rr` to reproduce the original Ray Reconstruction lock.
+
+## Descriptor updates
+
+Partial imported copies now mark overlapping view records for descriptor
+sync. An address-only write can therefore refresh a view even when its tag
+sits outside the copied bytes. All eight Windows-target descriptor tests
+passed under Wine. An uncontended copy-hook benchmark added about 0.04 ms
+per 3,800 mixed copies and did not measure downstream sync or game FPS.
+[Implementation and test](partial-descriptor-copies.patch.txt)
+
 ## Build and launch
 
 Set up Rust 1.98.1 and the Windows x64 MSVC cross toolchain, with Cargo's
@@ -42,14 +70,11 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a fresh external source directory when upgrading. The build reconstructs
-the measured 4K baseline at `3d033cbd633757d2fd15f97a4323d566e8a043ba`,
-then applies [nvidia-texture-queue.patch.txt](nvidia-texture-queue.patch.txt).
-This candidate filters host-written texture objects from the indexed upload queue when the preset is active.
-The wrapper verifies the resulting Git tree `e94850e6c5889940bf7b9e76bcf6534d31b42649`
-and all 263 build inputs before compiling the diagnostic DLSS profile.
-The published replay measurements are from the baseline.
-[VIctory-NVIDIA source change](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/5dda41ddff71e3f6052b843c115d2e09e89df41d)
+Use a separate external renderer directory for each build mode. The
+script checks all 263 original inputs when it reconstructs the measured
+4K tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`. It checks each
+subsequent overlay tree before building the diagnostic DLSS profile.
+[Current build locks](perf-build-trees.txt)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
