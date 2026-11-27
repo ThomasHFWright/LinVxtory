@@ -749,10 +749,24 @@ data consumed by the title's lighting. Stock SR presented at 1871.
 The two original opaque history backings again became reusable after
 their native writers retired.
 
+In the captured combined frame 1870, the tower, roof and table ripple
+patches retained 90–99% of the mid-scale contrast of the preceding SR
+frame 1861. The nearby fallback frame retained 90–105%, so nearby
+frames vary even under SR. The ponytail shape was intact and the wire
+mesh was softer with RR. These stationary captures show the combined
+effect and cannot isolate the GI change.
+
 The dedicated native transmission chain still produces the intended
-refraction. Its result travels in RR's optical layer. Other required
-native rendering includes visibility and probe integration, motion
-and material data, depth of field, and final compositing. The scene
-temporal input used by heat haze and DOF is a separate working area.
-The bounded replay verifies hardware routing and execution.
+refraction. Its result travels in RR's optical layer. Native directional
+shadow visibility, local and hair shadow reconstruction, and coarse
+alpha probe filtering also remain active. They generate packed
+visibility and lighting inputs consumed before the FFX handoff.
+Motion and material guide generation, current-frame light integration,
+depth of field and final compositing still run.
+
+The 720p trace also found a previous-scene contribution in the
+half-resolution `c89f7bd38af4f529` resolve. One output feeds heat haze
+and the other feeds the blur used by depth of field. Both paths reach
+the FFX color. The two-current-output specialization is CPU-verified
+and has no live activation in this measured build.
 [Source and reproduction](dive-testing.md#verify-reflection-and-diffuse-probe-replacement-together)
