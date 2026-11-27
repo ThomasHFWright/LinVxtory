@@ -203,3 +203,43 @@ A continuous history sequence starts with a reset and only reuses history
 when the current view references the preceding accepted camera. The
 title continues to present SR during this comparison. Keep the EXRs and
 game images local.
+
+## Test the native 4K upscaler slot on the AOC
+
+On the source tree from the HDR pair build, apply the optional [native
+display overlay](rr-native-display.patch.txt). The diagnostics build can
+select a single 4K provider on the title queue before the output's later
+consumers. It requires a precreated RR feature, a matching opaque
+producer, camera and DOF guide, frozen FFX inputs and a compatible 4K
+output UAV. The native lighting filters run for this experiment. An
+unselected or rejected RR list leaves the closed SR list available.
+
+```sh
+git apply --index "$kit/rr-native-display.patch.txt"
+test "$(git write-tree)" = fdf5181bb2e3676e33e4e79f331cd953347d5fb7
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Use the same private directories, 4K profile and capture controls. In
+a fresh launch environment configure the following switches. The
+`VICTORY_RR_STAGE_TRIGGER` path must be absent when the run begins.
+
+```sh
+unset VICTORY_OPAQUE_CURRENT VICTORY_OPAQUE_CUT VICTORY_ALPHA_CURRENT
+unset VICTORY_RR_SHADOW_FRAME VICTORY_RR_PAIR_DIR VICTORY_RR_BACKGROUND_FRAME
+export VICTORY_RR_PREPARE=1 VICTORY_RR_CAMERA=1 VICTORY_DOF_GUIDE=1
+export VICTORY_FFX_SR_SECTION=1 VICTORY_RR_NATIVE_DISPLAY=1 VICTORY_RR_DISPLAY_FRAME=1
+export VICTORY_RR_REFLECTION_CAPTURE=1 VICTORY_RR_REFLECTION_CAPTURE_FRAME=1
+export VICTORY_RR_REFLECTION_DENSE=1 VICTORY_RR_MATERIAL_GUIDES=1
+export VICTORY_RR_MATERIAL_FRAME=1 VICTORY_RR_ORDER_FRAME=1 VICTORY_PASS_STATS_FRAME=1
+export VICTORY_RR_STAGE_TRIGGER='Z:\path\to\run\captures\arm-stage'
+```
+
+Confirm the game is visible and the stock SR section has submitted before
+arming the trigger. Save an inkVI capture burst around the five selected
+Presents and a second burst after the window. Check the reported feature,
+number of submitted SR evaluations in the chosen slot, output serial,
+submission and fence. A candidate that declines reports the reason and
+keeps SR. The captured on-screen view, adopted FFX output and retired
+queue receipt answer different parts of the presentation check.
