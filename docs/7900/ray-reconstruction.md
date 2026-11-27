@@ -790,3 +790,26 @@ fallback was an unavailable previous native camera. Lighting
 instability was observed during the opt-in run. The recorded timing
 describes this mixed configuration, including its fallbacks. Stable
 continuous RR and the visual impact of switching still require proof.
+
+### Stationary lighting comparison
+
+Two capture-only replays used the same executable and independently
+confirmed the same camera, position, and title clock before arming.
+Only the GI replacement switch differed. Both retained RR, the optical
+layer, and the opaque and alpha replacement paths where their frame
+prerequisites passed.
+
+The sampled 90th percentile of the largest indoor patch change between
+consecutive confirmed RR Presents was 0.865 EV with GI replacement
+enabled and 0.032 EV with it disabled. For consecutive frames that
+changed provider it was 0.890 and 0.127 EV, respectively. In the longer
+RR history sequences the median change at the bunk fell from 9.59% to
+1.66%. The window edges were stable to within three pixels, and the
+open sky stayed steady. Exact SR fallback still showed a rarer wall
+change with GI replacement disabled.
+
+The stationary result identifies GI replacement as a major contributor
+to the lighting instability in this cell. The separate camera admission
+failures still cause provider switching. The captures measure visible
+stability, and the capture-free timing above measures the earlier mixed
+configuration.
