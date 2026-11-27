@@ -16,7 +16,7 @@ work by OctoAlgo under GPL-3.0.
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh "$DIVE_SRC"
+sh build.sh --control "$DIVE_SRC"
 cd "$DIVE_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/dive-capture.patch.txt"
@@ -93,7 +93,7 @@ separate feature-13 evaluation on captured title inputs.
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh "$RR_TEST_SRC"
+sh build.sh --control "$RR_TEST_SRC"
 cd "$RR_TEST_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 for patch in rr-backend rr-stage1 rr-cell-test rr-cell-join; do

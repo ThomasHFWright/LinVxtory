@@ -156,7 +156,7 @@ private staging directory. From the LinVxtory root:
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh "$RESEARCH_SRC"
+sh build.sh --control "$RESEARCH_SRC"
 cd "$RESEARCH_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-backend.patch.txt"
@@ -210,7 +210,7 @@ overlay](rr-graph.patch.txt) to a separate fresh reconstruction of the
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh "$TRACE_SRC"
+sh build.sh --control "$TRACE_SRC"
 cd "$TRACE_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-graph.patch.txt"

@@ -3,12 +3,17 @@
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 rr=0
-if [ "${1:-}" = --rr ]; then
-    rr=1
+control=0
+while [ "$#" -gt 1 ]; do
+    case "$1" in
+        --rr) rr=1 ;;
+        --control) control=1 ;;
+        *) break ;;
+    esac
     shift
-fi
+done
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-    echo 'Usage: sh build.sh [--rr] /path/to/renderer-source' >&2
+    echo 'Usage: sh build.sh [--rr] [--control] /path/to/renderer-source' >&2
     exit 1
 fi
 
@@ -65,18 +70,32 @@ if [ "$tree" = "$tested_tree" ]; then
     sha256sum --check --quiet "$kit/build-inputs.sha256.txt"
 fi
 expected=$tested_tree
+apply_locked_patch() {
+    next=$1
+    patch=$2
+    if [ "$tree" = "$expected" ]; then
+        git apply --index "$kit/$patch"
+        tree=$(git write-tree)
+        if [ "$tree" != "$next" ]; then
+            echo "Unexpected renderer tree after $patch" >&2
+            exit 1
+        fi
+    fi
+    expected=$next
+}
 if [ "$rr" -eq 1 ]; then
     while read -r next patch; do
-        if [ "$tree" = "$expected" ]; then
-            git apply --index "$kit/$patch"
-            tree=$(git write-tree)
-            if [ "$tree" != "$next" ]; then
-                echo "Unexpected renderer tree after $patch" >&2
-                exit 1
-            fi
-        fi
-        expected=$next
+        apply_locked_patch "$next" "$patch"
     done < "$kit/rr-build-trees.txt"
+fi
+if [ "$control" -eq 0 ]; then
+    while read -r sr_tree rr_tree patch; do
+        if [ "$rr" -eq 1 ]; then
+            apply_locked_patch "$rr_tree" "$patch"
+        else
+            apply_locked_patch "$sr_tree" "$patch"
+        fi
+    done < "$kit/perf-build-trees.txt"
 fi
 if [ "$tree" != "$expected" ]; then
     echo 'Renderer changes differ from the selected source tree.' >&2

@@ -29,6 +29,21 @@ session have yet to run. The feature in this build is Super Resolution.
 The [Ray Reconstruction research](ray-reconstruction.md) includes separate
 4K hardware probes and the submitted cell-frame graph.
 
+## Offline shader lookup
+
+The current build uses the validated byte range of each embedded DXBC
+container to match offline shader keys to runtime keys. Existing shader
+lists based on the old carrier-tail hashes may need regeneration. The
+same source change applies to both Super Resolution and Ray Reconstruction.
+On a synthetic 64 MiB carrier with 256 valid containers, four alternating
+Windows CLI runs under Wine reduced median `shader-info --verbose` time
+from 0.775 s to 0.051 s and preserved all 256 offsets. A separate fixture
+confirmed that identical containers in different carriers share a key.
+[Upstream fix](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/b1369afb40017099471223ff61327c4550669a61)
+
+Use `sh build.sh --control <renderer-directory>` to reproduce the original
+source lock. Add `--rr` to reproduce the original Ray Reconstruction lock.
+
 ## Build and launch
 
 Set up Rust 1.98.1 and the Windows x64 MSVC cross toolchain, with Cargo's
@@ -46,10 +61,11 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a fresh external source directory when upgrading. The script reconstructs
-and verifies the tested Git tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`
-and checks all 263 build inputs. It builds the diagnostic DLSS profile used
-for the 4K measurement.
+Use a separate external renderer directory for each build mode. The
+script checks all 263 original inputs when it reconstructs the measured
+4K tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`. It checks each
+subsequent overlay tree before building the diagnostic DLSS profile.
+[Current build locks](perf-build-trees.txt)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
