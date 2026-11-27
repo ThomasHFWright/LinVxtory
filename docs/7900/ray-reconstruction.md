@@ -4,11 +4,13 @@ The control is LinVxtory `338d80e`, renderer `5b10585` (tree
 `3d033cbd633757d2fd15f97a4323d566e8a043ba`). Its 1280×720 → 3840×2160
 Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 585 title Present intervals in the cell at +240 to +295 s. See the
-[control build and results](README.md).
+[control build and results](README.md#historical-4k-super-resolution-control).
 
-The experimental path uses one NGX Ray Reconstruction evaluation to
-produce the 4K scene. The title still applies its later postprocessing
-and composites the UI. SR remains the control and the fallback.
+The default 4K preset uses one NGX Ray Reconstruction evaluation on
+each qualifying frame. The title applies its later postprocessing and
+composites the UI. When a frame misses the native filter cutoff it
+keeps stock Super Resolution and the native filters.
+[Build and launch the default preset](README.md#build-and-launch)
 
 On the RTX 5090, accepted 4K RR frames preserved the game’s wavy glass
 and bypassed five original filter bodies. A paired GI shader retained
@@ -156,7 +158,7 @@ private staging directory. From the LinVxtory root:
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$RESEARCH_SRC"
+sh build.sh --sr --control "$RESEARCH_SRC"
 cd "$RESEARCH_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-backend.patch.txt"
@@ -210,7 +212,7 @@ overlay](rr-graph.patch.txt) to a separate fresh reconstruction of the
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$TRACE_SRC"
+sh build.sh --sr --control "$TRACE_SRC"
 cd "$TRACE_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-graph.patch.txt"
@@ -219,8 +221,8 @@ cargo build --locked --offline --profile diag --features dlss \
   -p victory --target x86_64-pc-windows-msvc
 ```
 
-Use the [4K control replay settings](README.md#build-and-launch) and choose
-a frame in the cell. The frame number varies with loading. Set
+Use the [4K launch settings](README.md#build-and-launch) with
+`VICTORY_RR_AUTO=0` before loading the preset. Choose a frame in the cell. The frame number varies with loading. Set
 `VICTORY_PROVENANCE` to a writable private Windows filename,
 `VICTORY_PROVENANCE_FRAMES` to the selected frame, `VICTORY_CAPTURE` to
 an existing private Windows directory, and `VICTORY_CAPTURE_FRAMES` to
@@ -908,7 +910,7 @@ at the native filter cutoff. The later FidelityFX slot kept the original
 SR command. Its signal and accepted 4K Present identify stock SR with
 all replacement flags clear. The same signal certified the camera for
 the next frame, and the replay presented full-route RR after the warmup.
-[Reproduction and opt-in build](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
+[Diagnostic reproduction](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
 
 In the first camera-turn run of this build, 227 of 229 accepted Presents
 used the full RR route and the other two used exact stock SR. The native

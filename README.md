@@ -6,19 +6,17 @@ repeatable gameplay checks.
 
 ## Default 4K preset
 
-The Series S preset renders at **1280×720** and presents at **3840×2160**
-using NVIDIA DLSS Super Resolution in Ultra Performance mode. It runs
-with ray tracing enabled and the ambient substitute disabled. The
-renderer composites the UI at presentation.
+LinVxtory uses **NVIDIA DLSS Ray Reconstruction** by default. The Series S
+preset renders at **1280×720** and presents at **3840×2160** in Ultra
+Performance mode. Ray tracing is active, and the renderer composites
+the title’s UI at presentation.
 
-The documented setup is **CachyOS, RTX 5090, NVIDIA driver 620.73.04,
-GE-Proton 11-14 and a locally built, pinned vkd3d-proton**. One offline
-cell replay measured **10.77 median FPS** and **119.01 ms p95 frame time** across 585
-title Present intervals in its 55-second timing window. The room lighting,
-wire window, character face and ponytail were visible in that checkpoint. Later
-scenes and long-session stability remain open.
-[Preset and replay conditions](docs/7900/README.md#current-4k-baseline) ·
-[Runtime versions](docs/7900/vkd3d-source-lock.json)
+For eligible frames, Ray Reconstruction replaces five native filter
+passes and preserves the game’s original wavy glass. If the required
+frame data is unavailable at the filter cutoff, that frame uses
+Super Resolution with the native filters. The stationary cell and
+camera-turn replays verified this behavior on an RTX 5090.
+[Image and fallback evidence](docs/7900/ray-reconstruction.md#stock-fallback-at-the-native-cutoff)
 
 ## Build and run
 
@@ -30,27 +28,21 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh ../linvxtory-renderer
 ```
 
-Use a fresh output directory when upgrading. The build script verifies
-the pinned renderer tree and build-input hashes. The launch guide covers
-the Proton prefix, local runtime libraries and Series S launch flags.
-Supply your own game files and keep the prefix, saves and caches separate
-from the source checkout.
+Use a fresh output directory for each build mode. Follow the launch
+guide to set up Proton and the signed NVIDIA runtime DLLs, including
+`nvngx_dlssd.dll` for Ray Reconstruction. Ordinary gameplay starts
+without a diagnostic trigger. Supply your own game files and keep
+the prefix, saves and caches separate from the source checkout.
+
+To run 4K Super Resolution with the same executable, set
+`VICTORY_RR_AUTO=0` in a fresh shell before loading the preset. For a
+dedicated SR build use `sh build.sh --sr ../linvxtory-sr`, or add
+`--control` to reproduce the exact historical SR source. The explicit
+`--rr` build option still selects the default renderer.
 [Toolchain and launch guide](docs/7900/README.md#build-and-launch) ·
-[Build-input hashes](docs/7900/build-inputs.sha256.txt) ·
+[4K measurements](docs/7900/ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard) ·
+[Diagnostic capture guide](docs/7900/dive-testing.md) ·
 [Asset policy](docs/asset-policy.md)
-
-## Ray Reconstruction research
-
-The research branch runs DLSS Ray Reconstruction in game at 720p → 4K.
-One RR evaluation reconstructs and upscales the scene. Verified RR
-frames bypass five original filter passes while retaining the game’s
-wavy glass. Stock Super Resolution is the default and handles frames
-that miss the early replacement cutoff.
-
-Build the opt-in renderer from the research branch with
-`sh build.sh --rr ../linvxtory-rr`.
-[Research branch notes](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/ray-reconstruction.md) ·
-[Reproduce a 4K cell test with inkVI-dive](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/dive-testing.md)
 
 ## Credits and development history
 

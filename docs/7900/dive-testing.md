@@ -16,7 +16,7 @@ work by OctoAlgo under GPL-3.0.
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$DIVE_SRC"
+sh build.sh --sr --control "$DIVE_SRC"
 cd "$DIVE_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/dive-capture.patch.txt"
@@ -25,9 +25,10 @@ cargo build --locked --offline --profile diag --features dlss \
   -p victory --target x86_64-pc-windows-msvc
 ```
 
-Run the published 4K profile with the same read-only title, isolated
-saves, warm-cache seed, and a real window. Give each process its own
-command and capture directories. Set the following Windows paths in the
+Set `VICTORY_RR_AUTO=0` before sourcing `rt-speed.env.sh` for these
+diagnostic recipes. Use the same read-only title, isolated saves,
+warm-cache seed and a real window. Give each process its own command
+and capture directories. Set the following Windows paths in the
 title process environment, substituting paths inside your offline mount.
 
 ```sh
@@ -93,7 +94,7 @@ separate feature-13 evaluation on captured title inputs.
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$RR_TEST_SRC"
+sh build.sh --sr --control "$RR_TEST_SRC"
 cd "$RR_TEST_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 for patch in rr-backend rr-stage1 rr-cell-test rr-cell-join; do
@@ -392,10 +393,14 @@ control and matched 55-second procedure above.
 
 ## Keep stock Super Resolution when the RR cutoff is missed
 
-From the LinVxtory research branch, `sh build.sh --rr ../linvxtory-rr`
-builds the complete opt-in RR renderer in a separate directory.
-The default `sh build.sh ../linvxtory-sr` builds the published SR control.
-Both commands check the resulting renderer tree before compiling.
+From LinVxtory, `sh build.sh ../linvxtory-rr` builds the current RR
+renderer. Use `sh build.sh --sr --control ../linvxtory-sr-control` for
+the historical standalone SR control. Both commands check the resulting
+renderer tree before compiling.
+
+The steps below are for the measured SR/RR comparison. Ordinary
+gameplay uses the default launch without a timing trigger.
+[Build and launch](README.md#build-and-launch)
 
 To finish a manual build, apply the [stock fallback overlay](rr-atomic-stock-fallback.patch.txt)
 to the deferred-camera and diffuse-history tree.
@@ -408,9 +413,11 @@ cargo build --locked --offline --profile diag --features dlss \
   -p victory --target x86_64-pc-windows-msvc
 ```
 
-Use the published 4K launcher settings and the same executable for both
-timing arms. In each freshly isolated run, set these shared switches and
-point the trigger at an absent file inside that run's writable directory.
+Use the [4K launch settings](README.md#build-and-launch) and the same RR
+executable for both timing arms. In each fresh shell, set
+`VICTORY_RR_AUTO=0` before sourcing `rt-speed.env.sh`. Set these shared
+diagnostic switches and point the trigger at an absent file inside the
+run's writable directory.
 
 ```sh
 export VICTORY_FFX_DLSS=4k VICTORY_PRESENT_4K=1
