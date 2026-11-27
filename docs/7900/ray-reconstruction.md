@@ -10,12 +10,13 @@ The experimental path uses one NGX Ray Reconstruction evaluation to
 produce the 4K scene. The title still applies its later postprocessing
 and composites the UI. SR remains the control and the fallback.
 
-Hardware replays show three consecutive 4K RR frames with two native
-opaque reflection filters bypassed. A separate displayed replay restored
-the game’s intentional glass ripples using the original transmission
-input, with the native filters active in that test. Camera motion and
-matched performance are still being verified. [Opaque filter evidence](#native-4k-frames-with-two-opaque-filters-bypassed)
-· [Displayed optical layer](#the-optical-layer-on-the-aoc-display)
+On the RTX 5090, accepted 4K RR frames preserved the game’s wavy glass
+and bypassed five original filter bodies. A paired GI shader retained
+the diffuse and caustic accumulation that feeds scene lighting. The
+stock-vs-RR timing pair after this lighting fix measured 9.01 vs 9.11
+median FPS and 184.08 vs 118.60 ms p95. The follow-up build verifies
+stock SR recovery when the early replacement cannot commit.
+[GPU filter evidence](#diffuse-history-replacement) · [Same-build timing](#capture-free-timing-after-the-lighting-and-camera-changes) · [Stock fallback](#stock-fallback-at-the-native-cutoff)
 
 ## Graph investigation
 
@@ -58,7 +59,8 @@ Two synthetic evaluations completed, one with reset and one with history.
 After the GPU fences signaled, both 4K readbacks had finite RGB at every
 pixel and zero remaining sentinel components. The [probe source, build
 instructions and measured outputs](rr-probe/README.md) are reproducible
-without game files. In-game guide validation is still underway.
+without game files. The hardware replays below verify the separate
+in-game route.
 
 ## What the title filters
 
@@ -895,5 +897,15 @@ Every accepted RR Present included the original glass input and 498 of
 499 used all verified replacements. Frame 2332 used late RR with the
 native filters retained because an optical producer was pending at the
 earlier cutoff. This one-pair result measured 8.2% higher accepted
-throughput and 35.6% lower p95. The late selection is being tightened
-so that a frame without the committed bypass uses stock SR.
+throughput and 35.6% lower p95. The follow-up below changes that late
+selection to stock SR.
+
+### Stock fallback at the native cutoff
+
+The follow-up build requires a committed early replacement for atomic RR.
+On the same RTX 5090 replay, Present 1952 had no eligible previous camera
+at the native filter cutoff. The later FidelityFX slot kept the original
+SR command. Its signal and accepted 4K Present identify stock SR with
+all replacement flags clear. The same signal certified the camera for
+the next frame, and the replay presented full-route RR after the warmup.
+[Reproduction and opt-in build](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)

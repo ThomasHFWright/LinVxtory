@@ -48,9 +48,9 @@ sh "$DIVE_TOOLS/dcmd.sh" ./run/channel 'cap 2'
 ```
 
 The reply acknowledges the scheduled Present IDs. To wait for complete
-files, use the helper in the [capture receipt PR](https://github.com/OctoAlgo/inkVI-dive/pull/1).
-Set `DIVE_TOOLS` to the helper checkout's `tools` directory. Each invocation
-requests a new burst.
+files, set `DIVE_TOOLS` to the `tools` directory of the pinned inkVI-dive
+checkout below. Each invocation requests a new burst.
+[Merged capture receipt helper](https://github.com/OctoAlgo/inkVI-dive/tree/6d0331631a1dc5cff1539d7715917aa17e1d3c3b/tools)
 
 ```sh
 python3 "$DIVE_TOOLS/capture-receipt.py" ./run/channel ./run/captures \
@@ -206,13 +206,8 @@ game images local.
 
 ## Test the native 4K upscaler slot on the AOC
 
-From the LinVxtory research branch, `sh build.sh --rr ../linvxtory-rr`
-reconstructs and builds the native output test in its own directory.
-The default `sh build.sh ../linvxtory-sr` builds the published SR control.
-Each mode checks the resulting renderer tree before compiling.
-
-For a manual build on the source tree from the HDR pair build, apply the optional [native
-display overlay](rr-native-display.patch.txt). The diagnostics build can
+For this intermediate test, apply the [native display overlay](rr-native-display.patch.txt)
+to the source tree from the HDR pair build. The diagnostics build can
 select a single 4K provider on the title queue before the output's later
 consumers. It requires a precreated RR feature, a matching opaque
 producer, camera and DOF guide, frozen FFX inputs and a compatible 4K
@@ -251,7 +246,7 @@ queue receipt answer different parts of the presentation check.
 
 ## Verify the two opaque filter bypasses
 
-Build the 4K RR renderer in a separate directory as above. Apply the
+Build the intermediate native display renderer in a separate directory as above. Apply the
 optional [opaque cut test overlay](rr-opaque-cut.patch.txt) to its
 diagnostics source and rebuild.
 
@@ -394,3 +389,55 @@ and caustic accumulation. The older current-only experiment uses
 capture, tap, per-pass query, camera diagnostics and stage flags.
 Retain the new switches in the RR arm, then follow the same-source SR
 control and matched 55-second procedure above.
+
+## Keep stock Super Resolution when the RR cutoff is missed
+
+From the LinVxtory research branch, `sh build.sh --rr ../linvxtory-rr`
+builds the complete opt-in RR renderer in a separate directory.
+The default `sh build.sh ../linvxtory-sr` builds the published SR control.
+Both commands check the resulting renderer tree before compiling.
+
+To finish a manual build, apply the [stock fallback overlay](rr-atomic-stock-fallback.patch.txt)
+to the deferred-camera and diffuse-history tree.
+
+```sh
+test "$(git write-tree)" = 55bb577c0a2fb158ecdc6edd38e2df1b10390b78
+git apply --index "$kit/rr-atomic-stock-fallback.patch.txt"
+test "$(git write-tree)" = 7a1a47ccb01b0b13afee08c4b715fbc2793a7987
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Use the published 4K launcher settings and the same executable for both
+timing arms. In each freshly isolated run, set these shared switches and
+point the trigger at an absent file inside that run's writable directory.
+
+```sh
+export VICTORY_FFX_DLSS=4k VICTORY_PRESENT_4K=1
+export VICTORY_FFX_SR_SECTION=1 VICTORY_RR_PRESENT_LINEAGE=1
+export VICTORY_RR_PERF_TRIGGER='Z:\path\to\run\rr-bench-trigger'
+```
+
+Set the following switches in the RR arm only.
+
+```sh
+export VICTORY_RR_NATIVE_DISPLAY=1 VICTORY_RR_PREPARE=1 VICTORY_RR_CAMERA=1
+export VICTORY_RR_DEFER_CAMERA_PROJECTION=1 VICTORY_RR_REFLECTION_DENSE=1
+export VICTORY_RR_MATERIAL_GUIDES=1 VICTORY_DOF_GUIDE=1
+export VICTORY_RR_EARLY_SOURCE=1 VICTORY_RR_ATOMIC_CUT=1
+export VICTORY_RR_NATIVE_TRANSMISSION_DISPLAY=1 VICTORY_RR_REFLECTION_CURRENT_KERNELS=1
+export VICTORY_RR_EXPERIMENTAL_ALPHA_KERNEL=1 VICTORY_RR_BACKGROUND_FRAME=1
+export VICTORY_RR_PROBE_CURRENT=1 VICTORY_RR_PROBE_DIFFUSE_HISTORY=1
+```
+
+Confirm the same playable cell view in both runs. Create each trigger
+from the host after confirming the view. The benchmark drops a three-second
+guide warmup and scores the next 55 seconds. Start both arms without capture,
+per-pass queries, or camera diagnostics. Collect camera-turn images in
+separate replays.
+
+When a frame misses the native filter cutoff, the display hook leaves
+the title's stock FFX slot and native filters active. In a bounded
+diagnostic replay, match the cutoff rejection to the exact stock SR
+Present and its native pass counters. For each accepted RR Present,
+require all replacement flags in the same Present receipt.

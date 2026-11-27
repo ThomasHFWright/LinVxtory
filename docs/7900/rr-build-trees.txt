@@ -4,3 +4,8 @@ dbe076f814f66e1ddad92c7e2e924e0f0eca92bf rr-cell-test.patch.txt
 471f1db55f6437dcc62b5b3ffdb0c79dc542c28c rr-cell-join.patch.txt
 5025e20d5658f9a3691999bd85fa726dcc5c4b26 rr-cell-pair.patch.txt
 fdf5181bb2e3676e33e4e79f331cd953347d5fb7 rr-native-display.patch.txt
+422ada24652eb1444303ac1d8c91157d66a6a61e rr-opaque-cut.patch.txt
+775e0c7d5be42de4df8d63944f0f062cb9e9bf24 rr-optical-cut.patch.txt
+8cabc54072e7ff76e4487e33021b3f778c878bd7 rr-reflection-gi.patch.txt
+55bb577c0a2fb158ecdc6edd38e2df1b10390b78 rr-camera-stable-gi.patch.txt
+7a1a47ccb01b0b13afee08c4b715fbc2793a7987 rr-atomic-stock-fallback.patch.txt
