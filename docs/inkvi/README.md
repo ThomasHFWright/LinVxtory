@@ -110,6 +110,11 @@ export VICTORY_GPU_UPLOAD_COPIES=0 VICTORY_CARD_WINDOWS_MB=6144
 export VICTORY_MERGE_RUNS=4096 VICTORY_MERGE_GAP=0
 ```
 
+During bring-up on the RTX 5090, an early Series S build created all 53
+builder pipelines, peaked at **1.3 FPS** in the world host samples, and
+stalled before it could complete a cell replay. The peak describes the
+bring-up run. The cell median below comes from a later warm replay.
+
 The RTX 5090 and GE-Proton 11-14 replay created all 53 builder pipelines
 and reached the Series S cell with the movement and camera prompts.
 The preview ran with the ambient substitute disabled. A second replay

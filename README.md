@@ -62,8 +62,10 @@ configuration used in the replay. Supply your own game files at runtime.
 
 ## Results history
 
-- **Earlier ray-tracing preview.** The cell reached 5.1 FPS. Its comparison with traversal
-  held reached 7.3 FPS with the wall and shelving nearly black. [Earlier ray-tracing
+- **Ray-tracing bring-up and preview.** An early RTX 5090 build peaked at **1.3 FPS**
+  after entering the world and then stalled. The first stable warm preview reached
+  **5.1 median FPS** in the cell with traversal active. Holding traversal reached
+  7.3 median FPS with the wall and shelving nearly black. [Earlier ray-tracing
   test](docs/inkvi/README.md#ray-tracing-preview)
 
 - **inkVI Series S with the ambient substitute.** On RTX 5090, the build reached the cell
