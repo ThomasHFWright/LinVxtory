@@ -1,0 +1,47 @@
+[
+  {
+    "path": ".",
+    "commit": "71cae091b06571e51446cf2a937f0b04c237c04d",
+    "upstream": "https://github.com/HansKristian-Work/vkd3d-proton.git"
+  },
+  {
+    "path": "khronos/SPIRV-Headers",
+    "commit": "f88a2d766840fc825af1fc065977953ba1fa4a91",
+    "upstream": "https://github.com/KhronosGroup/SPIRV-Headers"
+  },
+  {
+    "path": "khronos/Vulkan-Headers",
+    "commit": "ee2ec5fd83dafce291024683b50dc89219333076",
+    "upstream": "https://github.com/KhronosGroup/Vulkan-Headers"
+  },
+  {
+    "path": "subprojects/dxil-spirv",
+    "commit": "b540c8a2484eecc7c2155994c806bbd8a8706f41",
+    "upstream": "https://github.com/HansKristian-Work/dxil-spirv.git"
+  },
+  {
+    "path": "subprojects/dxil-spirv/third_party/spirv-headers",
+    "commit": "c63848ecf2200425511319fd8bf2c17b751e501e",
+    "upstream": "https://github.com/KhronosGroup/SPIRV-Headers"
+  },
+  {
+    "path": "subprojects/dxil-spirv/third_party/SPIRV-Tools",
+    "commit": "199cb207b911501ddd76dcddf100a6e21c15ef23",
+    "upstream": "https://github.com/KhronosGroup/SPIRV-Tools"
+  },
+  {
+    "path": "subprojects/dxil-spirv/third_party/SPIRV-Cross",
+    "commit": "be71ee8c12cd7dc5ca8fa9581f708c2e8561fe2a",
+    "upstream": "https://github.com/KhronosGroup/SPIRV-Cross"
+  },
+  {
+    "path": "subprojects/dxil-spirv/subprojects/dxbc-spirv",
+    "commit": "d82d9eaa6cab5c7277a6839f328e1b4d2f146894",
+    "upstream": "https://github.com/doitsujin/dxbc-spirv"
+  },
+  {
+    "path": "subprojects/dxil-spirv/subprojects/dxbc-spirv/submodules/spirv_headers",
+    "commit": "c8ad050fcb29e42a2f57d9f59e97488f465c436d",
+    "upstream": "https://github.com/KhronosGroup/SPIRV-Headers.git"
+  }
+]

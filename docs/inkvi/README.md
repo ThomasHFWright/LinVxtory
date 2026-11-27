@@ -1,5 +1,9 @@
 # inkVI renderer on LinVxtory
 
+These are the earlier inkVI tests. For the current build see the
+[7900XTX renderer](../7900/README.md). The historical build instructions
+below apply to [main at 7de8ad3](https://github.com/ThomasHFWright/LinVxtory/tree/7de8ad35ba99d0bd4e84fda0b7bd72ac5f8a08fe).
+
 The source stack is [OctoAlgo’s inkVI at 7031c82](https://github.com/OctoAlgo/inkVI/tree/7031c8259f4c8a906d06c1e3f4726d455126bfca).
 It applies 39 ordered patches to [fxceless at ceb9e1f7a](https://github.com/fxceless/victory-fork/commit/ceb9e1f7a0180e61961bfde85d69d24e2dd84b39)
 and includes each original contributor’s provenance and license.

@@ -1,0 +1,91 @@
+diff --git a/libs/vkd3d/memory.c b/libs/vkd3d/memory.c
+index 453007388af18c14f8f7a9a5c276b5e64d3a9c35..2320e6a8c56c39bcb5808a30c2a42a4735581c9c 100644
+--- a/libs/vkd3d/memory.c
++++ b/libs/vkd3d/memory.c
+@@ -1417,4 +1417,5 @@ static HRESULT vkd3d_memory_allocation_init(struct vkd3d_memory_allocation *allo
+     memset(allocation, 0, sizeof(*allocation));
+     allocation->heap_type = vkd3d_normalize_heap_type(&info->heap_properties);
++    allocation->original_heap_type = info->heap_properties.Type;
+     allocation->flags = info->flags;
+     allocation->explicit_global_buffer_usage = info->explicit_global_buffer_usage;
+@@ -2075,7 +2076,9 @@ static HRESULT vkd3d_memory_allocator_try_suballocate_memory(struct vkd3d_memory
+         /* Match heap type so that we know we get the appropriate memory property flags.
+          * These types are normalized, so that different CUSTOM heaps will be considered to be different heap types.
+-         * Beyond that, there's just a distinction which explicit global buffer usage we have.
+-         * In practice, we're toggling between BUFFER heaps and non-BUFFER heaps here. */
++         * Buffer usage is selected from the original heap type. A CUSTOM write-back
++         * heap must not inherit a READBACK-only global buffer. Explicit usage also
++         * distinguishes BUFFER heaps from non-BUFFER heaps. */
+         if (chunk->allocation.heap_type != normalized_heap_type ||
++                chunk->allocation.original_heap_type != heap_properties->Type ||
+                 chunk->allocation.explicit_global_buffer_usage != explicit_global_buffer_usage)
+             continue;
+diff --git a/libs/vkd3d/resource.c b/libs/vkd3d/resource.c
+index 39e4b0b6fdbf67af8ba2cc4862b989fb34550735..980f4f6f46baed69592bb0a086c8245a42ae9127 100644
+--- a/libs/vkd3d/resource.c
++++ b/libs/vkd3d/resource.c
+@@ -6043,4 +6043,5 @@ void d3d12_desc_create_cbv_heap(vkd3d_cpu_descriptor_va_t desc_va,
+         struct d3d12_device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+ {
++    const D3D12_CONSTANT_BUFFER_VIEW_DESC null_desc = {0};
+     DECLSPEC_ALIGN(8) uint8_t stack_payload[VKD3D_MAX_DESCRIPTOR_SIZE];
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+@@ -6050,9 +6051,7 @@ void d3d12_desc_create_cbv_heap(vkd3d_cpu_descriptor_va_t desc_va,
+     VkHostAddressRangeEXT desc_range;
+
+-    if (!desc)
+-    {
+-        WARN("Constant buffer desc is NULL.\n");
+-        return;
+-    }
++    /* A zero-sized CBV is null even when its GPU address is nonzero. */
++    if (!desc || !desc->BufferLocation || !desc->SizeInBytes)
++        desc = &null_desc;
+
+     if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+@@ -6086,4 +6085,5 @@ void d3d12_desc_create_cbv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
+         struct d3d12_device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+ {
++    const D3D12_CONSTANT_BUFFER_VIEW_DESC null_desc = {0};
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     VkDescriptorAddressInfoEXT addr_info;
+@@ -6091,9 +6091,6 @@ void d3d12_desc_create_cbv_embedded(vkd3d_cpu_descriptor_va_t desc_va,
+     VkDescriptorGetInfoEXT get_info;
+
+-    if (!desc)
+-    {
+-        WARN("Constant buffer desc is NULL.\n");
+-        return;
+-    }
++    if (!desc || !desc->BufferLocation || !desc->SizeInBytes)
++        desc = &null_desc;
+
+     if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+@@ -6141,4 +6138,5 @@ void d3d12_desc_create_cbv(vkd3d_cpu_descriptor_va_t desc_va,
+         struct d3d12_device *device, const D3D12_CONSTANT_BUFFER_VIEW_DESC *desc)
+ {
++    const D3D12_CONSTANT_BUFFER_VIEW_DESC null_desc = {0};
+     const struct vkd3d_vk_device_procs *vk_procs = &device->vk_procs;
+     const struct vkd3d_unique_resource *resource = NULL;
+@@ -6156,9 +6154,6 @@ void d3d12_desc_create_cbv(vkd3d_cpu_descriptor_va_t desc_va,
+     uint32_t info_index;
+
+-    if (!desc)
+-    {
+-        WARN("Constant buffer desc is NULL.\n");
+-        return;
+-    }
++    if (!desc || !desc->BufferLocation || !desc->SizeInBytes)
++        desc = &null_desc;
+
+     if (desc->SizeInBytes & (D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT - 1))
+diff --git a/libs/vkd3d/vkd3d_private.h b/libs/vkd3d/vkd3d_private.h
+index 26b09c187819852f943b61c89960e00d233e1c7b..d1ebbb07633c26fdb103bbbbaceb96852c44b274 100644
+--- a/libs/vkd3d/vkd3d_private.h
++++ b/libs/vkd3d/vkd3d_private.h
+@@ -880,4 +880,5 @@ struct vkd3d_memory_allocation
+
+     D3D12_HEAP_TYPE heap_type;
++    D3D12_HEAP_TYPE original_heap_type;
+     uint32_t flags;
+     VkBufferUsageFlags2KHR explicit_global_buffer_usage;

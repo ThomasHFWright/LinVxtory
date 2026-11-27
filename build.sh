@@ -1,5 +1,5 @@
 #!/bin/sh
-# Reconstruct the pinned inkVI renderer and apply LinVxtory's Linux overlay.
+# Reconstruct the pinned renderer and build the tested Linux configuration.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
@@ -8,17 +8,18 @@ if [ "$#" -ne 1 ] || [ -z "$1" ]; then
 fi
 
 src=$1
-base=ceb9e1f7a0180e61961bfde85d69d24e2dd84b39
-inkvi=7031c8259f4c8a906d06c1e3f4726d455126bfca
-stack_tree=3535e80cb6d1f7b4adff282678fe41d77f99a22c
-base_url=https://github.com/fxceless/victory-fork.git
+base=014d52dedf837d1ac660a0bd256c4704be9eeb40
+base_tree=0b2726fef1258f1d7817afdf0af8b251870e408b
+tested_tree=0ab430bbecb29f450d2d9e837673ad10aa1210b4
+base_url=https://github.com/avatarmanz/VIctory-7900XTX.git
+kit="$root/docs/7900"
 
 if [ ! -e "$src" ]; then
     git init -q -- "$src"
 fi
 src=$(CDPATH= cd -- "$src" && pwd)
 if [ ! -d "$src/.git" ]; then
-    echo 'Use a new path or the pinned renderer checkout.' >&2
+    echo 'Use a new directory for the pinned renderer.' >&2
     exit 1
 fi
 if ! git -C "$src" rev-parse --verify HEAD >/dev/null 2>&1; then
@@ -26,46 +27,25 @@ if ! git -C "$src" rev-parse --verify HEAD >/dev/null 2>&1; then
     git -C "$src" fetch -q --no-tags --depth=1 "$base_url" "$base"
     git -C "$src" checkout -q --detach FETCH_HEAD
 fi
-head=$(git -C "$src" rev-parse HEAD)
-if [ "$head" != "$base" ] && [ "$(git -C "$src" rev-parse 'HEAD^{tree}')" != "$stack_tree" ]; then
-    echo 'Expected the pinned inkVI stack. Use a new output path to build it.' >&2
+
+if [ "$(git -C "$src" rev-parse HEAD)" != "$base" ] ||
+   [ "$(git -C "$src" rev-parse 'HEAD^{tree}')" != "$base_tree" ]; then
+    echo 'Expected the pinned 7900XTX base. Use a new output path.' >&2
     exit 1
 fi
-
-kit="$src/.git/inkvi-kit"
-if [ ! -d "$kit/.git" ]; then
-    git init -q -- "$kit"
-fi
-if ! git -C "$kit" rev-parse --verify HEAD >/dev/null 2>&1; then
-    git -C "$kit" fetch -q --no-tags --depth=1 https://github.com/OctoAlgo/inkVI.git "$inkvi"
-    git -C "$kit" checkout -q --detach FETCH_HEAD
-fi
-test "$(git -C "$kit" rev-parse HEAD)" = "$inkvi"
-git -C "$kit" diff --quiet HEAD
-if [ "$head" = "$base" ]; then
-    test -z "$(git -C "$src" status --porcelain)" || {
-        echo 'The pinned base has local changes.' >&2
-        exit 1
-    }
-    (cd "$kit/patches" && sha256sum --check --quiet SHA256SUMS)
-    set --
-    while IFS= read -r patch; do
-        set -- "$@" "$kit/patches/$patch"
-    done < "$kit/patches/series"
-    git -C "$src" -c user.name=inkvi -c user.email=inkvi@localhost -c commit.gpgsign=false \
-        am -q --committer-date-is-author-date "$@"
-fi
-test "$(git -C "$src" rev-parse 'HEAD^{tree}')" = "$stack_tree"
 if [ -z "$(git -C "$src" status --porcelain)" ]; then
-    git -C "$src" apply "$root/docs/inkvi/linux-overlay.patch.txt"
+    git -C "$src" apply --index "$kit/linux-overlay.patch.txt"
 fi
-
-helper=crates/victory-gpu/src/brighten.cso
-if [ ! -f "$src/$helper" ]; then
-    from=7406afbbd9cef0dcddef0b0a23b4855437715eb5
-    git -C "$src" fetch -q --no-tags --depth=1 "$base_url" "$from"
-    git -C "$src" show "$from:$helper" > "$src/$helper"
+if [ "$(git -C "$src" write-tree)" != "$tested_tree" ] ||
+   ! git -C "$src" diff --quiet; then
+    echo 'Renderer changes differ from the tested source tree.' >&2
+    exit 1
 fi
-python3 "$root/docs/inkvi/verify.py" "$src"
+if [ -n "$(git -C "$src" ls-files --others -- apps crates .cargo Cargo.lock Cargo.toml rust-toolchain.toml)" ]; then
+    echo 'Unexpected files in the renderer build inputs.' >&2
+    exit 1
+fi
 cd "$src"
-exec cargo build --locked --offline --release -p victory --target x86_64-pc-windows-msvc
+sha256sum --check --quiet "$kit/build-inputs.sha256.txt"
+printf '%s\n' 'Verified the locked renderer tree and build inputs.'
+exec cargo build --locked --offline --profile diag --features diagnostics -p victory --target x86_64-pc-windows-msvc

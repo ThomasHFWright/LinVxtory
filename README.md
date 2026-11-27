@@ -16,11 +16,10 @@ the inputs, crashes and remaining rendering defects alongside the results.
 
 ## What this kit builds
 
-The build uses OctoAlgo’s pinned inkVI stack for facial skin, hair,
-shadows and Wave64 translation. LinVxtory adds its Series S presentation
-repair, fresh constant-buffer tables after command-list waits, and the
-7900XTX performance changes. The same build includes an opt-in ray-tracing
-preview. [inkVI](https://github.com/OctoAlgo/inkVI/tree/7031c8259f4c8a906d06c1e3f4726d455126bfca) · [Build and test details](docs/inkvi/README.md)
+The build uses the pinned 7900XTX renderer with LinVxtory's Linux changes,
+the inkVI-derived face and hair fixes, and the tested 8 MiB GPU readback
+capture. The current preset runs the Series S profile at 1080p with ray
+tracing active. [Build, launch and source credits](docs/7900/README.md)
 
 ## Build the renderer
 
@@ -28,21 +27,25 @@ With the Rust toolchain, cached Cargo dependencies and MSVC SDK configured,
 run this from the LinVxtory checkout.
 
 ```sh
-sh build.sh "../linvxtory-renderer"
+sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a new output path when upgrading from the earlier PR995 kit. The wrapper
-fetches the pinned public inputs, applies the verified patches and builds
-one release executable. Supply your own game files at runtime.
-[Launch instructions](docs/inkvi/README.md#launch) · [Proton runtime setup](docs/linux-runtime.md)
+Use a new output path when upgrading. The wrapper fetches the pinned
+renderer, applies the Linux overlay and builds the same diagnostic
+configuration used in the replay. Supply your own game files at runtime.
+[Launch instructions](docs/7900/README.md#build-and-launch) · [Proton runtime setup](docs/linux-runtime.md)
 
 ## Gameplay status
 
-With ray tracing enabled on the RTX 5090, the Series S build reached the
-cell with visible indirect light and a median of **5.1 FPS**. The comparison
-run held ray traversal and reached **7.3 FPS**, with the wall and shelving
-nearly black. Both runs disabled the ambient substitute.
-[Ray-tracing setup, results and credits](docs/inkvi/README.md#ray-tracing-preview)
+On CachyOS with RTX 5090, the current **1080p Series S ray-traced** replay
+reached **8.89 median FPS** with GPU readback capture, up from **8.14 FPS**
+with it disabled on the same executable. The ambient substitute was off in
+both runs. The player's face, ponytail, wire window and cell lighting were
+visible. [Matched results and remaining work](docs/7900/README.md#findings)
+
+The earlier ray-tracing preview reached 5.1 FPS. Its comparison with
+traversal held reached 7.3 FPS with the wall and shelving nearly black.
+[Earlier ray-tracing test](docs/inkvi/README.md#ray-tracing-preview)
 
 In the earlier RTX 5090 Series S replay with the ambient substitute, the build reached the cell with
 individual hair strands, the ponytail, the lit wall and the window mesh.
