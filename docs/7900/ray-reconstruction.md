@@ -770,3 +770,23 @@ and the other feeds the blur used by depth of field. Both paths reach
 the FFX color. The two-current-output specialization is CPU-verified
 and has no live activation in this measured build.
 [Source and reproduction](dive-testing.md#verify-reflection-and-diffuse-probe-replacement-together)
+
+### First matched capture-free timing
+
+Both arms used the same build, RTX 5090, GE-Proton 11-14, isolated
+save and cache seeds, restored cell view and windowed 1280×720 to
+3840×2160 profile. The 55-second windows began after loading and a
+three-second warmup. Shots and input stayed outside the timed windows.
+
+| Arm | Median FPS | p95 Present interval | Accepted FPS over 55 s | Exact RR / SR / unknown |
+| --- | ---: | ---: | ---: | ---: |
+| Stock SR | 8.51 | 231.05 ms | 7.65 | 0 / 421 / 0 |
+| RR enabled with fallback | 9.30 | 136.69 ms | 8.91 | 367 / 123 / 0 |
+
+All 367 RR Presents used the optical layer and the opaque, alpha and
+probe replacements. Accepted throughput rose 16.4% in this pair.
+The arm switched between RR and SR 98 times. The most frequent logged
+fallback was an unavailable previous native camera. Lighting
+instability was observed during the opt-in run. The recorded timing
+describes this mixed configuration, including its fallbacks. Stable
+continuous RR and the visual impact of switching still require proof.
