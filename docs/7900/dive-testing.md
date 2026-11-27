@@ -121,3 +121,24 @@ trigger’s `first_present` from the title log.
 
 Mark missing evidence as missing. Timing this instrumented cut experiment
 does not measure the speed or image quality of a presented RR replacement.
+
+## First live repeat
+
+On the RTX 5090 with GE-Proton 11-14, the first command returned eight
+3840×2160 PNGs, Presents 2458–2465, in 3.974 seconds. The second command
+returned three, Presents 2636–2638, in 1.631 seconds. Both came from the
+same AOC cell session. All eleven SHA-256 hashes were independently
+checked against the files. The first burst overlapped the GPU measurement
+window beginning at Present 2457. These times include command handling,
+capture, disk writes and receipt generation. They exclude boot and do not
+measure rendering FPS. [Upstream test result](https://github.com/OctoAlgo/inkVI-dive/pull/1#issuecomment-7222712410)
+
+This run retired the in-game feature-13 creation fence at the requested
+resolutions. The revised indirect-command limit brought each targeted
+post-filter query to **32 compute invocations** in the sampled cell.
+Both shaders use 64-thread groups. The contribution of the indirect
+implementation to the remaining count still needs a target-specific
+check. The title produced GPU snapshots of the camera, HDR, depth and
+motion, but the retained material sample belonged to a different prepass
+recording. The diagnostic withheld its RR evaluation and the cell
+continued to present 4K SR.
