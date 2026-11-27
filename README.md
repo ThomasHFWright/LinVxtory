@@ -143,13 +143,13 @@ and runtime libraries.
 
 **Earlier Linux renderer work**
 
-- **tippythetaidum** developed typed half-data preservation for the facial-animation shaders, including fixed descriptor slots, table spans and ordinary format loads consumed as halves. [PR927](https://github.com/fxceless/victory-fork/pull/927) · [Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate)
+- **tippythetaidum** developed typed half-data preservation for the facial-animation shaders, including fixed descriptor slots, table spans and ordinary format loads consumed as halves. [PR927](https://github.com/fxceless/victory-fork/pull/927) · [Historical source kit](https://github.com/TomTomAIbot/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate)
 - **NuraadGit** contributed the constant-buffer size limit fix, **gomeaw** the cross-page buffer transfer fix and regressions, and **ryotdev** the initialized/root UAV test support. [PR24](https://github.com/fxceless/victory-fork/pull/24) · [PR846](https://github.com/fxceless/victory-fork/pull/846) · [PR33](https://github.com/fxceless/victory-fork/pull/33)
 - **gmankab** bounded texture staging allocations. **UwUCammie** contributed guarded buffer write-back. [PR989](https://github.com/fxceless/victory-fork/pull/989) · [PR1032](https://github.com/fxceless/victory-fork/pull/1032)
 - **AnoHunted, tedin7, TG0000, Maraco91, divyeshganta, heromike405-arch and AscilCH** contributed the audio decoder, ring-buffer and parser fixes used in the earlier Linux integration. [PR959](https://github.com/fxceless/victory-fork/pull/959) · [PR627](https://github.com/fxceless/victory-fork/pull/627)
 - **fxceless** contributed indirect-command gathering and wide-load and copyback optimizations. **cxy0072019-sketch** contributed texture-to-CPU readback and its allocation-lifetime corrections. **jtrudeau1530** reported Linux memory-range and descriptor synchronization issues that informed local fixes. [Integration notes](docs/upstream-integration.md) · [PR999](https://github.com/fxceless/victory-fork/pull/999)
 
-The earlier `linux-edge` workspace and Linux integration history are preserved in the [pre-migration tree](https://github.com/ThomasHFWright/LinVxtory/tree/6b1551effd073d5dd698eaa61d492daae69b55df) and [Linux improvements](docs/linux-improvements.md).
+The earlier `linux-edge` workspace and Linux integration history are preserved in the [pre-migration tree](https://github.com/TomTomAIbot/LinVxtory/tree/6b1551effd073d5dd698eaa61d492daae69b55df) and [Linux improvements](docs/linux-improvements.md).
 
 **Upstream acknowledgements**
 
@@ -158,7 +158,7 @@ work, **myokex** for mapped-page guards building on **Spexivus**, **joroyt** and
 **tightfall**, and **Joshua Odom** for the kernel-read fix. Its README also
 acknowledges development assistance from Claude Code. Linux integration and
 local validation in LinVictory and LinVxtory used OpenAI Codex.
-[Original credits and Windows findings](https://github.com/ThomasHFWright/LinVxtory/blob/6b1551effd073d5dd698eaa61d492daae69b55df/README.md#upstream-readme--fxcelessvictory-fork)
+[Original credits and Windows findings](https://github.com/TomTomAIbot/LinVxtory/blob/6b1551effd073d5dd698eaa61d492daae69b55df/README.md#upstream-readme--fxcelessvictory-fork)
 
 The project retains the GPL-3.0-or-later license. The build notes document
 upstream’s separate BCPack table exception. [License](LICENSE) · [Build provenance](docs/pr995-candidate/README.md#attribution-and-exact-changes)
