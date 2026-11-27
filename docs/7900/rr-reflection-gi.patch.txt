@@ -1,0 +1,773 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 18a9d72..1b66f89 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3533,7 +3533,7 @@ impl State {
+                     // SAFETY: an open list with everything set.
+                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
+                     #[cfg(feature = "diagnostics")]
+-                    present_lineage::drawn(self, list, crate::pipeline::host_pipeline(self.pipeline as This), false, None);
++                    present_lineage::drawn(self, list, crate::pipeline::host_pipeline(self.pipeline as This), present_lineage::Draw::Other("mesh"));
+                     #[cfg(feature = "diagnostics")]
+                     display_transmission::after(list, transmission);
+                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+@@ -4075,7 +4075,18 @@ impl State {
+                     .DrawInstanced(count, instances, from, first_instance)
+             };
+             #[cfg(feature = "diagnostics")]
+-            present_lineage::drawn(self, list, crate::pipeline::host_pipeline(self.pipeline as This), count == 3 && instances == 1 && from == 0 && first_instance == 0, None);
++            present_lineage::drawn(
++                self,
++                list,
++                crate::pipeline::host_pipeline(self.pipeline as This),
++                present_lineage::Draw::Direct {
++                    guest: (vertices, first),
++                    host: (count, from),
++                    instances,
++                    first_instance,
++                    expanded_rectangle: rects,
++                },
++            );
+             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+@@ -4183,7 +4194,7 @@ impl State {
+                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+             };
+             #[cfg(feature = "diagnostics")]
+-            present_lineage::drawn(self, list, crate::pipeline::host_pipeline(self.pipeline as This), false, None);
++            present_lineage::drawn(self, list, crate::pipeline::host_pipeline(self.pipeline as This), present_lineage::Draw::Indexed { indices, instances, first, base, first_instance });
+             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+@@ -4408,7 +4419,7 @@ impl State {
+                 crate::launch::record(&l6, launch.first, args.gpu(arguments), budget, crate::indirect::rest());
+                 self.mesh_scissor(list, false);
+                 #[cfg(feature = "diagnostics")]
+-                present_lineage::drawn(self, list, Some(p), false, None);
++                present_lineage::drawn(self, list, Some(p), present_lineage::Draw::Other("indirect_mesh"));
+                 self.drew(list, Some(p));
+                 DRAWN.fetch_add(1, Ordering::Relaxed);
+                 crate::launch::count(true);
+@@ -4519,12 +4530,23 @@ impl State {
+                 let use_current = self.opaque_candidate(p, kind, max);
+                 alpha_current = self.alpha_candidate(p, kind, max);
+                 #[cfg(feature = "diagnostics")]
+-                if stride == 12 && count.is_none()
+-                    && alpha_current::enabled() && self.alpha_layout(p, kind, max)
+-                    && p.current_lighting().is_some()
++                if alpha_current::enabled()
++                    && p.stages.iter().any(|stage| stage.shader.hash == opaque_current::ALPHA_TEMPORAL)
+                 {
+-                    alpha_writer = alpha_current::writer(self, list, p, kind, max, arguments);
+-                    alpha_current |= alpha_writer.is_some();
++                    let candidate = if stride != 12 || count.is_some() {
++                        Err("native alpha uses a different indirect dispatch signature or count buffer")
++                    } else if p.current_lighting().is_none() {
++                        Err("native alpha specialization PSO unavailable")
++                    } else {
++                        alpha_current::writer(self, list, p, kind, max, arguments)
++                    };
++                    match candidate {
++                        Ok(writer) => {
++                            alpha_writer = Some(writer);
++                            alpha_current = true;
++                        }
++                        Err(reason) => alpha_current::report_writer_gap(list, reason),
++                    }
+                 }
+                 if use_current || alpha_current {
+                     let applied = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+@@ -4673,7 +4695,7 @@ impl State {
+             self.buffers_written();
+         } else {
+             #[cfg(feature = "diagnostics")]
+-            present_lineage::drawn(self, list, Some(p), false, (kind == DRAW && max == 1 && count.is_none()).then_some(arguments));
++            present_lineage::drawn(self, list, Some(p), present_lineage::Draw::Indirect { kind, stride, max, arguments, count });
+             self.drew(list, Some(p));
+         }
+         // The scratch buffer stays readable as arguments: the next draw of
+@@ -4974,7 +4996,7 @@ fn readable(list: &HostList, kind: ResourceType, view: &View, _shader: Option<&c
+             #[cfg(feature = "diagnostics")]
+             crate::capture::note_target(*resource as This);
+             #[cfg(feature = "diagnostics")]
+-            present_lineage::overwritten(list, *resource as This);
++            present_lineage::overwritten(list, *resource as This, "unordered_write");
+             // Some compute-written textures are also read by the title CPU.
+             list.texture_written(*resource as This);
+             // Unordered access to a depth texture is its colour twin's.
+diff --git a/crates/victory-gpu/src/draw/alpha_current.rs b/crates/victory-gpu/src/draw/alpha_current.rs
+index 41515b8..9704236 100644
+--- a/crates/victory-gpu/src/draw/alpha_current.rs
++++ b/crates/victory-gpu/src/draw/alpha_current.rs
+@@ -17,7 +17,6 @@ pub(crate) fn enabled() -> bool {
+ pub(crate) struct Writer {
+     begun: u64,
+     cbv: u64,
+-    digest: blake3::Hash,
+     guides: [u64; 2],
+     history: [u64; 2],
+     packed: u64,
+@@ -32,10 +31,6 @@ pub(crate) struct Writer {
+ impl Writer {
+     pub(crate) fn cbv(&self) -> u64 { self.cbv }
+
+-    pub(crate) fn cbv_matches(&self, data: &[u8]) -> bool {
+-        blake3::hash(data) == self.digest
+-    }
+-
+     pub(super) fn arm(&self, mode: Arc<AtomicU32>) {
+         let _ = self.execution.set(mode);
+     }
+@@ -90,36 +85,69 @@ fn packed_reader(view: View) -> Option<[u64; 2]> {
+     (alias != packed).then_some([packed, alias])
+ }
+
++/// Width and height of the title's exact half-resolution alpha tile pass.
++pub(super) fn cbv_layout(bytes: &[u8]) -> bool {
++    bytes.len() == BYTES
++        && [0, 4].map(|at| f32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()))
++            == [640.0, 360.0]
++}
++
++#[test]
++fn current_alpha_accepts_late_native_constants_on_the_same_binding_layout() {
++    let mut cbv = [0; BYTES];
++    cbv[..4].copy_from_slice(&640f32.to_le_bytes());
++    cbv[4..8].copy_from_slice(&360f32.to_le_bytes());
++    assert!(cbv_layout(&cbv));
++    // The rest belongs to the title's deferred fill, including history and jitter.
++    cbv[8..].fill(0x52);
++    assert!(cbv_layout(&cbv));
++    assert!(!cbv_layout(&cbv[..BYTES - 4]));
++    cbv[..4].copy_from_slice(&1280f32.to_le_bytes());
++    assert!(!cbv_layout(&cbv));
++}
++
++pub(super) fn report_writer_gap(list: &HostList, reason: &'static str) {
++    if !crate::capture_control::request_only() || crate::capture::folder().is_none() {
++        return;
++    }
++    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let count = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
++    if count <= 8 || count.is_power_of_two() {
++        tracing::info!(recording_epoch = list.epoch(), begun = crate::frames_begun(), count,
++            reason, "RR experimental alpha could not record native variant");
++    }
++}
++
+ pub(super) fn writer(
+     state: &State, list: &HostList, p: &HostPipeline, kind: u32, max: u32, arguments: u64,
+-) -> Option<Arc<Writer>> {
+-    if !enabled() || !state.alpha_layout(p, kind, max) || arguments == 0 {
+-        return None;
+-    }
+-    let cbv = state.opaque_cbv()?;
+-    let at = usize::try_from(cbv).ok()?;
+-    let (mut bytes, mut confirm) = ([0; BYTES], [0; BYTES]);
+-    if !crate::host::read_into(at as *const u8, &mut bytes)
+-        || !crate::host::read_into(at as *const u8, &mut confirm) || bytes != confirm
+-    {
+-        return None;
++) -> Result<Arc<Writer>, &'static str> {
++    if !state.alpha_layout(p, kind, max) || arguments == 0 {
++        return Err("native alpha descriptor layout or dispatch arguments rejected");
+     }
++    let cbv = state.opaque_cbv().ok_or("native alpha constant buffer unavailable")?;
+     let read = |slot, at, format, size| serial(title_srv(state.opaque_view(slot, at)?)?, format, size);
+-    let packed = serial(state.reflection_texture(136, true, 42, 1280, 720)?, 42, FULL)?;
+-    let history = packed_reader(state.opaque_view(1, 72)?)?;
++    let packed = state.reflection_texture(136, true, 42, 1280, 720)
++        .and_then(|title| serial(title, 42, FULL)).ok_or("native alpha packed UAV unavailable")?;
++    let history = state.opaque_view(1, 72).and_then(packed_reader).ok_or("native alpha history packed alias unavailable")?;
+     if packed == history[0] {
+-        return None;
++        return Err("native alpha packed output overlaps history source");
+     }
+     let value = Arc::new(Writer {
+-        begun: crate::frames_begun(), cbv, digest: blake3::hash(&bytes),
+-        guides: [read(0, 752, 19, FULL)?, read(0, 528, 34, FULL)?],
++        begun: crate::frames_begun(), cbv,
++        guides: [
++            read(0, 752, 19, FULL).ok_or("native alpha depth view unavailable")?,
++            read(0, 528, 34, FULL).ok_or("native alpha motion view unavailable")?,
++        ],
+         history, packed,
+-        current: [read(1, 16, 34, HALF)?, read(1, 112, 26, HALF)?],
+-        arguments, tiles: state.opaque_buffer(0, false, 14_400)?,
++        current: [
++            read(1, 16, 34, HALF).ok_or("native alpha distance view unavailable")?,
++            read(1, 112, 26, HALF).ok_or("native alpha current color view unavailable")?,
++        ],
++        arguments, tiles: state.opaque_buffer(0, false, 14_400).ok_or("native alpha tile buffer layout unavailable")?,
+         execution: OnceLock::new(), published: AtomicBool::new(false), token: OnceLock::new(),
+     });
+     list.add_alpha_writer(value.clone());
+-    Some(value)
++    Ok(value)
+ }
+
+ pub(super) fn consumer(state: &State, list: &HostList, pipeline: &HostPipeline) {
+@@ -164,10 +192,9 @@ impl AlphaLease {
+
+     pub(crate) fn ready(&self) -> bool {
+         let writer = &self.writer;
+-        let mut bytes = [0; BYTES];
+-        !writer.published.load(Ordering::Acquire) && writer.token.get().is_none()
+-            && crate::host::read_into(writer.cbv as *const u8, &mut bytes)
+-            && writer.cbv_matches(&bytes)
++        writer.execution.get().is_some()
++            && !writer.published.load(Ordering::Acquire)
++            && writer.token.get().is_none()
+     }
+
+     pub(crate) fn commit(&self, mode: Arc<AtomicU8>, sequence: u64) -> bool {
+@@ -195,11 +222,20 @@ pub(crate) fn future(runs: &[&HostList], packet: rr_display::Packet) -> Result<A
+     }
+     let mut writers = runs[..prefix].iter().enumerate().flat_map(|(i, list)| list.alpha_writers().into_iter().map(move |writer| (i, writer)));
+     let (index, writer) = writers.next().ok_or("alpha cohort has no enrolled native writer")?;
+-    if writers.next().is_some() || writer.execution.get().is_none()
+-        || writer.published.load(Ordering::Acquire) || writer.token.get().is_some()
+-        || writer.begun != packet.begun || writer.guides != packet.serials[1..]
+-    {
+-        return Err("alpha writer is ambiguous, unready, stale, or mismatches FFX depth/motion");
++    if writers.next().is_some() {
++        return Err("multiple alpha writers in the exact future cohort");
++    }
++    if writer.execution.get().is_none() {
++        return Err("alpha writer did not record both conditional kernels");
++    }
++    if writer.published.load(Ordering::Acquire) || writer.token.get().is_some() {
++        return Err("alpha writer already published its delayed dispatch decision");
++    }
++    if writer.begun != packet.begun {
++        return Err("alpha writer and exact FFX begun stamps differ");
++    }
++    if writer.guides != packet.serials[1..] {
++        return Err("alpha writer depth and motion differ from exact FFX guides");
+     }
+     let mut consumer = None;
+     for (i, list) in runs[0..prefix].iter().enumerate() {
+@@ -219,5 +255,5 @@ pub(crate) fn future(runs: &[&HostList], packet: rr_display::Packet) -> Result<A
+     // Membership identifies the original recording. The epoch can change
+     // while the original list records barriers and finishes closing.
+     let lease = AlphaLease { writer, writer_epoch: runs[index].epoch(), consumer, alias };
+-    lease.ready().then_some(lease).ok_or("alpha writer constant bytes changed before cutoff")
++    lease.ready().then_some(lease).ok_or("alpha writer lost its private deferred binding or became published before cutoff")
+ }
+diff --git a/crates/victory-gpu/src/draw/opaque_current.rs b/crates/victory-gpu/src/draw/opaque_current.rs
+index 09445c6..ac72c0f 100644
+--- a/crates/victory-gpu/src/draw/opaque_current.rs
++++ b/crates/victory-gpu/src/draw/opaque_current.rs
+@@ -274,9 +274,11 @@ pub(super) fn defer_constants(
+         list.defer_host(move || {
+             // SAFETY: the normal deferred fill just initialized this private CBV storage.
+             let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, CBV_BYTES as usize) };
+-            let exact = witness.as_ref().is_some_and(|writer| writer.cbv_matches(bytes));
++            // The original PSO and the specialization share this native deferred
++            // fill. Only the exact known half-resolution layout is eligible.
++            let exact = witness.is_some() && super::alpha_current::cbv_layout(bytes);
+             if !exact && witness.as_ref().is_some_and(|writer| writer.cut()) {
+-                tracing::info!("RR experimental alpha kept native because its CBV changed after enrollment");
++                tracing::info!("RR experimental alpha kept native because its deferred constant layout was rejected");
+             }
+             applied.store(exact, Ordering::Release);
+         });
+diff --git a/crates/victory-gpu/src/draw/present_lineage.rs b/crates/victory-gpu/src/draw/present_lineage.rs
+index a5dacd9..caeb0da 100644
+--- a/crates/victory-gpu/src/draw/present_lineage.rs
++++ b/crates/victory-gpu/src/draw/present_lineage.rs
+@@ -21,9 +21,9 @@ fn witness_enabled() -> bool {
+     *ON.get_or_init(|| std::env::var_os("VICTORY_RR_PRESENT_LINEAGE_DIAGNOSTICS").is_some_and(|v| v == "1"))
+ }
+
+-fn witness(stage: &'static str, outcome: &'static str, serial: u64, submission: u64) {
++fn witness(stage: &'static str, outcome: &'static str, serial: u64, submission: u64) -> bool {
+     if !witness_enabled() {
+-        return;
++        return false;
+     }
+     static COUNTS: Mutex<Option<HashMap<(&'static str, &'static str), u64>>> = Mutex::new(None);
+     let mut counts = COUNTS.lock().unwrap_or_else(|e| e.into_inner());
+@@ -31,6 +31,9 @@ fn witness(stage: &'static str, outcome: &'static str, serial: u64, submission:
+     *count += 1;
+     if count.is_power_of_two() {
+         tracing::info!(stage, outcome, serial, submission, count = *count, "RR Present lineage evidence");
++        true
++    } else {
++        false
+     }
+ }
+
+@@ -81,7 +84,7 @@ impl Pass {
+ pub(crate) type Probe = Arc<Mutex<Option<(ProviderReceipt, u64)>>>;
+ pub(crate) enum Event {
+     Seed(Arc<HostTexture>, u64),
+-    UnknownWrite(Arc<HostTexture>),
++    UnknownWrite(Arc<HostTexture>, &'static str),
+     Transfer(Pass, Arc<HostTexture>, Arc<HostTexture>),
+     Present(usize, Probe),
+ }
+@@ -126,11 +129,95 @@ pub(crate) fn seed(list: &HostList, title: This, exact: &ID3D12Resource) {
+     }
+ }
+
+-pub(crate) fn overwritten(list: &HostList, title: This) {
++pub(crate) fn overwritten(list: &HostList, title: This, reason: &'static str) {
+     if enabled()
+         && let Some(copy) = target(title)
+     {
+-        list.present_lineage_event(Event::UnknownWrite(copy));
++        list.present_lineage_event(Event::UnknownWrite(copy, reason));
++    }
++}
++
++pub(crate) fn texture_copy(
++    list: &HostList,
++    title: This,
++    native: &ID3D12Resource,
++    same: bool,
++    reason: &'static str,
++) {
++    if !enabled() { return }
++    if let Some(copy) = target(title) {
++        // Copy commands suppress the texel write for a shared native texture.
++        // Preserve the tag only when upload/zero initialization cannot write
++        // either side. The tracked shapes are color textures without depth twins.
++        if same
++            && native.as_raw() == copy.texture.as_raw()
++            && !crate::texture::title_written(native)
++            && copy.tiled.is_none()
++        {
++            witness(reason, "unchanged_alias", copy.serial, 0);
++        } else {
++            list.present_lineage_event(Event::UnknownWrite(copy, reason));
++        }
++    }
++}
++
++#[derive(Debug, Clone, Copy)]
++pub(super) enum Draw {
++    Direct {
++        guest: (u32, u32),
++        host: (u32, u32),
++        instances: u32,
++        first_instance: u32,
++        expanded_rectangle: bool,
++    },
++    Indexed { indices: u32, instances: u32, first: u32, base: i32, first_instance: u32 },
++    Indirect { kind: u32, stride: u32, max: u32, arguments: u64, count: Option<u64> },
++    Other(&'static str),
++}
++
++impl Draw {
++    fn full_triangle(self, pipeline: &HostPipeline) -> bool {
++        // The two exact fullscreen vertex programs derive their outputs from
++        // per-vertex XY and constants. Neither reads InstanceId.
++        matches!(self, Self::Direct { guest: (3, 0), host: (3, 0), instances: 1, expanded_rectangle: false, .. }
++            | Self::Direct { guest: (3, 0), host: (6, 0), instances: 1, expanded_rectangle: true, .. })
++            && pipeline.inputs.iter().all(|input| !input.per_instance)
++    }
++
++    fn native_fullscreen_strip(self, state: &State, pipeline: &HostPipeline) -> bool {
++        // Three vertices in a strip issue one triangle. The live 4K tone and
++        // dither passes take the second triangle in their vertex streams.
++        const TRIANGLE_STRIP: u32 = 5;
++        if !matches!(self, Self::Direct {
++            guest: (3, 3), host: (3, 3), instances: 1, first_instance: 0,
++            expanded_rectangle: false,
++        }) || state.topology != TRIANGLE_STRIP
++            || pipeline.rects
++            || pipeline.inputs.is_empty()
++            || !pipeline.state.contains("cull 1 ")
++            || !pipeline.state.contains("mask 0xf")
++        {
++            return false;
++        }
++        pipeline.inputs.iter().all(|input| {
++            let Some(view) = state.vertex.get(input.slot as usize) else { return false };
++            let Some((bytes, _)) = crate::resource::element(input.format) else { return false };
++            let element_end = u64::from(input.offset) + bytes as u64;
++            let end = 5 * u64::from(view.stride) + element_end;
++            !input.per_instance
++                && view.address != 0
++                && element_end <= u64::from(view.stride)
++                && end <= u64::from(view.size)
++                && crate::shadow::find_any(view.address, u64::from(view.size))
++                    .is_some_and(|copy| copy.left(view.address) >= end)
++        })
++    }
++
++    fn hair_arguments(self) -> Option<u64> {
++        match self {
++            Self::Indirect { kind: 0, max: 1, arguments, count: None, .. } => Some(arguments),
++            _ => None,
++        }
+     }
+ }
+
+@@ -164,8 +251,7 @@ pub(super) fn drawn(
+     state: &State,
+     list: &HostList,
+     pipeline: Option<&HostPipeline>,
+-    full_triangle: bool,
+-    args: Option<u64>,
++    draw: Draw,
+ ) {
+     if !enabled() {
+         return;
+@@ -182,7 +268,27 @@ pub(super) fn drawn(
+                 HAIR_COPY => Some("hair_copy"),
+                 _ => None,
+             };
+-            if let Some(stage) = stage { witness(stage, outcome, serial, 0); }
++            if let Some(stage) = stage {
++                if witness(stage, outcome, serial, 0) {
++                    let arguments = match draw {
++                        Draw::Direct { guest, host, instances, first_instance, expanded_rectangle } => format!(
++                            "direct guest {guest:?} host {host:?} instances {instances} first_instance {first_instance} expanded_rectangle {expanded_rectangle}"
++                        ),
++                        Draw::Indexed { indices, instances, first, base, first_instance } => format!("indexed {indices} {instances} {first} {base} {first_instance}"),
++                        Draw::Indirect { kind, stride, max, arguments, count } => format!("indirect {kind} {stride} {max} {arguments:#x} {count:?}"),
++                        Draw::Other(name) => name.to_owned(),
++                    };
++                    let viewports: Vec<_> = state.viewports.iter().map(|v| [v.TopLeftX, v.TopLeftY, v.Width, v.Height, v.MinDepth, v.MaxDepth]).collect();
++                    let scissors: Vec<_> = state.scissors.iter().map(|v| [v.left, v.top, v.right, v.bottom]).collect();
++                    let dest_format = state.targets.first()
++                        .and_then(|title| target(*title as This))
++                        .and_then(|copy| valid_shape(&copy))
++                        .map(|format| format.0);
++                    tracing::info!(stage, outcome, serial, ?arguments, ?dest_format, ?viewports, ?scissors,
++                        topology = state.topology, depth_bound = state.depth != 0, raster = %p.state,
++                        "RR Present draw rejection details");
++                }
++            }
+         }
+         None
+     };
+@@ -207,8 +313,8 @@ pub(super) fn drawn(
+         let [scissor] = state.scissors.as_slice() else {
+             return reject("unexpected_raster_state", dest.serial);
+         };
+-        if state.depth != 0
+-            || !p.state.contains("depth false")
++        if !p.state.contains("depth false")
++            || p.state.contains("bounds true")
+             || !p.state.contains("stencil false")
+             || !p.state.contains("blend false")
+             || !(p.state.contains("mask 0x7") || p.state.contains("mask 0xf"))
+@@ -217,7 +323,10 @@ pub(super) fn drawn(
+         {
+             return reject("unexpected_raster_state", dest.serial);
+         }
+-        let (pass, slot, offset, from, to) = match (signatures, full_triangle, args) {
++        let native_strip = matches!(signatures, COMPOSITE | DITHER)
++            && [vp.MinDepth, vp.MaxDepth] == [0., 1.]
++            && draw.native_fullscreen_strip(state, p);
++        let (pass, slot, offset, from, to) = match (signatures, draw.full_triangle(p) || native_strip, draw.hair_arguments()) {
+             (COMPOSITE, true, _) => (Pass::Tone, 1, 304, HDR, TONE),
+             (DITHER, true, _) => (Pass::Dither, 1, 0, TONE, BASE),
+             (HAIR_BLUR, false, Some(args)) => (Pass::HairBlur { args }, 0, 40, HDR, HDR),
+@@ -232,13 +341,23 @@ pub(super) fn drawn(
+             witness(pass.report(), "unexpected_view_format", dest.serial, 0);
+             return None;
+         }
++        if let Draw::Direct { guest, host, first_instance, expanded_rectangle: true, .. } = draw
++            && witness(pass.report(), "qualified_expanded_rectangle", dest.serial, 0)
++        {
++            tracing::info!(stage = pass.report(), serial = dest.serial, ?guest, ?host, first_instance,
++                "RR Present rectangle expansion");
++        }
++        if native_strip && witness(pass.report(), "qualified_native_fullscreen_strip", dest.serial, 0) {
++            tracing::info!(stage = pass.report(), serial = dest.serial, inputs = ?p.inputs,
++                "RR Present native fullscreen strip inputs");
++        }
+         Some(Event::Transfer(pass, src, dest))
+     };
+     if let Some(event) = transfer() {
+         list.present_lineage_event(event);
+     } else {
+         for &title in &state.targets {
+-            overwritten(list, title as This);
++            overwritten(list, title as This, "unqualified_draw");
+         }
+     }
+ }
+@@ -366,9 +485,9 @@ pub(crate) fn submitted(
+                     },
+                 );
+             }
+-            Event::UnknownWrite(copy) => {
++            Event::UnknownWrite(copy, reason) => {
+                 if map.remove(&identity(&copy)).is_some() {
+-                    witness("submission", "tag_overwritten", copy.serial, submit);
++                    witness(reason, "tag_overwritten", copy.serial, submit);
+                 }
+             }
+             Event::Transfer(pass, src, dest) => transfer(map, pass, src, dest, submit),
+diff --git a/crates/victory-gpu/src/draw/probe_current.rs b/crates/victory-gpu/src/draw/probe_current.rs
+index 343b84a..0b5f9a8 100644
+--- a/crates/victory-gpu/src/draw/probe_current.rs
++++ b/crates/victory-gpu/src/draw/probe_current.rs
+@@ -15,6 +15,9 @@ pub(super) const DWORDS: u32 = 224;
+ pub(super) const BYTES: u32 = 544;
+ const FULL: [u32; 2] = [1280, 720];
+ const HALF: [u32; 2] = [640, 360];
++const UNBOUND: u8 = 0;
++const BOUND: u8 = 1;
++const AMBIGUOUS_BINDING: u8 = 2;
+
+ pub(crate) fn enabled() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+@@ -53,18 +56,25 @@ impl Key {
+ pub(crate) struct Request {
+     key: Key,
+     cbv: u64,
+-    digest: blake3::Hash,
++    binding: AtomicU8,
+     token: OnceLock<Arc<AtomicU8>>,
+     sealed: AtomicBool,
+     selected: AtomicBool,
+ }
+
+ impl Request {
++    fn bind(&self, source: u64) {
++        if source != self.cbv || self.binding.compare_exchange(
++            UNBOUND, BOUND, Ordering::AcqRel, Ordering::Acquire,
++        ).is_err() {
++            self.binding.store(AMBIGUOUS_BINDING, Ordering::Release);
++        }
++    }
++
+     fn ready(&self) -> bool {
+-        let mut bytes = [0; BYTES as usize];
+-        !self.sealed.load(Ordering::Acquire) && self.token.get().is_none()
+-            && crate::host::read_into(self.cbv as *const u8, &mut bytes)
+-            && blake3::hash(&bytes) == self.digest
++        self.binding.load(Ordering::Acquire) == BOUND
++            && !self.sealed.load(Ordering::Acquire)
++            && self.token.get().is_none()
+     }
+
+     pub(crate) fn selected(&self) -> bool {
+@@ -176,8 +186,7 @@ pub(super) fn candidate(
+         return None;
+     }
+     let View::Constant(cbv, BYTES) = table(state, 1, DWORDS)? else { return None; };
+-    let mut bytes = [0; BYTES as usize];
+-    if cbv == 0 || !crate::host::read_into(cbv as *const u8, &mut bytes) || !known_layout(&bytes) {
++    if cbv == 0 {
+         return None;
+     }
+     let depth = image(state, 0, 688, false, 19, FULL)?;
+@@ -224,7 +233,7 @@ pub(super) fn candidate(
+     key.separate_history().then(|| Arc::new(Request {
+         key,
+         cbv,
+-        digest: blake3::hash(&bytes),
++        binding: AtomicU8::new(UNBOUND),
+         token: OnceLock::new(),
+         sealed: AtomicBool::new(false),
+         selected: AtomicBool::new(false),
+@@ -241,6 +250,7 @@ fn known_layout(bytes: &[u8]) -> bool {
+
+ pub(super) fn defer(list: &HostList, dest: *mut u8, source: u64, request: Arc<Request>) {
+     list.defer_fill(dest, source as *const u8, BYTES as usize);
++    request.bind(source);
+     let address = dest as usize;
+     list.defer_host(move || {
+         if request.sealed.swap(true, Ordering::AcqRel) {
+@@ -249,15 +259,18 @@ pub(super) fn defer(list: &HostList, dest: *mut u8, source: u64, request: Arc<Re
+             }
+             return;
+         }
+-        let committed = request.token.get().is_some_and(|token| {
+-            token.load(Ordering::Acquire) == super::opaque_current::CUT
+-        });
++        let committed = request.binding.load(Ordering::Acquire) == BOUND
++            && request.token.get().is_some_and(|token| {
++                token.load(Ordering::Acquire) == super::opaque_current::CUT
++            });
+         if !committed {
+             return;
+         }
+         // SAFETY: the ordered fill wrote this upload range before submission.
+         let bytes = unsafe { std::slice::from_raw_parts(address as *const u8, BYTES as usize) };
+-        if known_layout(bytes) && blake3::hash(bytes) == request.digest {
++        // Both PSOs share these unchanged title bytes. The compiled branch
++        // replaces the history decision, so only its checked layout matters.
++        if known_layout(bytes) {
+             request.selected.store(true, Ordering::Release);
+         } else {
+             tracing::warn!(?request.key, "screen probe current-only retained stock after CBV revalidation");
+@@ -347,6 +360,13 @@ fn only_matching_layout_is_eligible_and_exactly_one_kernel_runs() {
+         cbv[at..at + 4].copy_from_slice(&value.to_le_bytes());
+     }
+     assert!(known_layout(&cbv));
++    let mut updated = [0; BYTES as usize];
++    updated[..8].copy_from_slice(&cbv[..8]);
++    updated[16..24].copy_from_slice(&cbv[16..24]);
++    assert_ne!(&updated[32..], &cbv[32..]);
++    assert!(known_layout(&updated));
++    updated[16..20].copy_from_slice(&2560f32.to_le_bytes());
++    assert!(!known_layout(&updated));
+     assert!(!known_layout(&cbv[..512]));
+     assert_eq!(dispatch_counts(false), [1, 0]);
+     assert_eq!(dispatch_counts(true), [0, 1]);
+@@ -375,3 +395,34 @@ fn cohort_requires_matching_history_alias_and_both_current_products() {
+     overlap.history[6] = key.outputs[7];
+     assert!(!overlap.separate_history());
+ }
++
++#[cfg(test)]
++#[test]
++fn cohort_requires_one_exact_deferred_cbv_binding() {
++    let new = || Request {
++        key: Key {
++            begun: 1,
++            epoch: 2,
++            depth: 3,
++            outputs: [4, 5, 6, 7, 8, 9, 10, 11],
++            history: [12, 13, 14, 15, 16, 17, 18],
++            reflection_history_alias: 19,
++        },
++        cbv: 0x1000,
++        binding: AtomicU8::new(UNBOUND),
++        token: OnceLock::new(),
++        sealed: AtomicBool::new(false),
++        selected: AtomicBool::new(false),
++    };
++    let exact = new();
++    assert!(!exact.ready());
++    exact.bind(0x1000);
++    assert!(exact.ready());
++    exact.bind(0x1000);
++    assert!(!exact.ready());
++
++    let different = new();
++    different.bind(0x1200);
++    different.bind(0x1000);
++    assert!(!different.ready());
++}
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index 6061cb9..acd5d5f 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -1105,7 +1105,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
+             // ahead of this list (`crate::tiles`).
+             crate::texture::card_writes(list, dst, to, None);
+             #[cfg(feature = "diagnostics")]
+-            crate::draw::present_lineage::overwritten(list, dst);
++            crate::draw::present_lineage::texture_copy(list, dst, to, same, "resource_copy");
+             crate::texture::host_written(dst);
+             if same {
+                 SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+@@ -1310,7 +1310,7 @@ extern "system" fn copy_texture_region(
+         // a copy into a level without memory is dropped.
+         crate::texture::card_writes(list, dst.resource, to, Some(dst.footprint.offset as u32));
+         #[cfg(feature = "diagnostics")]
+-        crate::draw::present_lineage::overwritten(list, dst.resource);
++        crate::draw::present_lineage::texture_copy(list, dst.resource, to, same, "texture_region_copy");
+         crate::texture::host_written(dst.resource);
+         if same {
+             SELF_COPIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+@@ -1473,7 +1473,7 @@ extern "system" fn resolve(
+         ensure_state(list, dst, RESOLVE_DEST);
+         ensure_state(list, src, RESOLVE_SOURCE);
+         #[cfg(feature = "diagnostics")]
+-        crate::draw::present_lineage::overwritten(list, dst);
++        crate::draw::present_lineage::overwritten(list, dst, "resolve");
+         crate::texture::host_written(dst);
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
+@@ -1560,7 +1560,7 @@ extern "system" fn clear_rtv(
+             #[cfg(feature = "diagnostics")]
+             crate::dof::invalidate(list);
+             #[cfg(feature = "diagnostics")]
+-            crate::draw::present_lineage::overwritten(list, record.resource);
++            crate::draw::present_lineage::overwritten(list, record.resource, "target_clear");
+             list.list.ClearRenderTargetView(rtv, color, rects);
+         }
+     }
+diff --git a/crates/victory-gpu/src/list/thin.rs b/crates/victory-gpu/src/list/thin.rs
+index 0abd670..52ce8a8 100644
+--- a/crates/victory-gpu/src/list/thin.rs
++++ b/crates/victory-gpu/src/list/thin.rs
+@@ -307,7 +307,9 @@ impl Recording {
+                 inner.closed = true;
+                 let kept = std::mem::take(&mut inner.kept);
+                 #[cfg(feature = "diagnostics")]
+-                if let Some(owner) = self.rr_ffx_owner() {
++                if let Some(owner) = self.rr_ffx_owner()
++                    && !crate::rr_perf::capture_free_scoring()
++                {
+                     // SAFETY: the translation just closed the suffix and still owns this list.
+                     let exact_closed = unsafe { super::closed_rr_packet(back) }
+                         .is_some_and(|closed| owner.owns(closed.packet, &closed.request));
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+index cc2b4cd..2ab37ef 100644
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -900,7 +900,7 @@ pub(crate) struct ClosedFuture {
+
+ #[cfg(feature = "diagnostics")]
+ fn report_cohort_gap(packet: crate::draw::rr_display::Packet, lists: usize, reason: &'static str) {
+-    if !crate::rr_perf::quality_capture() {
++    if !crate::capture_control::request_only() || crate::capture::folder().is_none() {
+         return;
+     }
+     static REASONS: std::sync::Mutex<Option<std::collections::HashMap<&'static str, u64>>> =
+diff --git a/crates/victory-gpu/src/rr_perf.rs b/crates/victory-gpu/src/rr_perf.rs
+index 3b3a632..53da7c3 100644
+--- a/crates/victory-gpu/src/rr_perf.rs
++++ b/crates/victory-gpu/src/rr_perf.rs
+@@ -143,6 +143,16 @@ pub(crate) fn quality_capture() -> bool {
+         && crate::capture::folder().is_some()
+ }
+
++fn scored_without_captures(start: Instant, at: Instant, capture_enabled: bool) -> bool {
++    !capture_enabled && contains(start + WARMUP, at)
++}
++
++pub(crate) fn capture_free_scoring() -> bool {
++    START.get().is_some_and(|&start| {
++        scored_without_captures(start, Instant::now(), crate::capture::folder().is_some())
++    })
++}
++
+ pub(crate) fn active() -> bool {
+     configured()
+         && START
+@@ -256,6 +266,19 @@ mod tests {
+         assert!(!contains(start, start + LENGTH));
+     }
+
++    #[test]
++    fn skips_forensics_only_during_capture_free_scoring() {
++        let start = Instant::now();
++        let first = start + WARMUP;
++        let end = first + LENGTH;
++        let tick = Duration::from_millis(1);
++        assert!(!scored_without_captures(start, first - tick, false));
++        assert!(scored_without_captures(start, first, false));
++        assert!(scored_without_captures(start, end - tick, false));
++        assert!(!scored_without_captures(start, end, false));
++        assert!(!scored_without_captures(start, first, true));
++    }
++
+     #[test]
+     fn counts_successes_without_guessing_and_clears_failed_buckets() {
+         let mut state = State::new();
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 243b50b..df66477 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -289,7 +289,7 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+         return true;
+     }
+     #[cfg(feature = "diagnostics")]
+-    crate::draw::present_lineage::overwritten(list, placed);
++    crate::draw::present_lineage::overwritten(list, placed, "alias_copy");
+     card_writes(list, placed, to, None);
+     crate::list::ensure_state(list, placed, COPY_DEST);
+     let part = |texture: &ID3D12Resource, index: usize| D3D12_TEXTURE_COPY_LOCATION {

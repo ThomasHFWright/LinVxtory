@@ -724,3 +724,35 @@ and the title presented stock SR. Both original opaque post-filters
 ran during recovery, and their exact packed history became reusable.
 GI was stock for this test. The fixed-count replay used GPU queries
 and capture, so the timing comparison needs separate matched runs.
+
+### Presented RR with reflection and diffuse-probe replacement
+
+The stationary replay with all three current-frame packers enabled
+confirmed four consecutive accepted 4K RR Presents. Each used the
+original glass input and one feature-13 evaluation with zero SR
+evaluations in those slots.
+
+| Present | Opaque and GI GPU fence | Alpha GPU fence | RR fence | Present fence |
+| ---: | ---: | ---: | ---: | ---: |
+| 1867 | 10005 | 10009 | 10010 | 10012 |
+| 1868 | 10022 | 10026 | 10027 | 10029 |
+| 1869 | 10039 | 10043 | 10044 | 10046 |
+| 1870 | 10056 | 10060 | 10061 | 10063 |
+
+All five original shader bodies had zero workgroups in each fenced
+frame. The counters read 32 for each original opaque temporal,
+bilateral, history-update, alpha temporal and diffuse-probe
+temporal/caustic shader, the pinned indirect-clear cost. The current
+opaque packer recorded 89,376–92,704 invocations, current alpha
+327,200–328,480, and current probe 921,632. These packers retain the
+data consumed by the title's lighting. Stock SR presented at 1871.
+The two original opaque history backings again became reusable after
+their native writers retired.
+
+The dedicated native transmission chain still produces the intended
+refraction. Its result travels in RR's optical layer. Other required
+native rendering includes visibility and probe integration, motion
+and material data, depth of field, and final compositing. The scene
+temporal input used by heat haze and DOF is a separate working area.
+The bounded replay verifies hardware routing and execution.
+[Source and reproduction](dive-testing.md#verify-reflection-and-diffuse-probe-replacement-together)

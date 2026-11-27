@@ -320,3 +320,47 @@ Match the chosen submission, output serial and fence to its retirement.
 Check exact DXGI attribution separately before assigning a provider to a
 captured frame. Keep the PNGs and title logs local.
 [Combined hardware results](ray-reconstruction.md#optical-input-and-opaque-bypass-on-the-same-frames)
+
+## Verify reflection and diffuse-probe replacement together
+
+From tree `775e0c7` above, add the [alpha and GI overlay](rr-reflection-gi.patch.txt).
+This includes the exact native Present tracking used in the hardware test.
+
+```sh
+test "$(git write-tree)" = 775e0c7d5be42de4df8d63944f0f062cb9e9bf24
+git apply --index "$kit/rr-reflection-gi.patch.txt"
+test "$(git write-tree)" = 8cabc54072e7ff76e4487e33021b3f778c878bd7
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+export VICTORY_RR_EXPERIMENTAL_ALPHA_KERNEL=1 VICTORY_RR_PROBE_CURRENT=1
+```
+
+Use the optical + opaque settings above and add the two switches. For
+the bounded dispatch proof, unset `VICTORY_RR_PERF_TRIGGER` and restore
+the five-Present stage trigger. Set `VICTORY_RR_DISPLAY_FRAME=1`,
+`VICTORY_RR_BACKGROUND_FRAME=1`, `VICTORY_RR_MATERIAL_FRAME=1`,
+`VICTORY_RR_REFLECTION_CAPTURE_FRAME=1`, `VICTORY_RR_ORDER_FRAME=1`,
+`VICTORY_PASS_STATS_FRAME=1` and `VICTORY_PASS_GPU_TIME=1`. Arm in the
+playable cell and capture around the trigger as above.
+
+Join the exact source and alpha list epochs to retired shader queries
+and the FFX fence. In addition to the opaque counters, verify original
+and current variants for alpha temporal (`34992f2b65a789a5`) and probe
+temporal/caustics (`34fb51b8a0312e82`). The calibrated raw count of 32
+means only the indirect clear ran. Require positive replacement work
+and `paired_alpha_selected=true` and `paired_probe_selected=true` at
+the chosen slot. Match the HDR output to accepted DXGI Present lineage
+with `is_rr`, `early_cut`, `optical`, `paired_alpha` and `paired_probe`
+all true.
+
+For timing, run the **same binary** in two fresh isolated sessions with
+the same stationary camera, seed and window size. Enable
+`VICTORY_RR_PRESENT_LINEAGE=1` and use a fresh
+`VICTORY_RR_PERF_TRIGGER` for each process. Clear the five-Present
+trigger, the per-pass query and lineage diagnostic switches, and all
+capture paths. Keep opt-in replacement switches off in the SR arm.
+Arm each process only after the same playable view is verified and
+collect the next 55 seconds after the three-second warmup. Report
+median FPS, p95 Present interval, and RR, SR, unknown and replacement
+route counts. A mixed window measures the enabled configuration
+including its fallback costs. Report it as mixed.
