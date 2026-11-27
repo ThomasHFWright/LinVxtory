@@ -41,11 +41,14 @@ from the source checkout.
 
 ## Ray Reconstruction research
 
-The research branch presented two consecutive 4K game frames with DLSS
-Ray Reconstruction and then fell back to Super Resolution when a guide
-was missing. Native denoisers ran during that test. Preserving the
-window’s wavy refraction and measuring performance with redundant filters
-disabled remain open.
+The research branch runs DLSS Ray Reconstruction in game at 720p → 4K.
+One RR evaluation reconstructs and upscales the scene. Verified RR
+frames bypass five original filter passes while retaining the game’s
+wavy glass. Stock Super Resolution is the default and handles frames
+that miss the early replacement cutoff.
+
+Build the opt-in renderer from the research branch with
+`sh build.sh --rr ../linvxtory-rr`.
 [Research branch notes](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/ray-reconstruction.md) ·
 [Reproduce a 4K cell test with inkVI-dive](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/dive-testing.md)
 

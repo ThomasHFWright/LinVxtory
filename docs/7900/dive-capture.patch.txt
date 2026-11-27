@@ -1,0 +1,404 @@
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index 7e2e39b17eb044839afc9f6042b104c7e5ba46eb..0c5341664edb80804125441aceefdcdf5179f61b 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -47,7 +47,7 @@ pub(crate) fn listed(n: u64) -> bool {
+     });
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let after = n.wrapping_sub(first);
+-    named || first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
++    named || world_on() && first != u64::MAX && ([2, 6, 30, 80].contains(&after) || also.contains(&after))
+ }
+
+ /// With a capture folder, for the frames [`listed`]: `what` is added to
+@@ -123,18 +123,35 @@ fn world_on() -> bool {
+ /// The first frame that ran 500 draws or more (`VICTORY_CAPTURE_WORLD`).
+ static WORLD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
++/// Draw-count world marker, independent of scene identity.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn world_frame() -> Option<u64> {
++    let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
++    (first != u64::MAX).then_some(first)
++}
++
+ /// At the present of `frame`: the draws run on the host so far.
+ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
+     static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+     let before = LAST.swap(drawn, Relaxed);
+-    if world_on()
++    #[cfg(feature = "diagnostics")]
++    let tracks_world = world_on() || crate::capture_control::tracks_world();
++    #[cfg(not(feature = "diagnostics"))]
++    let tracks_world = world_on();
++    if tracks_world
+         && drawn.saturating_sub(before) >= 500
+         && WORLD.compare_exchange(u64::MAX, frame, Relaxed, Relaxed).is_ok()
+     {
+-        tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
+         #[cfg(feature = "diagnostics")]
+-        if let Some(folder) = folder() {
++        crate::capture_control::world_started();
++        if world_on() {
++            tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
++        } else {
++            tracing::info!(frame, "capture world marker: first frame of 500 draws or more");
++        }
++        #[cfg(feature = "diagnostics")]
++        if world_on() && let Some(folder) = folder() {
+             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
+             let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
+ "));
+@@ -144,6 +161,11 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+
+ /// Whether frame `n` is saved.
+ pub(crate) fn wanted(n: u64) -> bool {
++    #[cfg(feature = "diagnostics")]
++    if crate::capture_control::request_only() {
++        return folder().is_some()
++            && (crate::capture_control::requested(n) || crate::capture_control::in_seconds(n));
++    }
+     // Before the world, with `VICTORY_CAPTURE_WORLD`: every 16th frame too
+     // (small pictures of menus, loading screens and title cards).
+     let before_world = world_on() && n.is_multiple_of(16) && WORLD.load(std::sync::atomic::Ordering::Relaxed) == u64::MAX;
+@@ -152,25 +174,51 @@ pub(crate) fn wanted(n: u64) -> bool {
+     // run, so single frames cannot be compared between runs).
+     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
+     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
+-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
++    #[cfg(feature = "diagnostics")]
++    let extra = || crate::capture_control::requested(n) || crate::capture_control::in_seconds(n);
++    #[cfg(not(feature = "diagnostics"))]
++    let extra = || false;
++    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || extra())
+ }
+
+ /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.
+ pub(crate) fn save(n: u64, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
+-    save_as(&format!("frame-{n}"), width, height, pitch, bgra, rows);
++    let name = format!("frame-{n}");
++    // Native-size and raw-row options from OctoAlgo, inkVI-dive (GPL-3.0).
++    #[cfg(feature = "diagnostics")]
++    if let Some(folder) = folder() {
++        static RAW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *RAW.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_RAW").is_some_and(|v| v == "1")) {
++            let kind = if bgra { "bgra" } else { "rgba" };
++            let path = folder.join(format!("{name}-{width}x{height}-{kind}-p{pitch}.raw"));
++            if let Some(data) = pitch.checked_mul(height as usize).and_then(|len| rows.get(..len)) {
++                save_image(&path, data);
++            }
++            return;
++        }
++    }
++    #[cfg(feature = "diagnostics")]
++    let step = {
++        static FULL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if *FULL.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_FULL").is_some_and(|v| v == "1")) { 1 } else { 2 }
++    };
++    #[cfg(not(feature = "diagnostics"))]
++    let step = 2;
++    save_as(&name, width, height, pitch, bgra, rows, step);
+ }
+
+-/// Saves 8-bit RGBA or BGRA rows as `<name>.png`, at half size.
+-fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8]) {
++/// Saves 8-bit RGBA or BGRA rows as `<name>.png` with the given pixel stride.
++fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows: &[u8], step: u32) {
+     let Some(folder) = folder() else { return };
+-    let (w, h) = ((width / 2).max(1), (height / 2).max(1));
+-    // Filter byte 0 per row, then RGB of every other pixel of every other row.
++    let (w, h) = ((width / step).max(1), (height / step).max(1));
++    let step = step as usize;
++    // Filter byte 0 per row, followed by the RGB channels.
+     let mut raw = Vec::with_capacity((w as usize * 3 + 1) * h as usize);
+     for y in 0..h as usize {
+         raw.push(0);
+-        let row = &rows[(2 * y).min(height as usize - 1) * pitch..];
++        let row = &rows[(step * y).min(height as usize - 1) * pitch..];
+         for x in 0..w as usize {
+-            let p = &row[(2 * x).min(width as usize - 1) * 4..][..3];
++            let p = &row[(step * x).min(width as usize - 1) * 4..][..3];
+             if bgra {
+                 raw.extend([p[2], p[1], p[0]]);
+             } else {
+@@ -180,7 +228,11 @@ fn save_as(name: &str, width: u32, height: u32, pitch: usize, bgra: bool, rows:
+     }
+     let png = encode(w, h, &raw);
+     let path = folder.join(format!("{name}.png"));
+-    match std::fs::write(&path, png) {
++    save_image(&path, &png);
++}
++
++fn save_image(path: &std::path::Path, bytes: &[u8]) {
++    match std::fs::write(path, bytes) {
+         Ok(()) => tracing::info!(path = %path.display(), "frame saved"),
+         Err(e) => tracing::warn!(error = %e, path = %path.display(), "frame not saved"),
+     }
+@@ -267,6 +319,12 @@ fn read_back_of(
+             Some(&mut total),
+         );
+     }
++    // DX12 can omit row padding from the end of its minimal footprint.
++    // Keep the whole final row addressable for native padded-row capture.
++    let last_row_padded = u64::from(footprint.Footprint.RowPitch)
++        .checked_mul(u64::from(footprint.Footprint.Height))?
++        .checked_add(footprint.Offset)?;
++    total = total.max(last_row_padded);
+     let heap = D3D12_HEAP_PROPERTIES {
+         Type: D3D12_HEAP_TYPE_READBACK,
+         ..Default::default()
+@@ -336,10 +394,13 @@ pub(crate) fn save_read_back(
+     // SAFETY: the copy finished (every submission is waited for); the
+     // mapping spans the footprint's rows.
+     unsafe {
+-        if buffer.Map(0, None, Some(&mut data)).is_err() {
++        let Some(len) = (f.RowPitch as usize).checked_mul(f.Height as usize) else { return };
++        if f.Width == 0 || f.Height == 0 || u64::from(f.Width) * 4 > u64::from(f.RowPitch)
++            || footprint.Offset != 0 || (len as u64) > buffer.GetDesc().Width
++            || buffer.Map(0, None, Some(&mut data)).is_err() || data.is_null()
++        {
+             return;
+         }
+-        let len = f.RowPitch as usize * f.Height as usize;
+         let rows = std::slice::from_raw_parts(data.cast::<u8>(), len);
+         save(frame, f.Width, f.Height, f.RowPitch as usize, bgra, rows);
+         buffer.Unmap(0, None);
+@@ -467,7 +528,7 @@ fn dump_one(
+                 "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
+                 d.Width, d.Height, d.Format.0
+             );
+-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
++            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba, 2);
+         } else {
+             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
+         }
+diff --git a/crates/victory-gpu/src/capture_control.rs b/crates/victory-gpu/src/capture_control.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..a6a57316a42e337547b0c4502752e71e452adc82
+--- /dev/null
++++ b/crates/victory-gpu/src/capture_control.rs
+@@ -0,0 +1,170 @@
++//! Renderer-only capture commands, adapted from OctoAlgo's inkVI-dive
++//! (479a9c20ed5bc4843bdf8c6ad1a199f939f991cb, GPL-3.0).
++
++use std::collections::VecDeque;
++use std::io::{Read, Result};
++use std::ops::RangeInclusive;
++use std::path::{Path, PathBuf};
++use std::sync::{Mutex, OnceLock};
++use std::time::Instant;
++
++const MAX_REQUEST: u64 = 8;
++const MAX_TIMED: u64 = 32;
++static REQUESTS: Mutex<VecDeque<RangeInclusive<u64>>> = Mutex::new(VecDeque::new());
++
++fn control() -> Option<&'static Path> {
++    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
++    FOLDER
++        .get_or_init(|| std::env::var_os("VICTORY_CAPTURE_CONTROL").map(PathBuf::from))
++        .as_deref()
++}
++
++pub(crate) fn request_only() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_CAPTURE_REQUEST_ONLY").is_some_and(|v| v == "1"))
++}
++
++pub(crate) fn tracks_world() -> bool {
++    control().is_some() || window().is_some()
++}
++
++fn count(command: &str) -> Option<u64> {
++    let mut words = command.split_whitespace();
++    if words.next()? != "cap" {
++        return None;
++    }
++    let n = words.next().map_or(Some(1), |s| s.parse().ok())?;
++    ((1..=MAX_REQUEST).contains(&n) && words.next().is_none()).then_some(n)
++}
++
++fn range(present: u64, count: u64) -> Option<RangeInclusive<u64>> {
++    Some(present.checked_add(1)?..=present.checked_add(count)?)
++}
++
++fn read_command(path: &Path) -> Result<String> {
++    let mut command = String::new();
++    std::fs::File::open(path)?
++        .take(64)
++        .read_to_string(&mut command)?;
++    if command.len() == 64 {
++        command.clear();
++    }
++    Ok(command)
++}
++
++pub(crate) fn present(frame: u64, world: Option<u64>, enabled: bool) {
++    let Some(folder) = control() else { return };
++    let pending = folder.join("cmd");
++    let claimed = folder.join("cmd.processing");
++    if std::fs::rename(pending, &claimed).is_err() {
++        return;
++    }
++    let mut requests = REQUESTS.lock().unwrap_or_else(|error| error.into_inner());
++    // Retain recent requests for asynchronously submitted Presents. One request
++    // at a time keeps synchronous 4K readbacks bounded.
++    let command = read_command(&claimed).unwrap_or_default();
++    let capture_count = count(&command);
++    let reply = match capture_count {
++        None => "error: expected cap or cap N, where N is 1..8".to_owned(),
++        Some(_) if !enabled => "error: cap needs VICTORY_CAPTURE".to_owned(),
++        Some(_) if requests.back().is_some_and(|active| frame < *active.end()) => {
++            "error: a capture request is still active".to_owned()
++        }
++        Some(n) => match range(frame, n) {
++            Some(frames) => {
++                if requests.len() == 8 {
++                    requests.pop_front();
++                }
++                let reply = format!(
++                    "cap: presents {}..{} are saved",
++                    frames.start(),
++                    frames.end()
++                );
++                requests.push_back(frames);
++                reply
++            }
++            None => "error: capture frame range overflowed".to_owned(),
++        },
++    };
++    drop(requests);
++    tracing::info!(frame, "capture control: {reply}");
++    let world_offset = world
++        .and_then(|first| frame.checked_sub(first))
++        .map_or_else(|| "-".to_owned(), |n| n.to_string());
++    let stamp = format!("present {frame} world {world_offset}");
++    let description = capture_count.map_or_else(
++        || "invalid capture request".to_owned(),
++        |count| format!("cap {count}"),
++    );
++    let world = world.map_or_else(|| "unknown".to_owned(), |n| n.to_string());
++    let report = format!(
++        "[{stamp}] > {description}\n{reply}\nobserved_present={frame}\nworld_frame={world}\n"
++    );
++    let published = std::fs::write(folder.join("reply.txt"), report)
++        .and_then(|()| std::fs::write(folder.join("done"), format!("{stamp}\n")));
++    if let Err(error) = published {
++        tracing::warn!(%error, "capture control reply could not be written");
++    }
++    let _ = std::fs::remove_file(claimed);
++}
++
++pub(crate) fn requested(frame: u64) -> bool {
++    control().is_some()
++        && REQUESTS
++            .lock()
++            .unwrap_or_else(|error| error.into_inner())
++            .iter()
++            .any(|range| range.contains(&frame))
++}
++
++static WORLD_AT: OnceLock<Instant> = OnceLock::new();
++
++pub(crate) fn world_started() {
++    let _ = WORLD_AT.set(Instant::now());
++}
++
++fn seconds_window(value: &str) -> Option<(f64, f64)> {
++    let (a, b) = value.split_once('-')?;
++    let a = a.trim().parse::<f64>().ok()?;
++    let b = b.trim().parse::<f64>().ok()?;
++    (a >= 0.0 && b <= 3600.0 && a < b && b - a <= 30.0).then_some((a, b))
++}
++
++fn window() -> Option<(f64, f64)> {
++    static WINDOW: OnceLock<Option<(f64, f64)>> = OnceLock::new();
++    *WINDOW.get_or_init(|| seconds_window(&std::env::var("VICTORY_CAPTURE_SECS").ok()?))
++}
++
++pub(crate) fn in_seconds(frame: u64) -> bool {
++    let Some((from, to)) = window() else {
++        return false;
++    };
++    let Some(start) = WORLD_AT.get() else {
++        return false;
++    };
++    // This is queried in host Present order. Check wall time once per frame
++    // and count selected frames independently of the stock sampling cadence.
++    static STATE: Mutex<(u64, bool, u64)> = Mutex::new((0, false, 0));
++    let mut state = STATE.lock().unwrap_or_else(|error| error.into_inner());
++    if frame > state.0 {
++        let select = state.2 < MAX_TIMED && (from..=to).contains(&start.elapsed().as_secs_f64());
++        *state = (frame, select, state.2 + u64::from(select));
++    }
++    frame == state.0 && state.1
++}
++
++#[cfg(test)]
++#[test]
++fn parser_and_windows_are_bounded() {
++    assert_eq!(count("cap\n"), Some(1));
++    assert_eq!(count("cap 8\r\n"), Some(8));
++    for command in ["cap 0", "cap 9", "cap -2", "cap 2\ncap 1", "pos", "@w4 cap"] {
++        assert_eq!(count(command), None);
++    }
++    assert_eq!(range(21, 3), Some(22..=24));
++    assert_eq!(range(u64::MAX, 1), None);
++    assert_eq!(seconds_window(" 0.4 - 1.25 "), Some((0.4, 1.25)));
++    for window in ["1-0", "0-NaN", "0-inf", "0-30.1", "-1-1", "4000-4010"] {
++        assert_eq!(seconds_window(window), None);
++    }
++}
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..5064e8688a526a5ac057e5608cd06940964dab70 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -10215,7 +10215,9 @@ impl Host {
+             // read back at once (a saved or listed frame): then a list of
+             // its own, one whose last flight has finished or a new one.
+             #[cfg(feature = "diagnostics")]
+-            let read_now = crate::capture::wanted(frame) || crate::capture::listed(frame);
++            let capture_wanted = crate::capture::wanted(frame);
++            #[cfg(feature = "diagnostics")]
++            let read_now = capture_wanted || crate::capture::listed(frame);
+             #[cfg(not(feature = "diagnostics"))]
+             let read_now = false;
+             let slot = if late_free_present() && !read_now {
+@@ -10308,7 +10310,7 @@ impl Host {
+                 list.CopyResource(&back, texture);
+             }
+             #[cfg(feature = "diagnostics")]
+-            let capture = crate::capture::wanted(frame)
++            let capture = capture_wanted
+                 .then(|| {
+                     if composed {
+                         list.ResourceBarrier(&[transition(
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index df03e719b155445730e2ae3584cabe9fc3659db8..c61fe713fb9176dce8dbd0dee5315b1c78cbd5f3 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -25,6 +25,8 @@ mod texlate;
+ mod texstore;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod capture;
++#[cfg(all(windows, feature = "diagnostics"))]
++mod capture_control;
+ #[cfg(windows)]
+ mod compose;
+ pub mod console;
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 940afda7fb89b240cdc6bf924422d7ffd3fb2c31..325882c0a5836ac71382cd13639daec777d48e69 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -975,6 +975,11 @@ extern "system" fn present(
+     #[cfg(all(windows, feature = "diagnostics"))]
+     {
+         crate::capture::frame_drew(frame, crate::draw::drawn());
++        crate::capture_control::present(
++            frame,
++            crate::capture::world_frame(),
++            crate::capture::folder().is_some(),
++        );
+         if crate::capture::listed(frame) {
+             before_sync();
+             crate::capture::dump_targets(frame);
