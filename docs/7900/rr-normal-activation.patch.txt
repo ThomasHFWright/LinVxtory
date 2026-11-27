@@ -1,0 +1,628 @@
+diff --git a/crates/victory-gpu/src/dof.rs b/crates/victory-gpu/src/dof.rs
+index 9ae7809..6b6f5d5 100644
+--- a/crates/victory-gpu/src/dof.rs
++++ b/crates/victory-gpu/src/dof.rs
+@@ -30,7 +30,7 @@ void main(uint3 id : SV_DispatchThreadID) {
+ pub(crate) fn enabled() -> bool {
+     static ON: OnceLock<bool> = OnceLock::new();
+     *ON.get_or_init(|| std::env::var_os("VICTORY_DOF_GUIDE").is_some_and(|v| v == "1"))
+-        && (!crate::rr_perf::configured() || crate::draw::rr_display::selected())
++        && (!crate::draw::rr_display::live_sources() || crate::draw::rr_display::selected())
+ }
+ 
+ pub(crate) struct Before {
+diff --git a/crates/victory-gpu/src/draw/alpha_current.rs b/crates/victory-gpu/src/draw/alpha_current.rs
+index 9704236..57fd244 100644
+--- a/crates/victory-gpu/src/draw/alpha_current.rs
++++ b/crates/victory-gpu/src/draw/alpha_current.rs
+@@ -202,9 +202,11 @@ impl AlphaLease {
+         if writer.published.load(Ordering::Acquire) || writer.token.set(mode).is_err() {
+             return false;
+         }
+-        tracing::info!(sequence, begun = writer.begun, alpha_epoch = self.writer_epoch, consumer_epoch = self.consumer,
+-            history = ?writer.history, packed = writer.packed, alias = self.alias, current = ?writer.current,
+-            arguments = writer.arguments, tiles = writer.tiles, "RR enrolled exact closed experimental alpha kernel");
++        if !rr_display::quiet() {
++            tracing::info!(sequence, begun = writer.begun, alpha_epoch = self.writer_epoch, consumer_epoch = self.consumer,
++                history = ?writer.history, packed = writer.packed, alias = self.alias, current = ?writer.current,
++                arguments = writer.arguments, tiles = writer.tiles, "RR enrolled exact closed experimental alpha kernel");
++        }
+         true
+     }
+ }
+diff --git a/crates/victory-gpu/src/draw/background_snapshot.rs b/crates/victory-gpu/src/draw/background_snapshot.rs
+index 5715c68..5c72f2e 100644
+--- a/crates/victory-gpu/src/draw/background_snapshot.rs
++++ b/crates/victory-gpu/src/draw/background_snapshot.rs
+@@ -32,14 +32,14 @@ fn frame() -> Option<u64> {
+     })
+ }
+ 
+-fn native_performance() -> bool {
++fn native_live() -> bool {
+     super::display_transmission::enabled()
+         && super::rr_display::enabled()
+-        && crate::rr_perf::configured()
++        && super::rr_display::live_sources()
+ }
+ 
+ fn recording(list: &HostList) -> bool {
+-    let selected = if native_performance() {
++    let selected = if native_live() {
+         super::rr_display::selected()
+     } else {
+         let present = crate::queue::presented() + 1;
+@@ -425,7 +425,7 @@ pub(crate) fn peek_producer_epochs(
+ pub(crate) fn submitted(runs: &[&HostList], submission: u64) -> Option<RrBackgroundSnapshot> {
+     // The native path already scoped recording to the active RR window.
+     // Queue lag must not invalidate its exact closed producer/FFX submission.
+-    let requested = if native_performance() { None } else { Some(frame()?) };
++    let requested = if native_live() { None } else { Some(frame()?) };
+     let mut events = Vec::new();
+     let mut marks = Vec::new();
+     let mut repeat = false;
+@@ -531,7 +531,9 @@ pub(crate) fn retire(snapshot: RrBackgroundSnapshot) {
+     if !snapshot.submitted_once() {
+         return;
+     }
+-    tracing::info!(?snapshot.key, ?snapshot.producer_epochs, camera = snapshot.camera.is_some(), material = ?snapshot.material, "RR background snapshots fence-retired");
++    if !super::rr_display::quiet() {
++        tracing::info!(?snapshot.key, ?snapshot.producer_epochs, camera = snapshot.camera.is_some(), material = ?snapshot.material, "RR background snapshots fence-retired");
++    }
+     *RETIRED.lock().unwrap_or_else(|error| error.into_inner()) = Some(snapshot);
+ }
+ 
+diff --git a/crates/victory-gpu/src/draw/material_guides.rs b/crates/victory-gpu/src/draw/material_guides.rs
+index 6f00e18..845852c 100644
+--- a/crates/victory-gpu/src/draw/material_guides.rs
++++ b/crates/victory-gpu/src/draw/material_guides.rs
+@@ -497,11 +497,11 @@ pub(super) fn after(
+             .parse()
+             .ok()
+     });
+-    let bench = crate::rr_perf::configured();
+-    let sample = !bench && requested.is_some() && crate::rr_window::selected(frame, requested) && crate::capture::folder().is_some();
++    let live_sources = super::rr_display::live_sources();
++    let sample = !live_sources && requested.is_some() && crate::rr_window::selected(frame, requested) && crate::capture::folder().is_some();
+     let live = *LIVE
+         .get_or_init(|| std::env::var_os("VICTORY_RR_MATERIAL_GUIDES").is_some_and(|v| v == "1"));
+-    if !(sample || (live && !bench) || reflection.is_some()) || !p.compute {
++    if !(sample || (live && !live_sources) || reflection.is_some()) || !p.compute {
+         return;
+     }
+     let begun = reflection.as_ref().map_or_else(crate::frames_begun, |v| v.begun);
+@@ -600,7 +600,7 @@ pub(super) fn after(
+             completions: AtomicU32::new(0),
+         }));
+     }
+-    if !bench {
++    if !crate::rr_perf::configured() && !super::rr_display::quiet() {
+         tracing::info!(
+             frame,
+             begun,
+diff --git a/crates/victory-gpu/src/draw/opaque_current.rs b/crates/victory-gpu/src/draw/opaque_current.rs
+index ac72c0f..59ac171 100644
+--- a/crates/victory-gpu/src/draw/opaque_current.rs
++++ b/crates/victory-gpu/src/draw/opaque_current.rs
+@@ -694,12 +694,14 @@ pub(crate) fn choose_before_deferred(
+         };
+         if dirty.fallback(pair, sequence) {
+             record.mode.store(RESET_NATIVE, Ordering::Release);
+-            tracing::info!(
+-                sequence,
+-                history = pair.history,
+-                packed = pair.packed,
+-                "RR opaque native history reset with full filters"
+-            );
++            if !rr_display::quiet() {
++                tracing::info!(
++                    sequence,
++                    history = pair.history,
++                    packed = pair.packed,
++                    "RR opaque native history reset with full filters"
++                );
++            }
+         }
+         let cut = dirty.writer_cut(pair, sequence);
+         if record.query.is_some() {
+@@ -728,8 +730,10 @@ pub(crate) fn choose_before_deferred(
+     }
+     let probe = if super::probe_current::enabled() {
+         let Some(probe) = super::probe_current::lease(runs, opaque_index, future.packet.begun, pair) else {
+-            tracing::info!(sequence, begun = future.packet.begun,
+-                "RR early choice kept native because the exact probe lease was unavailable");
++            if !rr_display::quiet() {
++                tracing::info!(sequence, begun = future.packet.begun,
++                    "RR early choice kept native because the exact probe lease was unavailable");
++            }
+             return;
+         };
+         Some(probe)
+@@ -747,27 +751,33 @@ pub(crate) fn choose_before_deferred(
+     ) {
+         Ok(prepared) => prepared,
+         Err(reason) => {
+-            tracing::info!(
+-                sequence,
+-                begun = future.packet.begun,
+-                reason,
+-                "RR early choice kept native"
+-            );
++            if !rr_display::quiet() {
++                tracing::info!(
++                    sequence,
++                    begun = future.packet.begun,
++                    reason,
++                    "RR early choice kept native"
++                );
++            }
+             return;
+         }
+     };
+     if super::alpha_current::enabled()
+         && !future.alpha.as_ref().is_some_and(|alpha| alpha.ready() && alpha.commit(mode.clone(), sequence))
+     {
+-        tracing::info!(sequence, begun = future.packet.begun,
+-            "RR early choice kept native because the exact alpha lease was unavailable");
++        if !rr_display::quiet() {
++            tracing::info!(sequence, begun = future.packet.begun,
++                "RR early choice kept native because the exact alpha lease was unavailable");
++        }
+         return;
+     }
+     if let Some(probe) = &probe
+         && !super::probe_current::enroll(probe, mode.clone(), sequence)
+     {
+-        tracing::info!(sequence, begun = future.packet.begun,
+-            "RR early choice kept native because the exact probe lease could not be enrolled");
++        if !rr_display::quiet() {
++            tracing::info!(sequence, begun = future.packet.begun,
++                "RR early choice kept native because the exact probe lease could not be enrolled");
++        }
+         return;
+     }
+     prepared.set_alpha(future.alpha);
+@@ -775,14 +785,16 @@ pub(crate) fn choose_before_deferred(
+     if future.request.adopt(prepared) {
+         dirty.cut(free, pair, sequence);
+         mode.store(CUT, Ordering::Release);
+-        tracing::info!(
+-            sequence,
+-            begun = future.packet.begun,
+-            slot_epoch = future.packet.slot_epoch,
+-            history = pair.history,
+-            packed = pair.packed,
+-            "RR adopted closed future slot before opaque cutoff"
+-        );
++        if !rr_display::quiet() {
++            tracing::info!(
++                sequence,
++                begun = future.packet.begun,
++                slot_epoch = future.packet.slot_epoch,
++                history = pair.history,
++                packed = pair.packed,
++                "RR adopted closed future slot before opaque cutoff"
++            );
++        }
+     }
+ }
+ 
+diff --git a/crates/victory-gpu/src/draw/probe_current.rs b/crates/victory-gpu/src/draw/probe_current.rs
+index 08556d4..4b3e372 100644
+--- a/crates/victory-gpu/src/draw/probe_current.rs
++++ b/crates/victory-gpu/src/draw/probe_current.rs
+@@ -117,7 +117,9 @@ pub(crate) fn enroll(request: &Request, mode: Arc<AtomicU8>, sequence: u64) -> b
+     if !request.ready() || request.token.set(mode).is_err() {
+         return false;
+     }
+-    tracing::info!(sequence, key = ?request.key, "RR enrolled exact native probe history writer");
++    if !super::rr_display::quiet() {
++        tracing::info!(sequence, key = ?request.key, "RR enrolled exact native probe history writer");
++    }
+     true
+ }
+ 
+@@ -325,7 +327,7 @@ impl DispatchPair {
+             // still owns this aligned range and the GPU has not used it.
+             unsafe { (counts as *mut [u32; 2]).write(dispatch_counts(selected)) };
+             current.store(selected, Ordering::Release);
+-            if selected {
++            if selected && !super::rr_display::quiet() {
+                 if retain_diffuse_history() {
+                     tracing::info!(?request.key, "screen probe diffuse and caustic history kernel selected");
+                 } else {
+diff --git a/crates/victory-gpu/src/draw/reflection_capture.rs b/crates/victory-gpu/src/draw/reflection_capture.rs
+index c7d05e2..73f98c9 100644
+--- a/crates/victory-gpu/src/draw/reflection_capture.rs
++++ b/crates/victory-gpu/src/draw/reflection_capture.rs
+@@ -354,8 +354,8 @@ pub(crate) enum Event {
+ 
+ pub(super) fn before(state: &State, list: &HostList, pipeline: &HostPipeline) -> Option<Pending> {
+     let present = crate::queue::presented() + 1;
+-    let selected = if crate::rr_perf::configured() {
+-        super::rr_display::enabled() && crate::rr_perf::active()
++    let selected = if super::rr_display::live_sources() {
++        super::rr_display::selected()
+     } else {
+         let requested = requested_frame()?;
+         let fixed = (crate::frames_begun().abs_diff(requested) <= 1).then_some(present);
+@@ -536,8 +536,8 @@ impl Readback {
+ 
+ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Option<Readback> {
+     let frame = crate::queue::presented() + 1;
+-    if crate::rr_perf::configured() {
+-        if !super::rr_display::enabled() || !crate::rr_perf::active() {
++    if super::rr_display::live_sources() {
++        if !super::rr_display::selected() {
+             return None;
+         }
+     } else if !super::rr_display::enabled()
+@@ -567,9 +567,11 @@ pub(crate) fn stage_early(host: &Host, runs: &[&HostList], sequence: u64, packet
+         return None;
+     }
+     let planned = record_source(host, runs, sequence, crate::queue::presented() + 1, Some(packet))?;
+-    tracing::info!(sequence, begun = packet.begun, prefix_epoch = packet.prefix_epoch,
+-        slot_epoch = packet.slot_epoch, output_serial = packet.output_serial,
+-        "RR exact source staged before deferred closures");
++    if !super::rr_display::quiet() {
++        tracing::info!(sequence, begun = packet.begun, prefix_epoch = packet.prefix_epoch,
++            slot_epoch = packet.slot_epoch, output_serial = packet.output_serial,
++            "RR exact source staged before deferred closures");
++    }
+     Some(planned)
+ }
+ 
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index e1788f1..9463723 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -115,12 +115,14 @@ impl NativeVelocityCandidate {
+         let source = SOURCE.lock().unwrap_or_else(|error| error.into_inner());
+         let source = source.as_ref().filter(|source| source.signaled && source.submission < sequence)?;
+         let camera = self.for_source(source, packet)?;
+-        tracing::info!(
+-            begun = packet.begun, prefix_epoch = packet.prefix_epoch, slot_epoch = packet.slot_epoch,
+-            source_submit = source.submission, submit = sequence,
+-            depth = packet.serials[1], motion = packet.serials[2],
+-            "RR native velocity matched the signaled opaque source"
+-        );
++        if !super::rr_display::quiet() {
++            tracing::info!(
++                begun = packet.begun, prefix_epoch = packet.prefix_epoch, slot_epoch = packet.slot_epoch,
++                source_submit = source.submission, submit = sequence,
++                depth = packet.serials[1], motion = packet.serials[2],
++                "RR native velocity matched the signaled opaque source"
++            );
++        }
+         Some(early_camera(camera, sequence))
+     }
+ }
+@@ -132,7 +134,9 @@ pub(crate) fn publish_native_camera(camera: &Camera, begun: u64, epoch: u64, seq
+     let mut accepted = ACCEPTED.lock().unwrap_or_else(|error| error.into_inner());
+     if accepted.as_ref().is_none_or(|(prior, submit)| prior.begun < begun && *submit < sequence) {
+         *accepted = Some((camera.clone(), sequence));
+-        tracing::info!(begun, epoch, sequence, "RR confirmed native velocity camera at FidelityFX signal");
++        if !super::rr_display::quiet() {
++            tracing::info!(begun, epoch, sequence, "RR confirmed native velocity camera at FidelityFX signal");
++        }
+     }
+ }
+ 
+@@ -161,12 +165,14 @@ impl Source {
+     }
+ 
+     pub(crate) fn witness_cut(&self, before_deferred: u64) {
+-        tracing::info!(
+-            submit = self.submission, begun = self.primary.begun, prepass_epoch = self.primary.epoch,
+-            occurrence = self.material.key.occurrence, depth = self.depth_serial,
+-            motion = self.primary.motion_serial, before_deferred,
+-            "RR order exact opaque source reached cut boundary"
+-        );
++        if !super::rr_display::quiet() {
++            tracing::info!(
++                submit = self.submission, begun = self.primary.begun, prepass_epoch = self.primary.epoch,
++                occurrence = self.material.key.occurrence, depth = self.depth_serial,
++                motion = self.primary.motion_serial, before_deferred,
++                "RR order exact opaque source reached cut boundary"
++            );
++        }
+     }
+ }
+ 
+diff --git a/crates/victory-gpu/src/draw/rr_display.rs b/crates/victory-gpu/src/draw/rr_display.rs
+index 10a76cc..b7c923d 100644
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -1,4 +1,4 @@
+-//! Experimental on-queue RR replacement for one checked native FFX slot.
++//! On-queue RR replacement for one checked native FFX slot.
+ 
+ use super::{HostList, background_snapshot, display_transmission, reflection_dense, rr_shadow};
+ use crate::{
+@@ -7,7 +7,10 @@ use crate::{
+     object::This,
+     reflection_motion,
+ };
+-use std::sync::{Arc, Mutex, OnceLock};
++use std::sync::{
++    Arc, Mutex, OnceLock,
++    atomic::{AtomicBool, Ordering},
++};
+ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
+ use windows::core::Interface;
+ 
+@@ -60,10 +63,26 @@ impl Drop for RrDisplayRecording {
+     }
+ }
+ 
+-#[derive(Clone, Copy)]
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+ enum RequestWindow {
+     Diagnostic(u64),
+     Performance,
++    Continuous,
++}
++
++fn choose_window(
++    performance: bool,
++    diagnostic: Option<u64>,
++    auto: bool,
++    explicit_window: bool,
++) -> Option<RequestWindow> {
++    if performance {
++        Some(RequestWindow::Performance)
++    } else if let Some(frame) = diagnostic {
++        Some(RequestWindow::Diagnostic(frame))
++    } else {
++        (auto && !explicit_window).then_some(RequestWindow::Continuous)
++    }
+ }
+ 
+ fn window() -> Option<RequestWindow> {
+@@ -87,14 +106,28 @@ fn window() -> Option<RequestWindow> {
+             );
+             return None;
+         }
+-        if crate::rr_perf::configured() {
+-            return Some(RequestWindow::Performance);
++        let performance = crate::rr_perf::configured();
++        let diagnostic = std::env::var("VICTORY_RR_DISPLAY_FRAME")
++            .ok().and_then(|frame| frame.parse().ok());
++        let explicit_window = [
++            "VICTORY_RR_PERF_TRIGGER",
++            "VICTORY_RR_STAGE_TRIGGER",
++            "VICTORY_RR_DISPLAY_FRAME",
++        ].into_iter().any(|name| std::env::var_os(name).is_some());
++        let auto = enabled("VICTORY_RR_AUTO");
++        let required = [
++            "VICTORY_RR_EARLY_SOURCE",
++            "VICTORY_RR_ATOMIC_CUT",
++            "VICTORY_FFX_SR_SECTION",
++            "VICTORY_RR_NATIVE_TRANSMISSION_DISPLAY",
++            "VICTORY_RR_REFLECTION_DENSE",
++            "VICTORY_DOF_GUIDE",
++        ];
++        let ready = !auto || required.into_iter().all(enabled);
++        if auto && !explicit_window && !ready {
++            tracing::warn!("Continuous RR requires the atomic fallback, native transmission and reflection/DOF guide setup");
+         }
+-        std::env::var("VICTORY_RR_DISPLAY_FRAME")
+-            .ok()?
+-            .parse()
+-            .ok()
+-            .map(RequestWindow::Diagnostic)
++        choose_window(performance, diagnostic, auto && ready, explicit_window)
+     })
+ }
+ 
+@@ -102,16 +135,50 @@ pub(crate) fn enabled() -> bool {
+     window().is_some()
+ }
+ 
++pub(crate) fn continuous() -> bool {
++    matches!(window(), Some(RequestWindow::Continuous))
++}
++
++/// Bounded performance and continuous display both record guide sources for
++/// the selected slot, instead of using the one-off diagnostic frame selectors.
++pub(crate) fn live_sources() -> bool {
++    crate::rr_perf::configured() || continuous()
++}
++
++pub(crate) fn quiet() -> bool {
++    static EXPLICIT: OnceLock<bool> = OnceLock::new();
++    continuous() && !*EXPLICIT.get_or_init(|| {
++        std::env::var_os("VICTORY_RR_PRESENT_LINEAGE_DIAGNOSTICS").is_some_and(|v| v == "1")
++    })
++}
++
++static BACKEND_READY: AtomicBool = AtomicBool::new(false);
++
++pub(crate) fn set_backend_ready(ready: bool) {
++    BACKEND_READY.store(ready, Ordering::Release);
++}
++
+ pub(crate) fn selected() -> bool {
+     match window() {
+         Some(RequestWindow::Diagnostic(frame)) => {
+             crate::rr_window::selected(crate::queue::presented() + 1, Some(frame))
+         }
+         Some(RequestWindow::Performance) => crate::rr_perf::active(),
++        Some(RequestWindow::Continuous) => BACKEND_READY.load(Ordering::Acquire),
+         None => false,
+     }
+ }
+ 
++#[cfg(test)]
++#[test]
++fn continuous_window_respects_explicit_diagnostics() {
++    assert_eq!(choose_window(false, None, true, false), Some(RequestWindow::Continuous));
++    assert_eq!(choose_window(false, None, false, false), None);
++    assert_eq!(choose_window(false, None, true, true), None);
++    assert_eq!(choose_window(false, Some(35), true, true), Some(RequestWindow::Diagnostic(35)));
++    assert_eq!(choose_window(true, Some(35), true, true), Some(RequestWindow::Performance));
++}
++
+ #[derive(Clone)]
+ pub(crate) struct Request {
+     present: u64,
+@@ -282,12 +349,12 @@ pub(crate) fn capture(
+             projection: projection.map(f32::to_bits),
+             prepared: Arc::default(),
+         });
+-        if !crate::rr_perf::configured() || crate::rr_perf::quality_capture() {
++        if !quiet() && (!crate::rr_perf::configured() || crate::rr_perf::quality_capture()) {
+             tracing::info!(present, begun, epoch, ?serials, "RR display slot armed");
+         }
+         Ok::<_, &'static str>(())
+     };
+-    if let Err(reason) = prepare() {
++    if let Err(reason) = prepare() && !quiet() {
+         tracing::warn!(
+             begun,
+             epoch,
+@@ -341,7 +408,7 @@ impl Chosen {
+         }
+         *HISTORY.lock().unwrap_or_else(|error| error.into_inner()) =
+             Some((self.stream, self.current, self.cut, self.optical));
+-        if !crate::rr_perf::configured() || crate::rr_perf::quality_capture() {
++        if !quiet() && (!crate::rr_perf::configured() || crate::rr_perf::quality_capture()) {
+             tracing::info!(
+                 present = self.present,
+                 begun = self.current.begun,
+@@ -365,7 +432,7 @@ impl Chosen {
+     }
+ 
+     pub(crate) fn retired(self) {
+-        if self.fence != 0 && (!crate::rr_perf::configured() || crate::rr_perf::quality_capture()) {
++        if self.fence != 0 && !quiet() && (!crate::rr_perf::configured() || crate::rr_perf::quality_capture()) {
+             tracing::info!(
+                 present = self.present,
+                 begun = self.current.begun,
+@@ -624,13 +691,15 @@ pub(crate) fn select(
+     match try_record() {
+         Ok(chosen) => Some((index, chosen)),
+         Err(reason) => {
+-            tracing::warn!(
+-                begun = request.begun,
+-                submit = sequence,
+-                reason,
+-                provider = "SR",
+-                "RR display left stock FFX active"
+-            );
++            if !quiet() {
++                tracing::warn!(
++                    begun = request.begun,
++                    submit = sequence,
++                    reason,
++                    provider = "SR",
++                    "RR display left stock FFX active"
++                );
++            }
+             None
+         }
+     }
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 9775533..d5d290c 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -43,6 +43,16 @@ pub fn rr_display_selected() -> bool {
+     crate::draw::rr_display::selected()
+ }
+ 
++#[cfg(feature = "diagnostics")]
++pub fn set_rr_display_backend_ready(ready: bool) {
++    crate::draw::rr_display::set_backend_ready(ready);
++}
++
++#[cfg(feature = "diagnostics")]
++pub fn rr_display_quiet() -> bool {
++    crate::draw::rr_display::quiet()
++}
++
+ /// The host D3D12 device, created on first use; `None` without a host GPU.
+ pub fn host_device() -> Option<ID3D12Device> {
+     crate::host::host().map(|h| h.device.clone())
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+index ed5b809..449b0d5 100644
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -1075,8 +1075,10 @@ pub(crate) fn closed_future(
+         }
+     }
+     drop(state);
+-    tracing::info!(queue, begun, source_submit, entries, pending, exact_pending, owner_rejected,
+-        barriers, closed, exact = selected.is_some(), duplicate, bounded, "RR future FFX at opaque cutoff");
++    if !crate::draw::rr_display::quiet() {
++        tracing::info!(queue, begun, source_submit, entries, pending, exact_pending, owner_rejected,
++            barriers, closed, exact = selected.is_some(), duplicate, bounded, "RR future FFX at opaque cutoff");
++    }
+     if duplicate || bounded {
+         return None;
+     }
+@@ -1090,7 +1092,7 @@ pub(crate) fn closed_future(
+         return None;
+     }
+     crate::host::rr_order::future_closed(queue, future.packet);
+-    if future.optical.is_some() {
++    if future.optical.is_some() && !crate::draw::rr_display::quiet() {
+         tracing::info!(queue, begun, source_submit, alpha = future.alpha.is_some(),
+             "RR early native transmission cohort held");
+     }
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index 59c3356..c0280dc 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -522,7 +522,7 @@ fn record(
+         history.invalidate();
+     }
+     #[cfg(feature = "diagnostics")]
+-    let log_camera = !external::rr_perf_configured();
++    let log_camera = !external::rr_perf_configured() && !external::rr_display_quiet();
+     #[cfg(not(feature = "diagnostics"))]
+     let log_camera = true;
+     if camera.is_some() && log_camera {
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+index aee05b7..51efbff 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+@@ -204,11 +204,14 @@ pub(super) fn record_display(
+     };
+     // SAFETY: the native slot proves its producer order, snapshot states,
+     // exact stock output UAV and fencing on the title direct queue.
+-    unsafe { record_on_stream(&DISPLAY_PROVIDER, commands, &guides, &frame, None) }
+-        .map_err(|error| match error {
+-            Error::Invalid(reason) | Error::RecordingFailed(reason) => reason,
+-            Error::Unavailable => "NGX feature 13 unavailable",
+-        })?;
++    let result = unsafe { record_on_stream(&DISPLAY_PROVIDER, commands, &guides, &frame, None) };
++    if result.is_err() && DISPLAY_PROVIDER.lock().unwrap_or_else(|error| error.into_inner()).failed {
++        external::set_rr_display_backend_ready(false);
++    }
++    result.map_err(|error| match error {
++        Error::Invalid(reason) | Error::RecordingFailed(reason) => reason,
++        Error::Unavailable => "NGX feature 13 unavailable",
++    })?;
+     Ok(receipt)
+ }
+ 
+@@ -481,7 +484,8 @@ pub(super) fn prepare_title(device: &ID3D12Device) {
+     if !std::env::var_os("VICTORY_RR_PREPARE").is_some_and(|v| v == "1") {
+         return;
+     }
+-    let provider = if external::rr_display_enabled() {
++    let display = external::rr_display_enabled();
++    let provider = if display {
+         &DISPLAY_PROVIDER
+     } else if shadow_enabled() {
+         &SHADOW_PROVIDER
+@@ -497,6 +501,9 @@ pub(super) fn prepare_title(device: &ID3D12Device) {
+         Ok((ngx, completed)) => {
+             provider.ngx = Some(ngx);
+             provider.depth_encoding = Some(depth);
++            if display {
++                external::set_rr_display_backend_ready(true);
++            }
+             tracing::info!(
+                 feature = FEATURE_RAY_RECONSTRUCTION,
+                 render = ?INPUT,

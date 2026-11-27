@@ -2,18 +2,19 @@
 # Reconstruct the pinned renderer and build the tested Linux configuration.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-rr=0
+rr=1
 control=0
 while [ "$#" -gt 1 ]; do
     case "$1" in
         --rr) rr=1 ;;
+        --sr) rr=0 ;;
         --control) control=1 ;;
         *) break ;;
     esac
     shift
 done
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-    echo 'Usage: sh build.sh [--rr] [--control] /path/to/renderer-source' >&2
+    echo 'Usage: sh build.sh [--rr | --sr] [--control] /path/to/renderer-source' >&2
     exit 1
 fi
 
@@ -96,6 +97,9 @@ if [ "$control" -eq 0 ]; then
             apply_locked_patch "$sr_tree" "$patch"
         fi
     done < "$kit/perf-build-trees.txt"
+    if [ "$rr" -eq 1 ]; then
+        apply_locked_patch 182c2119e9e17ed516e3855045f3151b445c4d70 rr-normal-activation.patch.txt
+    fi
 fi
 if [ "$tree" != "$expected" ]; then
     echo 'Renderer changes differ from the selected source tree.' >&2
