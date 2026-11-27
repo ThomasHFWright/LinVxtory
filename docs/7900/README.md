@@ -97,6 +97,30 @@ A 50 MiB transfer to VRAM took about 0.98 ms. These results favor VRAM for
 repeated dense shader reads. Sparse read and direct-write experiments
 remain separate from the default memory path.
 
+## Earlier ray-traced measurements
+
+The highest observed median in the same +240 to +295 second cell window
+was **9.36 FPS** (106.84 ms, 473 title Present intervals) in one warm
+control on renderer `ba3bb41`. It used Series S 1080p, the RTX 5090,
+53 ray-tracing builder pipelines, and the ambient substitute off. The
+window, lit cell, facial profile and ponytail were visible. That control
+had compare joining disabled. Enabling compare joining on the same
+executable measured 8.95 FPS in the other arm. We keep it disabled.
+
+Increasing the outstanding command-list limit from 256 to 512 removed
+a median **77.35 ms/frame** in waits at that limit in an earlier mesh-on
+comparison, with median FPS going **7.75 to 8.95**. A separate cap
+comparison reduced limit waits from 36.7 ms/frame to zero while median
+FPS stayed similar at 8.87 and 8.73. These comparisons used different
+renderer configurations. The current preset also uses 512.
+
+The latest three-frame diagnostic trace matched 86 submission fences.
+Across 57 sampled compare lists, the median was 45 µs and the sum was
+3.18 ms. A single sampled game command list took 24.15 ms.
+Some timestamps missed the reporting deadline. This trace points the
+next investigation toward work inside game command lists. The short
+sample covers only the lists it timed.
+
 ## Source and credits
 
 [avatarmanz and the 7900XTX contributors](https://github.com/avatarmanz/VIctory-7900XTX)

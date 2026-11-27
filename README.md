@@ -7,6 +7,31 @@ Our Linux work began on Slaktarn700’s Proton fork and continued in LinVictory,
 where we integrated compatibility fixes and tested them on Linux hardware.
 [VIctory](https://github.com/Marvisak/VIctory) · [fxceless/victory-fork](https://github.com/fxceless/victory-fork) · [Slaktarn700/VIctory](https://github.com/Slaktarn700/VIctory)
 
+## Current status
+
+**8.89 median FPS on `main`** in the warm offline Series S cell replay on
+CachyOS and RTX 5090. The preset uses **1080p with ray tracing active** and
+the ambient substitute off. Facial skin, the ponytail, the wire window and
+room lighting were visible in both arms. The **20 FPS** target remains open.
+[Current replay and build](docs/7900/README.md#findings)
+
+**9.36 median FPS** is the highest comparable result, from one earlier warm
+ray-traced control using the same timed cell window. The published preset
+uses the capture improvement that held up in two matched comparisons.
+[Best recorded run and comparison details](docs/7900/README.md#earlier-ray-traced-measurements)
+
+### Biggest measured improvements
+
+- **GPU readback capture.** The current build started at 8.14 FPS with
+  capture off. Four 8 MiB slots reduced copyback from **19.35 to 16.70 ms
+  per frame** and fetch wait from **10.30 to 8.80 ms**. [Capture results](docs/7900/README.md#findings)
+- **More outstanding command lists.** Increasing the limit from 256 to
+  512 brought median limit waits to zero in two comparisons. The
+  earlier mesh-on run improved from **7.75 to 8.95 FPS**. [Queue limit results](docs/7900/README.md#earlier-ray-traced-measurements)
+- **CPU/GPU write merging.** A larger exact merge budget reduced waits
+  on overlapping writes from **13 to 6 ms per frame** in the earlier
+  ray-tracing preview. [Memory synchronization test](docs/inkvi/README.md#memory-synchronization-test)
+
 ## Our focus
 
 Get normal world rendering and controllable gameplay working under Wine/Proton.
@@ -35,51 +60,54 @@ renderer, applies the Linux overlay and builds the same diagnostic
 configuration used in the replay. Supply your own game files at runtime.
 [Launch instructions](docs/7900/README.md#build-and-launch) · [Proton runtime setup](docs/linux-runtime.md)
 
-## Gameplay status
+## Results history
 
-On CachyOS with RTX 5090, the current **1080p Series S ray-traced** replay
-reached **8.89 median FPS** with GPU readback capture, up from **8.14 FPS**
-with it disabled on the same executable. The ambient substitute was off in
-both runs. The player's face, ponytail, wire window and cell lighting were
-visible. [Matched results and remaining work](docs/7900/README.md#findings)
+- **Earlier ray-tracing preview.** The cell reached 5.1 FPS. Its comparison with traversal
+  held reached 7.3 FPS with the wall and shelving nearly black. [Earlier ray-tracing
+  test](docs/inkvi/README.md#ray-tracing-preview)
 
-The earlier ray-tracing preview reached 5.1 FPS. Its comparison with
-traversal held reached 7.3 FPS with the wall and shelving nearly black.
-[Earlier ray-tracing test](docs/inkvi/README.md#ray-tracing-preview)
+- **inkVI Series S with the ambient substitute.** On RTX 5090, the build reached the cell
+  with individual hair strands, the ponytail, the lit wall and the window mesh. Facial skin
+  rendered in the early close-up. One NPC temporarily had a black skin texture while
+  streaming. Cell samples averaged **9.03 FPS** with a median of **9.8 FPS**. [Source and
+  test notes](docs/inkvi/README.md#rtx-5090-observations)
 
-In the earlier RTX 5090 Series S replay with the ambient substitute, the build reached the cell with
-individual hair strands, the ponytail, the lit wall and the window mesh.
-Facial skin rendered in the early close-up. One NPC temporarily had a black
-skin texture while streaming. Cell samples averaged **9.03 FPS** with a
-median of **9.8 FPS**. [Source and test notes](docs/inkvi/README.md#rtx-5090-observations)
+- **Earlier Series S checkpoint.** The previous Series S renderer reached **7.11 FPS** in
+  the cell in a fixed checkpoint replay. [Previous Series S
+  benchmark](docs/pr995-candidate/validation.md#series-s-checkpoint-benchmark)
 
-The previous Series S renderer reached **7.11 FPS** in the cell in a
-fixed checkpoint replay. [Previous Series S benchmark](docs/pr995-candidate/validation.md#series-s-checkpoint-benchmark)
+- **Linux descriptor slot caching.** On RTX 5090, two cold room replays with this preset
+  delivered **3.89 and 4.07 FPS** against **3.57 FPS** with caching off on the same
+  executable. The wall, window mesh and yard posts were visible in the sampled frames.
+  [Repeated cache measurements](docs/pr995-candidate/validation.md#descriptor-slot-cache)
 
-The previous Linux preset enabled descriptor slot caching. On our RTX 5090, two cold
-room replays with this preset delivered **3.89 and 4.07 FPS** against **3.57 FPS**
-with caching off on the same executable. The wall, window mesh and yard posts
-were visible in the sampled frames. [Repeated cache measurements](docs/pr995-candidate/validation.md#descriptor-slot-cache)
+- **Series X endurance.** On CachyOS with an RTX 5090, the earlier Series X build ran for 30
+  minutes and stopped at the scheduled limit. With descriptor slot caching off, it averaged
+  **4.24 FPS** over the last 25.9 measured minutes. In the fixed world +180 to +330 second
+  interval, it delivered **3.57 FPS**, versus **3.15 FPS** for `f0ca006` in one replay per
+  build. The player turned the camera later in the long run. The frontal view still showed
+  exposed eyes and teeth with missing facial skin. [Endurance
+  results](docs/pr995-candidate/validation.md#performance-build-on-the-rtx-5090)
 
-On CachyOS with an RTX 5090, the earlier Series X build ran for 30 minutes and
-stopped at the scheduled limit. With descriptor slot caching off, it averaged **4.24 FPS** over the last
-25.9 measured minutes. In the fixed world +180 to +330 second interval,
-it delivered **3.57 FPS**, versus **3.15 FPS** for `f0ca006` in one replay
-per build. The player turned the camera later in the long run. The frontal
-view still showed exposed eyes and teeth with missing facial skin.
-[Endurance results](docs/pr995-candidate/validation.md#performance-build-on-the-rtx-5090)
+- **First texture recovery.** The `f0ca006` build reached the cell on our RTX 5090. In one
+  cold, windowed comparison it delivered 3.15 FPS against 3.11 FPS for the previous build
+  over world seconds +180 to +330. It was slower earlier in loading. The first-read fix
+  recovered real texture uploads. The character’s cheek still has a gap before lighting. The
+  two camera angles differed, so hair quality could not be compared directly. [Checkpoint
+  results](docs/pr995-candidate/validation.md#texture-recovery-build-on-the-rtx-5090)
 
-The `f0ca006` build reached the cell on our RTX 5090. In one cold, windowed
-comparison it delivered 3.15 FPS against 3.11 FPS for the previous build over
-world seconds +180 to +330. It was slower earlier in loading. The first-read
-fix recovered real texture uploads. The character’s cheek still has a gap before lighting. The two camera
-angles differed, so hair quality could not be compared directly. [Checkpoint results](docs/pr995-candidate/validation.md#texture-recovery-build-on-the-rtx-5090)
+- **Controller and dialogue on checkpoint 91b6968.** On CachyOS and GE-Proton 11-14 with an
+  RTX 5090, a player used an Xbox Wireless Controller to turn the camera in both directions,
+  walk through the cell, and start a conversation with an NPC. The player saw mouth movement
+  during the conversation. This run used four automated Enter presses during startup. All
+  camera movement and interaction in the room came from the controller. Hair and facial skin
+  still have rendering defects.
 
-The following controller observations are from the published `91b6968` checkpoint.
-
-On CachyOS and GE-Proton 11-14 with an RTX 5090, a player used an Xbox Wireless Controller to turn the camera in both directions, walk through the cell, and start a conversation with an NPC. The player saw mouth movement during the conversation. This run used four automated Enter presses during startup. All camera movement and interaction in the room came from the controller. Hair and facial skin still have rendering defects.
-
-The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the world +180 to +330 second window. The earlier 30-minute PR995 run averaged 4.87 FPS with a different camera and workload. These results do not establish a change in gameplay FPS. The repeatable gains were faster CPU texture detiling and reuse of the pipeline library on a second launch. [Measurements and hardware tests](docs/pr995-candidate/validation.md)
+  The interactive run delivered 453 presents in 144.70 seconds (3.13 FPS) in the world +180
+  to +330 second window. The earlier 30-minute PR995 run averaged 4.87 FPS with a different
+  camera and workload. These results do not establish a change in gameplay FPS. The
+  repeatable gains were faster CPU texture detiling and reuse of the pipeline library on a
+  second launch. [Measurements and hardware tests](docs/pr995-candidate/validation.md)
 
 ## Attribution
 
