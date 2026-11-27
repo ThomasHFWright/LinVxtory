@@ -4,19 +4,19 @@ LinVxtory develops VIctory for **NVIDIA GPUs on Linux through Wine and
 Proton**. It provides a source-locked renderer build, runtime setup and
 repeatable gameplay checks.
 
-## Default 4K preset
+## Candidate default 4K preset
 
-LinVxtory uses **NVIDIA DLSS Ray Reconstruction** by default. The Series S
-preset renders at **1280×720** and presents at **3840×2160** in Ultra
-Performance mode. Ray tracing is active, and the renderer composites
-the title’s UI at presentation.
+The Series S preset requests **NVIDIA DLSS Ray Reconstruction** from
+startup, with **1280×720** input and **3840×2160** output in Ultra
+Performance mode. Ray tracing and the game’s native global illumination
+(GI) run, and the renderer composites the title’s UI at presentation.
 
-For eligible frames, Ray Reconstruction replaces five native filter
-passes and preserves the game’s original wavy glass. If the required
-frame data is unavailable at the filter cutoff, that frame uses
-Super Resolution with the native filters. The stationary cell and
-camera-turn replays verified this behavior on an RTX 5090.
-[Image and fallback evidence](docs/7900/ray-reconstruction.md#stock-fallback-at-the-native-cutoff)
+On eligible frames, RR replaces four native reflection filter passes
+and preserves the game’s original wavy glass. Frames that miss the
+filter cutoff use stock Super Resolution with the native filters. The
+first intro upscales in the hardware replay still used this fallback.
+[Native lighting and glass verification](docs/7900/ray-reconstruction.md#native-gi-with-original-glass) ·
+[Startup investigation](docs/7900/ray-reconstruction.md#continuous-startup-investigation)
 
 ## Build and run
 
@@ -40,7 +40,7 @@ dedicated SR build use `sh build.sh --sr ../linvxtory-sr`, or add
 `--control` to reproduce the exact historical SR source. The explicit
 `--rr` build option still selects the default renderer.
 [Toolchain and launch guide](docs/7900/README.md#build-and-launch) ·
-[4K measurements](docs/7900/ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard) ·
+[Historical hybrid-GI measurements](docs/7900/ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard) ·
 [Diagnostic capture guide](docs/7900/dive-testing.md) ·
 [Asset policy](docs/asset-policy.md)
 

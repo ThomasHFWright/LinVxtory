@@ -6,19 +6,21 @@ Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 585 title Present intervals in the cell at +240 to +295 s. See the
 [control build and results](README.md#historical-4k-super-resolution-control).
 
-The default 4K preset uses one NGX Ray Reconstruction evaluation on
-each qualifying frame. The title applies its later postprocessing and
-composites the UI. When a frame misses the native filter cutoff it
-keeps stock Super Resolution and the native filters.
-[Build and launch the default preset](README.md#build-and-launch)
+The candidate default 4K preset requests one NGX Ray Reconstruction
+evaluation per qualifying frame from startup. It retains the game’s
+native global illumination, preserves the original wavy glass and
+replaces four native reflection filter bodies on eligible frames. The
+title applies its later postprocessing and composites the UI. A frame
+that misses the filter cutoff keeps stock Super Resolution and the
+native filters. The first intro upscales observed in the hardware
+replay still used this fallback.
+[Build and launch](README.md#build-and-launch) · [Native GI and glass](#native-gi-with-original-glass)
 
-On the RTX 5090, accepted 4K RR frames preserved the game’s wavy glass
-and bypassed five original filter bodies. A paired GI shader retained
-the diffuse and caustic accumulation that feeds scene lighting. The
-stock-vs-RR timing pair with the cutoff guard measured 8.54 vs 8.75
-median FPS and 271.46 vs 202.39 ms p95. Stock SR recovered on every
-accepted frame where the early replacement could not commit.
-[GPU filter evidence](#diffuse-history-replacement) · [Same-build timing](#capture-free-timing-with-the-stock-fallback-guard) · [Stock fallback](#stock-fallback-at-the-native-cutoff)
+The earlier five-filter experiment replaced the probe shader with a
+hybrid that retained diffuse and caustic accumulation. Its stock-vs-RR
+timing pair measured 8.54 vs 8.75 median FPS and 271.46 vs 202.39 ms
+p95. Those results apply to the hybrid-GI experiment.
+[Hybrid-GI filter evidence](#diffuse-history-replacement) · [Historical same-build timing](#capture-free-timing-with-the-stock-fallback-guard)
 
 ## Graph investigation
 
@@ -937,6 +939,15 @@ angles differed from the stock run, and full-frame registration failed
 across the turn. The review uses locally aligned crops and adjacent
 frames from the same replay.
 
+### Native GI with original glass
+
+The native-GI validation build `a53eaa18` presented the 4K cell frame
+1914 on the physical AOC. Its fenced FidelityFX slot used one RR
+evaluation and zero SR evaluations. The Present receipt identifies the
+original optical input and confirms the four reflection replacements
+with native GI selected. The pane retained the visible wavy distortion
+and wire mesh. This is frame-level image and route evidence.
+
 ### Continuous startup investigation
 
 A normal launch can request RR without a benchmark trigger. The physical
@@ -951,8 +962,8 @@ original depth/HDR serials and draw ordering. The alpha replacement
 still needs its exact writer and reader. With no pane, the already
 composed title color goes directly into RR.
 
-A hardware diagnostic of this change executed feature 13 on intro FFX
-frame 1369 with a history reset, zero SR GPU evaluations and all five
+An earlier hybrid-GI diagnostic of this change executed feature 13 on
+intro FFX frame 1369 with a history reset, zero SR GPU evaluations and all five
 targeted replacements. The first FFX frame, 1366, still executed SR.
 An animated letterbox limited accepted Present attribution for the early
 RR frames, so this is a GPU-slot result.
@@ -965,8 +976,9 @@ variation begins upstream of RR on that pair.
 
 ### Capture-free timing with the stock fallback guard
 
-The same executable ran both arms on the physical AOC with the same
-Series S checkpoint, stationary cell pose, save/cache seed and 720p-to-4K
+The historical hybrid-GI experiment used the same executable for both
+arms on the physical AOC with the same Series S checkpoint, stationary
+cell pose, save/cache seed and 720p-to-4K
 profile. Each run excluded loading and the three-second guide warmup
 from its 55-second measurement. Capture, motion and pass diagnostics
 stayed outside the measurement. Before each measured arm in the timing

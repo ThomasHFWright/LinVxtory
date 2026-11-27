@@ -398,8 +398,9 @@ renderer. Use `sh build.sh --sr --control ../linvxtory-sr-control` for
 the historical standalone SR control. Both commands check the resulting
 renderer tree before compiling.
 
-The steps below are for the measured SR/RR comparison. Ordinary
-gameplay uses the default launch without a timing trigger.
+The steps below reproduce the historical five-filter hybrid-GI
+comparison. The candidate default launch uses native GI and requests
+RR without a timing trigger.
 [Build and launch](README.md#build-and-launch)
 
 To finish a manual build, apply the [stock fallback overlay](rr-atomic-stock-fallback.patch.txt)

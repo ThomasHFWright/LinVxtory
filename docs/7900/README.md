@@ -8,19 +8,22 @@ readback capture, and direct 4K DLSS. The patches are
 GPL-3.0-or-later like the renderer. The kit provides source, settings, and
 input hashes. Use your own game files and build the runtime locally.
 
-## Default Ray Reconstruction preset
+## Candidate default Ray Reconstruction preset
 
-The default Series S profile uses DLSS Ray Reconstruction in Ultra
-Performance mode with a **1280×720** input and **3840×2160** output. The
-renderer supplies the scene, depth, motion, material and reflection guides
-and keeps the game’s original wavy glass. The title still applies its later
+The Series S profile requests DLSS Ray Reconstruction from startup in
+Ultra Performance mode with **1280×720** input and **3840×2160** output.
+The game’s native global illumination (GI) remains active. The renderer
+supplies the scene, depth, motion, material and reflection guides and
+preserves the original wavy glass. The title applies its later
 postprocessing and composites the UI at presentation.
 
-The renderer commits Ray Reconstruction for eligible frames before the
-native filter cutoff. When the guides or glass data do not qualify in
-time, it keeps the stock Super Resolution command and native filters
-for that frame.
-[Accepted 4K output and fallback evidence](ray-reconstruction.md#stock-fallback-at-the-native-cutoff)
+For eligible frames, the renderer commits RR before the native filter
+cutoff and replaces four reflection filter passes. When the guides or
+glass data fail to qualify in time, the renderer keeps stock Super
+Resolution and the native filters for that frame. This also covers
+the first intro upscales observed in the hardware replay.
+[Native GI and glass verification](ray-reconstruction.md#native-gi-with-original-glass) ·
+[Startup investigation](ray-reconstruction.md#continuous-startup-investigation)
 
 ## Historical 4K Super Resolution control
 
@@ -37,8 +40,8 @@ from elapsed seconds 240–295, 585 title Present intervals yielded
 ponytail, wire window and lighting remained visible in the cell.
 
 This result belongs to the historical Super Resolution renderer. The
-separate same-build SR/RR comparison uses a different replay window.
-[Same-build comparison](ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard)
+separate same-build SR/RR comparison used the historical hybrid-GI route.
+[Historical hybrid-GI timing](ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard)
 
 ## Offline shader lookup
 
@@ -147,8 +150,8 @@ export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
   run "$TITLE_EXE" --execute --console series-s
 ```
 
-This launches the default 720p-to-4K Ray Reconstruction preset with
-ray tracing active. It needs no timed benchmark or frame capture trigger.
+This launches the candidate default 720p-to-4K Ray Reconstruction preset with
+ray tracing and native GI active. It needs no timed benchmark or frame capture trigger.
 For an explicit Super Resolution launch, start in a fresh shell,
 `export VICTORY_RR_AUTO=0` before sourcing `rt-speed.env.sh`, and
 point `src` at the desired renderer directory in the command above. The
@@ -156,7 +159,7 @@ same setting selects SR when comparing both modes with one RR executable.
 
 The preset waits up to five seconds on a pipeline's first use. A cold
 run can spend several minutes compiling.
-[Separate capture and 55-second timing instructions](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
+[Diagnostic capture and historical hybrid-GI timing](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
 
 ## Findings
 
