@@ -1,0 +1,789 @@
+diff --git a/crates/victory-gpu/src/draw/background_snapshot.rs b/crates/victory-gpu/src/draw/background_snapshot.rs
+index f41f865..32f9eef 100644
+--- a/crates/victory-gpu/src/draw/background_snapshot.rs
++++ b/crates/victory-gpu/src/draw/background_snapshot.rs
+@@ -87,6 +87,15 @@ pub(super) fn rendered(
+     list: &HostList,
+     resource: usize,
+     format: DXGI_FORMAT,
++) -> Option<(Arc<crate::resource::HostTexture>, D3D12_RESOURCE_STATES)> {
++    rendered_at(list, resource, format, SIZE)
++}
++
++pub(super) fn rendered_at(
++    list: &HostList,
++    resource: usize,
++    format: DXGI_FORMAT,
++    size: [u32; 2],
+ ) -> Option<(Arc<crate::resource::HostTexture>, D3D12_RESOURCE_STATES)> {
+     let (backing, state) = list.guide_texture(resource)?;
+     // SAFETY: live registry backing retained by the recording list.
+@@ -94,8 +103,8 @@ pub(super) fn rendered(
+     (backing.base == 0
+         && desc.Format == format
+         && desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+-        && desc.Width == u64::from(SIZE[0])
+-        && desc.Height == SIZE[1]
++        && desc.Width == u64::from(size[0])
++        && desc.Height == size[1]
+         && desc.DepthOrArraySize == 1
+         && desc.MipLevels == 1
+         && desc.SampleDesc.Count == 1
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index 204cf23..aa00343 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -2,7 +2,7 @@
+
+ use super::HostList;
+ use super::reflection_capture::Primary;
+-use super::rr_shadow::{self, RrShadowInputs, Snapshot};
++use super::rr_shadow::{self, RrShadowCameraStamp, RrShadowInputs, Snapshot};
+ use crate::external::{RrCameraFrame, RrMaterialCandidates};
+ use crate::host::{Host, transition};
+ use crate::reflection_motion::{self, ReflectionFrame, ReflectionInputs};
+@@ -156,7 +156,7 @@ fn matching_projection(native: [u32; 16], expected: [f32; 16]) -> bool {
+
+ // The title records ahead of its submission worker. Pair current/previous
+ // successful SR commands where the host serializes their actual submissions.
+-fn accept_camera(current: &Camera, sequence: u64) -> Option<[f32; 16]> {
++fn accept_camera(current: &Camera, sequence: u64) -> Option<([f32; 16], RrShadowCameraStamp)> {
+     static ACCEPTED: Mutex<Option<(Camera, u64)>> = Mutex::new(None);
+     let mut accepted = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
+     let previous = accepted.take();
+@@ -168,7 +168,13 @@ fn accept_camera(current: &Camera, sequence: u64) -> Option<[f32; 16]> {
+             && camera.epoch < current.epoch
+     });
+     *accepted = Some((current.clone(), sequence));
+-    crate::rr_history::previous_clip(&adjacent?.0.native, current.native.origin)
++    let (prior, submission) = adjacent?;
++    let clip = crate::rr_history::previous_clip(&prior.native, current.native.origin)?;
++    Some((clip, RrShadowCameraStamp {
++        begun: prior.begun,
++        epoch: prior.epoch,
++        submission,
++    }))
+ }
+
+ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Option<Readback> {
+@@ -197,7 +203,7 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+         warn("ambiguous current camera witness");
+         return None;
+     }
+-    let Some(previous) = accept_camera(&camera, sequence) else {
++    let Some((previous, previous_camera)) = accept_camera(&camera, sequence) else {
+         warn("no adjacent previously submitted camera witness");
+         return None;
+     };
+@@ -297,6 +303,7 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+         motion,
+         primary,
+         camera,
++        previous_camera,
+         source,
+         submission: sequence,
+     })
+@@ -380,6 +387,7 @@ pub(crate) struct Readback {
+     motion: ID3D12Resource,
+     primary: ID3D12Resource,
+     camera: Camera,
++    previous_camera: RrShadowCameraStamp,
+     source: Source,
+     submission: u64,
+ }
+@@ -480,6 +488,8 @@ impl Readback {
+             epoch: shadow.snapshot.epoch,
+             submission: self.submission,
+             source_submission: self.source.submission,
++            stream: self.camera.stream,
++            previous_camera: self.previous_camera,
+             serials: shadow.snapshot.serials,
+             frame: shadow.snapshot.frame,
+             hdr,
+@@ -490,6 +500,7 @@ impl Readback {
+             reflection_motion: shadow.motion,
+             reflection_counts: counts,
+             depth_of_field: shadow.snapshot.depth_of_field,
++            sr_output: shadow.snapshot.sr_output,
+         });
+     }
+ }
+diff --git a/crates/victory-gpu/src/draw/rr_shadow.rs b/crates/victory-gpu/src/draw/rr_shadow.rs
+index dcecc82..aad5e0d 100644
+--- a/crates/victory-gpu/src/draw/rr_shadow.rs
++++ b/crates/victory-gpu/src/draw/rr_shadow.rs
+@@ -15,6 +15,14 @@ pub struct RrShadowFrame {
+     pub pre_exposure: f32,
+ }
+
++/// A successful SR dispatch on the native renderer queue.
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub struct RrShadowCameraStamp {
++    pub begun: u64,
++    pub epoch: u64,
++    pub submission: u64,
++}
++
+ /// Fence-retired title resources. The material and reflection guide pixels are
+ /// diagnostic candidates from the same opaque prepass, with unresolved alpha
+ /// and sky ownership relative to the final FFX color/depth/motion inputs.
+@@ -24,6 +32,8 @@ pub struct RrShadowInputs {
+     pub epoch: u64,
+     pub submission: u64,
+     pub source_submission: u64,
++    pub stream: u64,
++    pub previous_camera: RrShadowCameraStamp,
+     pub serials: [u64; 3],
+     pub frame: RrShadowFrame,
+     pub hdr: ID3D12Resource,
+@@ -33,6 +43,8 @@ pub struct RrShadowInputs {
+     pub material_counts: [u32; 7],
+     pub reflection_motion: ID3D12Resource,
+     pub reflection_counts: [u32; 10],
++    /// Exact stock 4K color UAV output from this same FFX dispatch.
++    pub sr_output: Option<(u64, ID3D12Resource)>,
+     pub depth_of_field: Option<ID3D12Resource>,
+ }
+
+@@ -57,6 +69,7 @@ pub(crate) struct Snapshot {
+     pub serials: [u64; 3],
+     pub depth_of_field: Option<ID3D12Resource>,
+     pub copies: [ID3D12Resource; 3],
++    pub sr_output: Option<(u64, ID3D12Resource)>,
+     pub frame: RrShadowFrame,
+ }
+
+@@ -66,6 +79,7 @@ pub(crate) fn capture(
+     textures: [(This, &ID3D12Resource); 3],
+     frame: RrShadowFrame,
+     depth_of_field: Option<&ID3D12Resource>,
++    sr: Option<(This, &ID3D12Resource)>,
+ ) {
+     static REQUESTED: OnceLock<Option<u64>> = OnceLock::new();
+     let requested =
+@@ -99,6 +113,23 @@ pub(crate) fn capture(
+             background_snapshot::copy(list, &sources[1])?,
+             background_snapshot::copy(list, &sources[2])?,
+         ];
++        let sr_output = if let Some((title, exact)) = sr {
++            let source = background_snapshot::rendered_at(
++                list,
++                title as usize,
++                DXGI_FORMAT_R16G16B16A16_FLOAT,
++                [3840, 2160],
++            )?;
++            if source.0.texture.as_raw() != exact.as_raw()
++                || source.1 != D3D12_RESOURCE_STATE_UNORDERED_ACCESS
++            {
++                return None;
++            }
++            Some(background_snapshot::copy(list, &source)?)
++        } else {
++            None
++        };
++        let sr_serial = sr_output.as_ref().map(|&(serial, _)| serial);
+         list.rr_shadow_capture(Snapshot {
+             present,
+             begun: camera.current().begun,
+@@ -106,9 +137,10 @@ pub(crate) fn capture(
+             serials: [a, b, c],
+             copies: [hdr, depth, motion],
+             depth_of_field: depth_of_field.cloned(),
++            sr_output,
+             frame,
+         });
+-        tracing::info!(present, begun = camera.current().begun, epoch = camera.current().epoch, serials = ?[a,b,c], "RR title shadow snapshot recorded");
++        tracing::info!(present, begun = camera.current().begun, epoch = camera.current().epoch, serials = ?[a,b,c], ?sr_serial, "RR title shadow snapshot recorded");
+         Some(())
+     };
+     if record().is_none() {
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 2d02f6d..341bedf 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -18,7 +18,7 @@ pub use crate::reflection_motion::{
+ #[cfg(feature = "diagnostics")]
+ pub use crate::draw::background_snapshot::{RrBackgroundKey, RrBackgroundSnapshot};
+ #[cfg(feature = "diagnostics")]
+-pub use crate::draw::rr_shadow::{RrShadowFrame, RrShadowInputs, rr_shadow_consumer};
++pub use crate::draw::rr_shadow::{RrShadowCameraStamp, RrShadowFrame, RrShadowInputs, rr_shadow_consumer};
+
+ /// The host D3D12 device, created on first use; `None` without a host GPU.
+ pub fn host_device() -> Option<ID3D12Device> {
+@@ -144,8 +144,9 @@ impl Recording<'_> {
+         textures: [(This, &ID3D12Resource); 3],
+         frame: RrShadowFrame,
+         depth_of_field: Option<&ID3D12Resource>,
++        sr: Option<(This, &ID3D12Resource)>,
+     ) {
+-        crate::draw::rr_shadow::capture(self.0, camera, textures, frame, depth_of_field);
++        crate::draw::rr_shadow::capture(self.0, camera, textures, frame, depth_of_field, sr);
+     }
+
+     /// Record successful SR for camera history and the optional dense reflection proof.
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index 70cd247..7a26d8e 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -557,6 +557,7 @@ fn record(
+                     pre_exposure: f32::from_bits(info.settings[3]),
+                 },
+                 dof_guide.as_ref(),
++                rr_shadow::pair_folder().map(|_| (output.cast_const(), &output_host)),
+             );
+         }
+         list.rr_recorded_sr(camera, info.motion_scale, info.settings[4] & 0xff != 0);
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+index ca24089..1a2b02a 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+@@ -1,7 +1,11 @@
+ //! A single detached, fence-retired title evaluation with a private 4K output.
+
+ use super::*;
+-use std::sync::atomic::AtomicBool;
++use std::io::{self, BufWriter, Write};
++use std::path::{Path, PathBuf};
++use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
++
++mod exr;
+ use std::time::{Duration, Instant};
+ use windows::Win32::Graphics::Dxgi::Common::*;
+
+@@ -13,33 +17,120 @@ const PIXELS: usize = (WIDTH * HEIGHT) as usize;
+ const BYTES: usize = PIXELS * 8;
+ const UNWRITTEN: u16 = 0x7bff; // 65504.0, the largest finite binary16 value.
+
++pub(super) fn pair_folder() -> Option<&'static Path> {
++    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
++    FOLDER
++        .get_or_init(|| {
++            std::env::var_os("VICTORY_RR_PAIR_DIR")
++                .filter(|path| !path.is_empty())
++                .map(PathBuf::from)
++        })
++        .as_deref()
++}
++
+ pub(super) fn start(inputs: external::RrShadowInputs) {
+-    static STARTED: AtomicBool = AtomicBool::new(false);
+-    if STARTED.swap(true, Ordering::AcqRel) {
+-        return;
+-    }
+-    if let Err(error) = std::thread::Builder::new()
+-        .name("title-rr-shadow".into())
+-        .spawn(move || {
+-            tracing::info!(
+-                present = inputs.present,
+-                begun = inputs.begun,
+-                epoch = inputs.epoch,
+-                source_submit = inputs.source_submission,
+-                submit = inputs.submission,
+-                serials = ?inputs.serials,
+-                material_key = ?inputs.material.key,
+-                material_status = ?inputs.material_counts,
+-                reflection_status = ?inputs.reflection_counts,
+-                dof = inputs.depth_of_field.is_some(),
+-                "RR title shadow starting with diagnostic opaque guides"
+-            );
+-            if let Err(error) = evaluate(inputs) {
+-                tracing::warn!(%error, presented = "SR", "RR title shadow failed");
++    static OWNER: OnceLock<Option<SyncSender<external::RrShadowInputs>>> = OnceLock::new();
++    let owner = OWNER.get_or_init(|| {
++        let limit = std::env::var("VICTORY_RR_SHADOW_LIMIT")
++            .ok()
++            .and_then(|value| value.parse::<usize>().ok())
++            .filter(|limit| (1..=5).contains(limit))
++            .unwrap_or(1);
++        let (send, receive) = sync_channel(limit);
++        match std::thread::Builder::new()
++            .name("title-rr-shadow".into())
++            .spawn(move || {
++                if let Err(error) = run(receive, limit) {
++                    tracing::warn!(%error, presented = "SR", "RR title shadow failed");
++                }
++            }) {
++            Ok(_) => Some(send),
++            Err(error) => {
++                tracing::warn!(%error, "RR title shadow worker could not start");
++                None
+             }
+-        })
+-    {
+-        tracing::warn!(%error, "RR title shadow worker could not start");
++        }
++    });
++    if let Some(owner) = owner {
++        let _ = owner.try_send(inputs);
++    }
++}
++
++fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(), Error> {
++    let device = external::host_device().ok_or(Error::Invalid("host device"))?;
++    // SAFETY: a dedicated direct queue, used by this worker alone.
++    let queue: ID3D12CommandQueue = unsafe {
++        device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
++            Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
++            ..Default::default()
++        })?
++    };
++    let mut last: Option<ShadowStamp> = None;
++    let mut evaluated = 0;
++    while evaluated < limit {
++        let Ok(inputs) = receive.recv_timeout(Duration::from_secs(15)) else {
++            break;
++        };
++        if last.is_some_and(|prior| inputs.submission <= prior.camera.submission) {
++            continue;
++        }
++        let reset = !last.is_some_and(|prior| {
++            prior.matches_previous(inputs.present, inputs.stream, inputs.previous_camera)
++        });
++        tracing::info!(
++            present = inputs.present,
++            begun = inputs.begun,
++            epoch = inputs.epoch,
++            source_submit = inputs.source_submission,
++            submit = inputs.submission,
++            serials = ?inputs.serials,
++            material_key = ?inputs.material.key,
++            material_status = ?inputs.material_counts,
++            reflection_status = ?inputs.reflection_counts,
++            dof = inputs.depth_of_field.is_some(),
++            reset,
++            "RR title shadow starting with diagnostic opaque guides"
++        );
++        let current = ShadowStamp {
++            present: inputs.present,
++            stream: inputs.stream,
++            camera: external::RrShadowCameraStamp {
++                begun: inputs.begun,
++                epoch: inputs.epoch,
++                submission: inputs.submission,
++            },
++        };
++        evaluate(&device, &queue, inputs, reset)?;
++        last = Some(current);
++        evaluated += 1;
++    }
++    if limit > 1 {
++        tracing::info!(
++            evaluated,
++            requested = limit,
++            "RR title shadow sequence ended"
++        );
++    }
++    Ok(())
++}
++
++#[derive(Clone, Copy)]
++struct ShadowStamp {
++    present: u64,
++    stream: u64,
++    camera: external::RrShadowCameraStamp,
++}
++
++impl ShadowStamp {
++    fn matches_previous(
++        self,
++        present: u64,
++        stream: u64,
++        camera: external::RrShadowCameraStamp,
++    ) -> bool {
++        self.present.checked_add(1) == Some(present)
++            && self.stream == stream
++            && self.camera == camera
+     }
+ }
+
+@@ -48,6 +139,7 @@ enum Error {
+     Driver(windows::core::Error),
+     Ngx(rr::Error),
+     Invalid(&'static str),
++    Export(io::Error),
+ }
+
+ impl std::fmt::Display for Error {
+@@ -56,6 +148,7 @@ impl std::fmt::Display for Error {
+             Self::Driver(error) => write!(formatter, "D3D12: {error}"),
+             Self::Ngx(error) => write!(formatter, "NGX: {error:?}"),
+             Self::Invalid(reason) => formatter.write_str(reason),
++            Self::Export(error) => write!(formatter, "visual pair export: {error}"),
+         }
+     }
+ }
+@@ -66,21 +159,42 @@ impl From<windows::core::Error> for Error {
+     }
+ }
+
+-fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+-    let device = external::host_device().ok_or(Error::Invalid("host device"))?;
++fn readback_buffer(device: &ID3D12Device, bytes: usize) -> Result<ID3D12Resource, Error> {
++    resource(
++        device,
++        D3D12_HEAP_TYPE_READBACK,
++        D3D12_RESOURCE_STATE_COPY_DEST,
++        D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: bytes as u64,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: DXGI_SAMPLE_DESC {
++                Count: 1,
++                Quality: 0,
++            },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            ..Default::default()
++        },
++    )
++}
++
++fn evaluate(
++    device: &ID3D12Device,
++    queue: &ID3D12CommandQueue,
++    inputs: external::RrShadowInputs,
++    reset: bool,
++) -> Result<(), Error> {
+     // SAFETY: all inputs are immutable, fence-retired snapshots from this device.
+     unsafe {
+         let kind = D3D12_COMMAND_LIST_TYPE_DIRECT;
+-        let queue: ID3D12CommandQueue = device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+-            Type: kind,
+-            ..Default::default()
+-        })?;
+         let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(kind)?;
+         let commands: ID3D12GraphicsCommandList =
+             device.CreateCommandList(0, kind, &allocator, None)?;
+         let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE)?;
+         let output = resource(
+-            &device,
++            device,
+             D3D12_HEAP_TYPE_DEFAULT,
+             D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+             D3D12_RESOURCE_DESC {
+@@ -98,24 +212,17 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+                 ..Default::default()
+             },
+         )?;
+-        let readback = resource(
+-            &device,
+-            D3D12_HEAP_TYPE_READBACK,
+-            D3D12_RESOURCE_STATE_COPY_DEST,
+-            D3D12_RESOURCE_DESC {
+-                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+-                Width: BYTES as u64,
+-                Height: 1,
+-                DepthOrArraySize: 1,
+-                MipLevels: 1,
+-                SampleDesc: DXGI_SAMPLE_DESC {
+-                    Count: 1,
+-                    Quality: 0,
+-                },
+-                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+-                ..Default::default()
+-            },
+-        )?;
++        let pair = pair_folder()
++            .map(|folder| {
++                let (serial, sr) = inputs
++                    .sr_output
++                    .as_ref()
++                    .ok_or(Error::Invalid("same-dispatch SR output snapshot missing"))?;
++                Ok::<_, Error>((folder, *serial, sr))
++            })
++            .transpose()?;
++        let readback_bytes = if pair.is_some() { BYTES * 2 } else { BYTES };
++        let readback = readback_buffer(device, readback_bytes)?;
+         let heap = |flags| {
+             device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+@@ -169,21 +276,44 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+                 motion_scale: frame.motion_scale,
+                 frame_time_ms: frame.frame_time_ms,
+                 pre_exposure: frame.pre_exposure,
+-                reset: true,
++                reset,
+             },
+         )
+         .map_err(Error::Ngx)?;
+-        copy_for_readback(&commands, &output, &readback);
++        copy_for_readback(
++            &commands,
++            &output,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            &readback,
++            0,
++        );
++        if let Some((_, _, sr)) = pair {
++            copy_for_readback(
++                &commands,
++                sr,
++                D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                &readback,
++                BYTES as u64,
++            );
++        }
+         commands.Close()?;
+         queue.ExecuteCommandLists(&[Some(commands.cast::<ID3D12CommandList>()?)]);
+         let retired = queue
+             .Signal(&fence, 1)
+             .map_err(Error::from)
+-            .and_then(|()| wait_for(&device, &fence));
++            .and_then(|()| wait_for(device, &fence));
+         if let Err(error) = retired {
+             // The GPU can still reference these allocations after a failed signal or wait.
+             std::mem::forget((
+-                queue, allocator, commands, fence, inputs, output, readback, cpu, gpu,
++                queue.clone(),
++                allocator,
++                commands,
++                fence,
++                inputs,
++                output,
++                readback,
++                cpu,
++                gpu,
+             ));
+             return Err(error);
+         }
+@@ -193,36 +323,107 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+             0,
+             Some(&D3D12_RANGE {
+                 Begin: 0,
+-                End: BYTES,
++                End: readback_bytes,
+             }),
+             Some(&mut ptr),
+         )?;
+-        let stats = (!ptr.is_null())
+-            .then(|| output_stats(std::slice::from_raw_parts(ptr.cast::<u16>(), PIXELS * 4)));
++        let result = if ptr.is_null() {
++            Err(Error::Invalid("output readback pointer"))
++        } else {
++            let pixels = std::slice::from_raw_parts(ptr.cast::<u16>(), readback_bytes / 2);
++            report(&inputs, &pixels[..PIXELS * 4], reset).and_then(|rr_hash| {
++                if let Some((folder, serial, _)) = pair {
++                    let rr = &pixels[..PIXELS * 4];
++                    let sr = &pixels[PIXELS * 4..];
++                    if sr
++                        .chunks_exact(4)
++                        .any(|pixel| pixel[..3].iter().any(|&w| w & 0x7c00 == 0x7c00))
++                    {
++                        return Err(Error::Invalid("nonfinite RGB in stock 4K SR control"));
++                    }
++                    let (_, _, sr_nonzero, sr_hash) = output_stats(sr);
++                    if sr_nonzero == 0 {
++                        return Err(Error::Invalid("empty stock 4K SR control"));
++                    }
++                    save_pair(folder, &inputs, serial, reset, (rr, rr_hash), (sr, sr_hash))
++                        .map_err(Error::Export)?;
++                }
++                Ok(())
++            })
++        };
+         readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+-        let (finite, touched, nonzero, digest) =
+-            stats.ok_or(Error::Invalid("output readback pointer"))?;
+-        let complete = finite == PIXELS && touched == PIXELS && nonzero > 0;
+-        tracing::info!(
+-            feature = 13,
+-            complete,
+-            output = ?UHD.output,
+-            present = inputs.present,
+-            begun = inputs.begun,
+-            submit = inputs.submission,
+-            source_submit = inputs.source_submission,
+-            pixels = PIXELS,
+-            finite,
+-            written = touched,
+-            nonzero,
+-            fnv1a64 = format_args!("{digest:016x}"),
+-            presented = "SR",
+-            "RR title shadow output retired"
+-        );
+-        if !complete {
+-            return Err(Error::Invalid("incomplete or nonfinite 4K output"));
++        result?;
++    }
++    Ok(())
++}
++
++fn report(inputs: &external::RrShadowInputs, output: &[u16], reset: bool) -> Result<u64, Error> {
++    let (finite, touched, nonzero, digest) = output_stats(output);
++    let complete = finite == PIXELS && touched == PIXELS && nonzero > 0;
++    tracing::info!(
++        feature = 13,
++        complete,
++        reset,
++        output = ?UHD.output,
++        present = inputs.present,
++        begun = inputs.begun,
++        submit = inputs.submission,
++        source_submit = inputs.source_submission,
++        pixels = PIXELS,
++        finite,
++        written = touched,
++        nonzero,
++        fnv1a64 = format_args!("{digest:016x}"),
++        presented = "SR",
++        "RR title shadow output retired"
++    );
++    if !complete {
++        return Err(Error::Invalid("incomplete or nonfinite 4K output"));
++    }
++    Ok(digest)
++}
++
++fn save_pair(
++    folder: &Path,
++    inputs: &external::RrShadowInputs,
++    sr_serial: u64,
++    reset: bool,
++    (rr, rr_hash): (&[u16], u64),
++    (sr, sr_hash): (&[u16], u64),
++) -> io::Result<()> {
++    std::fs::create_dir_all(folder)?;
++    let stem = format!("frame-{}-submit-{}", inputs.present, inputs.submission);
++    let staging = folder.join(format!(".{stem}-{}.part", std::process::id()));
++    let pair = folder.join(stem);
++    std::fs::create_dir(&staging)?;
++    let save = || {
++        for (file, rgba) in [("rr.exr", rr), ("sr.exr", sr)] {
++            let mut writer = BufWriter::new(std::fs::File::create(staging.join(file))?);
++            exr::write(&mut writer, UHD.output, rgba, inputs.frame.pre_exposure)?;
++            writer.flush()?;
+         }
++        std::fs::write(
++            staging.join("receipt.txt"),
++            format!(
++                "tap=FFX upscaler output before title postprocessing\nreference=stock SR same dispatch\nfeature=13\nwidth={WIDTH}\nheight={HEIGHT}\nformat=RGBA16F native HDR\npresent={}\nbegun={}\nepoch={}\nsubmit={}\nsource_submit={}\nsr_serial={sr_serial}\nreset={reset}\nprevious_camera_begun={}\nprevious_camera_epoch={}\nprevious_camera_submit={}\npre_exposure={}\nrr_fnv1a64={rr_hash:016x}\nsr_fnv1a64={sr_hash:016x}\n",
++                inputs.present,
++                inputs.begun,
++                inputs.epoch,
++                inputs.submission,
++                inputs.source_submission,
++                inputs.previous_camera.begun,
++                inputs.previous_camera.epoch,
++                inputs.previous_camera.submission,
++                inputs.frame.pre_exposure,
++            ),
++        )?;
++        std::fs::rename(&staging, &pair)
++    };
++    if let Err(error) = save() {
++        let _ = std::fs::remove_dir_all(&staging);
++        return Err(error);
+     }
++    tracing::info!(path = %pair.display(), present = inputs.present, submit = inputs.submission, "RR title shadow HDR pair saved");
+     Ok(())
+ }
+
+@@ -253,9 +454,11 @@ fn resource(
+ unsafe fn copy_for_readback(
+     commands: &ID3D12GraphicsCommandList,
+     output: &ID3D12Resource,
++    state: D3D12_RESOURCE_STATES,
+     readback: &ID3D12Resource,
++    offset: u64,
+ ) {
+-    // SAFETY: output is a live UAV and readback owns an exact aligned footprint.
++    // SAFETY: output has the supplied state and readback owns an exact aligned footprint.
+     unsafe {
+         commands.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
+             Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+@@ -263,7 +466,7 @@ unsafe fn copy_for_readback(
+                 Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
+                     pResource: std::mem::transmute_copy(output),
+                     Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+-                    StateBefore: D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                    StateBefore: state,
+                     StateAfter: D3D12_RESOURCE_STATE_COPY_SOURCE,
+                 }),
+             },
+@@ -281,7 +484,7 @@ unsafe fn copy_for_readback(
+             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+                 PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+-                    Offset: 0,
++                    Offset: offset,
+                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+                         Format: FORMAT,
+                         Width: WIDTH,
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow/exr.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow/exr.rs
+new file mode 100644
+index 0000000..5e63904
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow/exr.rs
+@@ -0,0 +1,71 @@
++//! Uncompressed scanline OpenEXR, preserving GPU binary16 channel bits.
++
++use std::io::{self, Write};
++
++pub(super) fn write(
++    mut out: impl Write,
++    [width, height]: [u32; 2],
++    rgba: &[u16],
++    pre_exposure: f32,
++) -> io::Result<()> {
++    assert_eq!(rgba.len(), width as usize * height as usize * 4);
++    let mut header = Vec::new();
++    header.extend(20_000_630u32.to_le_bytes());
++    header.extend(2u32.to_le_bytes());
++    let mut attr = |name: &[u8], kind: &[u8], bytes: &[u8]| {
++        header.extend(name);
++        header.push(0);
++        header.extend(kind);
++        header.push(0);
++        header.extend((bytes.len() as u32).to_le_bytes());
++        header.extend(bytes);
++    };
++    const CHANNELS: [(u8, usize); 4] = [(b'A', 3), (b'B', 2), (b'G', 1), (b'R', 0)];
++    let mut channels = Vec::new();
++    for (name, _) in CHANNELS {
++        channels.extend([name, 0]);
++        channels.extend(1u32.to_le_bytes()); // HALF
++        channels.extend([0; 4]);
++        channels.extend(1u32.to_le_bytes()); // xSampling
++        channels.extend(1u32.to_le_bytes()); // ySampling
++    }
++    channels.push(0);
++    let window: Vec<_> = [0, 0, width - 1, height - 1]
++        .into_iter()
++        .flat_map(u32::to_le_bytes)
++        .collect();
++    let center = [0u8; 8];
++    let one = 1.0f32.to_le_bytes();
++    attr(b"channels", b"chlist", &channels);
++    attr(b"compression", b"compression", &[0]);
++    attr(b"dataWindow", b"box2i", &window);
++    attr(b"displayWindow", b"box2i", &window);
++    attr(b"lineOrder", b"lineOrder", &[0]);
++    attr(b"pixelAspectRatio", b"float", &one);
++    attr(b"screenWindowCenter", b"v2f", &center);
++    attr(b"screenWindowWidth", b"float", &one);
++    attr(b"victoryPreExposure", b"float", &pre_exposure.to_le_bytes());
++    header.push(0);
++
++    let row_bytes = width * 8;
++    let first_scanline = header.len() as u64 + u64::from(height) * 8;
++    out.write_all(&header)?;
++    for y in 0..height {
++        let offset = first_scanline + u64::from(y) * u64::from(8 + row_bytes);
++        out.write_all(&offset.to_le_bytes())?;
++    }
++
++    let mut line = Vec::with_capacity((row_bytes + 8) as usize);
++    for (y, pixels) in rgba.chunks_exact(width as usize * 4).enumerate() {
++        line.clear();
++        line.extend((y as u32).to_le_bytes());
++        line.extend(row_bytes.to_le_bytes());
++        for (_, i) in CHANNELS {
++            for &word in pixels.iter().skip(i).step_by(4) {
++                line.extend(word.to_le_bytes());
++            }
++        }
++        out.write_all(&line)?;
++    }
++    Ok(())
++}

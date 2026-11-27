@@ -1,0 +1,1135 @@
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index d1a740b..b69486d 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -54,6 +54,9 @@ unsafe extern "C" {
+         version: c_int,
+     ) -> NgxResult;
+     fn NVSDK_NGX_D3D12_GetCapabilityParameters(out: *mut *mut c_void) -> NgxResult;
++    #[cfg(test)]
++    fn NVSDK_NGX_D3D12_ReleaseFeature(feature: *mut c_void) -> NgxResult;
++    fn NVSDK_NGX_D3D12_DestroyParameters(params: *mut c_void) -> NgxResult;
+     fn NVSDK_NGX_D3D12_CreateFeature(
+         list: *mut c_void,
+         feature: c_int,
+@@ -74,6 +77,7 @@ unsafe extern "C" {
+         name: *const c_char,
+         value: *mut c_void,
+     );
++    fn NVSDK_NGX_Parameter_SetVoidPointer(p: *mut c_void, name: *const c_char, value: *mut c_void);
+     fn NVSDK_NGX_Parameter_GetI(p: *mut c_void, name: *const c_char, out: *mut c_int) -> NgxResult;
+ }
+
+@@ -84,6 +88,10 @@ macro_rules! name {
+     };
+ }
+
++// Called by the renderer fixture until a verified title producer is available.
++#[cfg_attr(not(test), allow(dead_code))]
++pub(crate) mod rr;
++
+ const INPUT: [u32; 2] = [1280, 720];
+ const FFX_FLAGS: u32 = (1 << 0) | (1 << 3) | (1 << 5);
+
+@@ -124,6 +132,7 @@ static ACTIVE: Context = OnceLock::new();
+ static REPLACED: AtomicUsize = AtomicUsize::new(0);
+ static OWNED_TAG: u8 = 0;
+ static OWNED_CREATE: Mutex<()> = Mutex::new(());
++static SDK: Mutex<()> = Mutex::new(());
+
+ fn owned_tag() -> usize {
+     std::ptr::addr_of!(OWNED_TAG) as usize
+@@ -445,6 +454,7 @@ fn record(
+             .ok_or("NGX Ultra Performance feature creation failed")?;
+     }
+     let p = ngx.params;
++    let sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+     // SAFETY: this list, its four held resources and the live NGX feature all use the same device.
+     let result = unsafe {
+         NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Color"), color.as_raw());
+@@ -474,6 +484,7 @@ fn record(
+         NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Render.Subrect.Dimensions.Height"), INPUT[1]);
+         NVSDK_NGX_D3D12_EvaluateFeature_C(commands.as_raw(), ngx.feature, p, std::ptr::null())
+     };
++    drop(sdk);
+     if result != SUCCESS {
+         tracing::warn!(result, "NGX did not evaluate the upscale");
+         return Err("NGX evaluation failed");
+@@ -541,41 +552,52 @@ unsafe extern "C" fn ngx_log(message: *const c_char, _: c_int, _: c_int) {
+ }
+
+ fn capabilities(device: &ID3D12Device) -> Option<*mut c_void> {
++    capabilities_for(device, "nvngx_dlss.dll", name!("SuperSampling.Available"))
++}
++
++fn capabilities_for(
++    device: &ID3D12Device,
++    dll: &str,
++    capability: *const c_char,
++) -> Option<*mut c_void> {
+     use std::os::windows::ffi::OsStrExt;
+
++    static INITIALIZED: OnceLock<()> = OnceLock::new();
+     let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+-    if !dir.join("nvngx_dlss.dll").is_file() {
++    if !dir.join(dll).is_file() {
+         return None;
+     }
+-    let data = std::env::temp_dir().join("victory-ngx");
+-    std::fs::create_dir_all(&data).ok()?;
+-    let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
+-    let data_w: Vec<u16> = data.as_os_str().encode_wide().chain([0]).collect();
+-    let paths = [dir_w.as_ptr()];
+-    let info = CommonInfo {
+-        paths: PathList {
+-            path: paths.as_ptr(),
+-            length: 1,
+-        },
+-        internal: std::ptr::null(),
+-        logging: Logging {
+-            callback: ngx_log as *const c_void,
+-            minimum: 2,
+-            disable_other_sinks: false,
+-        },
+-    };
+-    let mut params = std::ptr::null_mut();
+-    // SAFETY: live device and command list, strings and out pointers for the SDK.
+-    unsafe {
+-        let result = NVSDK_NGX_D3D12_Init_with_ProjectID(
+-            c"5e2f9a3c-1b7d-4c8e-9a6f-0d3b2c1e4f57".as_ptr(),
+-            ENGINE_CUSTOM,
+-            c"1.0".as_ptr(),
+-            data_w.as_ptr(),
+-            device.as_raw(),
+-            &info,
+-            VERSION_API,
+-        );
++    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
++    if INITIALIZED.get().is_none() {
++        let data = std::env::temp_dir().join("victory-ngx");
++        std::fs::create_dir_all(&data).ok()?;
++        let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
++        let data_w: Vec<u16> = data.as_os_str().encode_wide().chain([0]).collect();
++        let paths = [dir_w.as_ptr()];
++        let info = CommonInfo {
++            paths: PathList {
++                path: paths.as_ptr(),
++                length: 1,
++            },
++            internal: std::ptr::null(),
++            logging: Logging {
++                callback: ngx_log as *const c_void,
++                minimum: 2,
++                disable_other_sinks: false,
++            },
++        };
++        // SAFETY: one process-global device, with live SDK strings and synchronous initialization.
++        let result = unsafe {
++            NVSDK_NGX_D3D12_Init_with_ProjectID(
++                c"5e2f9a3c-1b7d-4c8e-9a6f-0d3b2c1e4f57".as_ptr(),
++                ENGINE_CUSTOM,
++                c"1.0".as_ptr(),
++                data_w.as_ptr(),
++                device.as_raw(),
++                &info,
++                VERSION_API,
++            )
++        };
+         if result != SUCCESS {
+             eprintln!(
+                 "Series S DLSS NGX initialization failed ({:#010x})",
+@@ -583,14 +605,18 @@ fn capabilities(device: &ID3D12Device) -> Option<*mut c_void> {
+             );
+             return None;
+         }
++        let _ = INITIALIZED.set(());
++    }
++    let mut params = std::ptr::null_mut();
++    // SAFETY: initialization succeeded and the SDK lock protects the new parameter map.
++    unsafe {
+         if NVSDK_NGX_D3D12_GetCapabilityParameters(&mut params) != SUCCESS || params.is_null() {
+             return None;
+         }
+         let mut available = 0;
+-        if NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.Available"), &mut available)
+-            != SUCCESS
+-            || available == 0
++        if NVSDK_NGX_Parameter_GetI(params, capability, &mut available) != SUCCESS || available == 0
+         {
++            NVSDK_NGX_D3D12_DestroyParameters(params);
+             return None;
+         }
+     }
+@@ -615,6 +641,25 @@ fn create_feature(
+     preset: Preset,
+     params: *mut c_void,
+ ) -> Option<*mut c_void> {
++    create_feature_for(
++        commands,
++        preset,
++        params,
++        FEATURE_SUPER_SAMPLING,
++        FLAG_HDR | FLAG_MV_LOW_RES | FLAG_DEPTH_INVERTED | FLAG_AUTO_EXPOSURE,
++        |_| {},
++    )
++}
++
++fn create_feature_for(
++    commands: &ID3D12GraphicsCommandList,
++    preset: Preset,
++    params: *mut c_void,
++    kind: c_int,
++    flags: c_int,
++    set_extra: impl FnOnce(*mut c_void),
++) -> Option<*mut c_void> {
++    let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
+     let mut feature = std::ptr::null_mut();
+     // SAFETY: live SDK parameters and an open command list.
+     unsafe {
+@@ -629,20 +674,12 @@ fn create_feature(
+             NVSDK_NGX_Parameter_SetUI(params, parameter, value);
+         }
+         NVSDK_NGX_Parameter_SetI(params, name!("PerfQualityValue"), preset.quality);
+-        NVSDK_NGX_Parameter_SetI(
+-            params,
+-            name!("DLSS.Feature.Create.Flags"),
+-            FLAG_HDR | FLAG_MV_LOW_RES | FLAG_DEPTH_INVERTED | FLAG_AUTO_EXPOSURE,
+-        );
++        NVSDK_NGX_Parameter_SetI(params, name!("DLSS.Feature.Create.Flags"), flags);
+         NVSDK_NGX_Parameter_SetI(params, name!("DLSS.Enable.Output.Subrects"), 0);
+-        let result = NVSDK_NGX_D3D12_CreateFeature(
+-            commands.as_raw(),
+-            FEATURE_SUPER_SAMPLING,
+-            params,
+-            &mut feature,
+-        );
++        set_extra(params);
++        let result = NVSDK_NGX_D3D12_CreateFeature(commands.as_raw(), kind, params, &mut feature);
+         if result != SUCCESS || feature.is_null() {
+-            tracing::warn!(result, "Series S DLSS NGX feature creation failed");
++            tracing::warn!(kind, result, "Series S DLSS NGX feature creation failed");
+             return None;
+         }
+     }
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+new file mode 100644
+index 0000000..9453036
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+@@ -0,0 +1,410 @@
++//! The fixed 720p to 4K NGX Ray Reconstruction renderer backend.
++
++use super::*;
++use windows::Win32::Graphics::Dxgi::Common::*;
++
++const FEATURE_RAY_RECONSTRUCTION: c_int = 13;
++const RR_PRESET_F: u32 = 6;
++
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub(crate) enum DepthEncoding {
++    LinearView,
++    InvertedHardware,
++}
++
++pub(crate) enum Reflections<'a> {
++    Motion(&'a ID3D12Resource),
++    HitDistance {
++        distance: &'a ID3D12Resource,
++        world_to_view: &'a [f32; 16],
++        view_to_clip: &'a [f32; 16],
++    },
++}
++
++/// Current HDR and geometric guides from the same camera sample.
++pub(crate) struct Guides<'a> {
++    pub color: &'a ID3D12Resource,
++    pub depth: &'a ID3D12Resource,
++    pub depth_encoding: DepthEncoding,
++    pub motion: &'a ID3D12Resource,
++    pub diffuse_albedo: &'a ID3D12Resource,
++    pub specular_albedo: &'a ID3D12Resource,
++    pub normals_roughness: &'a ID3D12Resource,
++    pub reflections: Reflections<'a>,
++    /// Luminance of aligned post-DOF minus pre-DOF HDR. Zero outside blurred pixels.
++    pub depth_of_field: Option<&'a ID3D12Resource>,
++    pub output: &'a ID3D12Resource,
++}
++
++pub(crate) struct Frame {
++    pub jitter: [f32; 2],
++    pub motion_scale: [f32; 2],
++    pub frame_time_ms: f32,
++    pub pre_exposure: f32,
++    pub reset: bool,
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(crate) enum Error {
++    Invalid(&'static str),
++    Unavailable,
++    /// NGX may have recorded work. Discard the list rather than executing a second provider on it.
++    RecordingFailed(&'static str),
++}
++
++#[derive(Default)]
++struct Provider {
++    ngx: Option<Ngx>,
++    depth_encoding: Option<DepthEncoding>,
++    has_history: bool,
++    failed: bool,
++}
++
++// shortcut: one RR stream per process, add list retirement tracking before releasing the NGX objects.
++static PROVIDER: Mutex<Provider> = Mutex::new(Provider {
++    ngx: None,
++    depth_encoding: None,
++    has_history: false,
++    failed: false,
++});
++
++/// Record one RR frame on the host's direct list. The first evaluation resets history.
++///
++/// # Safety
++/// Inputs must contain the verified semantic guides described by their fields. They must be
++/// in NON_PIXEL_SHADER_RESOURCE state and the non-overlapping output must be in UAV state.
++/// The caller serializes submission in evaluation order and holds all textures until the work
++/// retires. Request a reset after a skipped frame, discarded list, or camera cut.
++pub(crate) unsafe fn record(
++    commands: &ID3D12GraphicsCommandList,
++    guides: &Guides<'_>,
++    frame: &Frame,
++) -> Result<(), Error> {
++    let device = external::host_device().ok_or(Error::Unavailable)?;
++    validate(&device, commands, guides, frame)?;
++    let mut provider = PROVIDER.lock().unwrap_or_else(|e| e.into_inner());
++    if provider.failed {
++        return Err(Error::Unavailable);
++    }
++    if provider
++        .depth_encoding
++        .is_some_and(|encoding| encoding != guides.depth_encoding)
++    {
++        return Err(Error::Invalid("RR depth encoding changed"));
++    }
++
++    if provider.ngx.is_none() {
++        if !initialize_nvapi() {
++            return Err(Error::Unavailable);
++        }
++        let params = capabilities_for(
++            &device,
++            "nvngx_dlssd.dll",
++            name!("SuperSamplingDenoising.Available"),
++        )
++        .ok_or(Error::Unavailable)?;
++        provider.ngx = Some(Ngx {
++            params,
++            feature: std::ptr::null_mut(),
++        });
++        provider.depth_encoding = Some(guides.depth_encoding);
++    }
++    let reset = frame.reset || !provider.has_history;
++    let ngx = provider.ngx.as_mut().unwrap();
++    if ngx.feature.is_null() {
++        let is_hw_depth = guides.depth_encoding == DepthEncoding::InvertedHardware;
++        let flags = FLAG_HDR | FLAG_MV_LOW_RES | if is_hw_depth { FLAG_DEPTH_INVERTED } else { 0 };
++        let feature = create_feature_for(
++            commands,
++            UHD,
++            ngx.params,
++            FEATURE_RAY_RECONSTRUCTION,
++            flags,
++            |params| {
++                // SAFETY: the shared create function holds the SDK lock and owns the parameter block.
++                unsafe {
++                    NVSDK_NGX_Parameter_SetI(params, name!("DLSS.Denoise.Mode"), 1);
++                    NVSDK_NGX_Parameter_SetUI(params, name!("DLSS.Roughness.Mode"), 1);
++                    NVSDK_NGX_Parameter_SetUI(
++                        params,
++                        name!("RayReconstruction.Hint.Render.Preset.UltraPerformance"),
++                        RR_PRESET_F,
++                    );
++                    NVSDK_NGX_Parameter_SetUI(
++                        params,
++                        name!("DLSS.Use.HW.Depth"),
++                        u32::from(is_hw_depth),
++                    );
++                }
++            },
++        );
++        let Some(feature) = feature else {
++            provider.failed = true;
++            return Err(Error::RecordingFailed("NGX RR feature creation"));
++        };
++        ngx.feature = feature;
++    }
++
++    let result = {
++        let _sdk = SDK.lock().unwrap_or_else(|e| e.into_inner());
++        let params = ngx.params;
++        // SAFETY: validation checked device, shapes, formats and distinct output. The caller
++        // guarantees matching guide semantics, states, recording order and GPU lifetime.
++        unsafe {
++            for (name, resource) in [
++                (name!("Color"), guides.color),
++                (name!("Depth"), guides.depth),
++                (name!("MotionVectors"), guides.motion),
++                (name!("DLSS.Input.DiffuseAlbedo"), guides.diffuse_albedo),
++                (name!("DLSS.Input.SpecularAlbedo"), guides.specular_albedo),
++                (name!("GBuffer.Normals"), guides.normals_roughness),
++                (name!("Output"), guides.output),
++            ] {
++                NVSDK_NGX_Parameter_SetD3d12Resource(params, name, resource.as_raw());
++            }
++            NVSDK_NGX_Parameter_SetD3d12Resource(
++                params,
++                name!("DLSSD.DepthOfFieldGuide"),
++                guides
++                    .depth_of_field
++                    .map_or(std::ptr::null_mut(), Interface::as_raw),
++            );
++            let (motion, distance, world_to_view, view_to_clip) = match guides.reflections {
++                Reflections::Motion(motion) => (
++                    motion.as_raw(),
++                    std::ptr::null_mut(),
++                    std::ptr::null::<c_void>(),
++                    std::ptr::null::<c_void>(),
++                ),
++                Reflections::HitDistance {
++                    distance,
++                    world_to_view,
++                    view_to_clip,
++                } => (
++                    std::ptr::null_mut(),
++                    distance.as_raw(),
++                    world_to_view.as_ptr().cast(),
++                    view_to_clip.as_ptr().cast(),
++                ),
++            };
++            NVSDK_NGX_Parameter_SetD3d12Resource(params, name!("GBuffer.SpecularMvec"), motion);
++            NVSDK_NGX_Parameter_SetD3d12Resource(
++                params,
++                name!("DLSSD.SpecularHitDistance"),
++                distance,
++            );
++            NVSDK_NGX_Parameter_SetVoidPointer(
++                params,
++                name!("WorldToViewMatrix"),
++                world_to_view.cast_mut(),
++            );
++            NVSDK_NGX_Parameter_SetVoidPointer(
++                params,
++                name!("ViewToClipMatrix"),
++                view_to_clip.cast_mut(),
++            );
++            for (name, value) in [
++                (name!("Jitter.Offset.X"), frame.jitter[0]),
++                (name!("Jitter.Offset.Y"), frame.jitter[1]),
++                (name!("MV.Scale.X"), frame.motion_scale[0]),
++                (name!("MV.Scale.Y"), frame.motion_scale[1]),
++                (name!("DLSS.Pre.Exposure"), frame.pre_exposure),
++                (name!("DLSS.Exposure.Scale"), 1.0),
++                (name!("FrameTimeDeltaInMsec"), frame.frame_time_ms),
++            ] {
++                NVSDK_NGX_Parameter_SetF(params, name, value);
++            }
++            NVSDK_NGX_Parameter_SetI(params, name!("Reset"), i32::from(reset));
++            NVSDK_NGX_Parameter_SetUI(
++                params,
++                name!("DLSS.Render.Subrect.Dimensions.Width"),
++                INPUT[0],
++            );
++            NVSDK_NGX_Parameter_SetUI(
++                params,
++                name!("DLSS.Render.Subrect.Dimensions.Height"),
++                INPUT[1],
++            );
++            let result = NVSDK_NGX_D3D12_EvaluateFeature_C(
++                commands.as_raw(),
++                ngx.feature,
++                params,
++                std::ptr::null(),
++            );
++            NVSDK_NGX_Parameter_SetVoidPointer(
++                params,
++                name!("WorldToViewMatrix"),
++                std::ptr::null_mut(),
++            );
++            NVSDK_NGX_Parameter_SetVoidPointer(
++                params,
++                name!("ViewToClipMatrix"),
++                std::ptr::null_mut(),
++            );
++            result
++        }
++    };
++    if result != SUCCESS {
++        tracing::warn!(result, "NGX RR evaluation failed");
++        provider.failed = true;
++        return Err(Error::RecordingFailed("NGX RR evaluation"));
++    }
++    provider.has_history = true;
++    Ok(())
++}
++
++fn validate(
++    device: &ID3D12Device,
++    commands: &ID3D12GraphicsCommandList,
++    guides: &Guides<'_>,
++    frame: &Frame,
++) -> Result<(), Error> {
++    validate_temporal(frame)?;
++    // SAFETY: command type and device are immutable properties of a live COM object.
++    if unsafe { commands.GetType() } != D3D12_COMMAND_LIST_TYPE_DIRECT
++        || !on_device(commands, device)
++    {
++        return Err(Error::Invalid(
++            "RR requires a direct list on the host device",
++        ));
++    }
++    let motion_formats = [DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R32G32_FLOAT];
++    let scalar_formats = [DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R32_FLOAT];
++    let rgba = [DXGI_FORMAT_R16G16B16A16_FLOAT];
++    let albedo = [DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R8G8B8A8_UNORM];
++    let (reflections, reflection_formats) = match guides.reflections {
++        Reflections::Motion(motion) => (motion, motion_formats),
++        Reflections::HitDistance {
++            distance,
++            world_to_view,
++            view_to_clip,
++        } => {
++            if !invertible(world_to_view) || !invertible(view_to_clip) {
++                return Err(Error::Invalid("invalid RR camera matrices"));
++            }
++            (distance, scalar_formats)
++        }
++    };
++
++    for (label, resource, formats) in [
++        ("RR HDR color", guides.color, rgba.as_slice()),
++        ("RR depth", guides.depth, &[DXGI_FORMAT_R32_FLOAT]),
++        ("RR motion", guides.motion, &motion_formats),
++        ("RR diffuse albedo", guides.diffuse_albedo, &albedo),
++        ("RR specular albedo", guides.specular_albedo, &albedo),
++        ("RR packed normals", guides.normals_roughness, &rgba),
++        ("RR reflections", reflections, &reflection_formats),
++    ]
++    .into_iter()
++    .chain(
++        guides
++            .depth_of_field
++            .map(|dof| ("RR depth of field guide", dof, &[DXGI_FORMAT_R16_FLOAT][..])),
++    ) {
++        // SAFETY: the descriptor is immutable and returned by value.
++        let desc = unsafe { resource.GetDesc() };
++        if !on_device(resource, device)
++            || resource.as_raw() == guides.output.as_raw()
++            || !texture_shape(&desc, INPUT, formats)
++            || desc
++                .Flags
++                .contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
++        {
++            return Err(Error::Invalid(label));
++        }
++    }
++
++    // SAFETY: the descriptor is immutable and returned by value.
++    let output = unsafe { guides.output.GetDesc() };
++    let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
++        Format: rgba[0],
++        ..Default::default()
++    };
++    // SAFETY: this is a writable format-support query with the matching type and size.
++    if !on_device(guides.output, device)
++        || !texture_shape(&output, UHD.output, &rgba)
++        || !output
++            .Flags
++            .contains(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS)
++        || unsafe {
++            device.CheckFeatureSupport(
++                D3D12_FEATURE_FORMAT_SUPPORT,
++                std::ptr::from_mut(&mut support).cast(),
++                size_of_val(&support) as u32,
++            )
++        }
++        .is_err()
++        || !support
++            .Support2
++            .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
++    {
++        return Err(Error::Invalid(
++            "RR output must be a distinct typed RGBA16F UAV",
++        ));
++    }
++    Ok(())
++}
++
++fn on_device(child: &ID3D12DeviceChild, device: &ID3D12Device) -> bool {
++    let mut actual = None::<ID3D12Device>;
++    // SAFETY: the out pointer is valid and uses the D3D12 device IID.
++    unsafe { child.GetDevice(&mut actual) }.is_ok()
++        && actual
++            .as_ref()
++            .is_some_and(|actual| actual.as_raw() == device.as_raw())
++}
++
++fn texture_shape(desc: &D3D12_RESOURCE_DESC, size: [u32; 2], formats: &[DXGI_FORMAT]) -> bool {
++    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        && desc.Width == u64::from(size[0])
++        && desc.Height == size[1]
++        && desc.DepthOrArraySize == 1
++        && desc.SampleDesc.Count == 1
++        && formats.contains(&desc.Format)
++}
++
++fn validate_temporal(frame: &Frame) -> Result<(), Error> {
++    if frame.jitter.iter().any(|v| !v.is_finite())
++        || frame
++            .motion_scale
++            .iter()
++            .any(|v| !v.is_finite() || *v == 0.0)
++        || [frame.pre_exposure, frame.frame_time_ms]
++            .iter()
++            .any(|v| !v.is_finite() || *v <= 0.0)
++    {
++        return Err(Error::Invalid(
++            "RR frame timing, exposure, jitter, or motion scale",
++        ));
++    }
++    Ok(())
++}
++
++fn invertible(matrix: &[f32; 16]) -> bool {
++    if matrix.iter().any(|v| !v.is_finite()) {
++        return false;
++    }
++    let mut rows = std::array::from_fn::<_, 4, _>(|row| {
++        std::array::from_fn::<_, 4, _>(|col| f64::from(matrix[row * 4 + col]))
++    });
++    for col in 0..4 {
++        let pivot = (col..4)
++            .max_by(|a, b| rows[*a][col].abs().total_cmp(&rows[*b][col].abs()))
++            .unwrap();
++        if rows[pivot][col] == 0.0 {
++            return false;
++        }
++        rows.swap(col, pivot);
++        let row = rows[col];
++        for next in &mut rows[col + 1..] {
++            let scale = next[col] / row[col];
++            for k in col + 1..4 {
++                next[k] -= scale * row[k];
++            }
++        }
++    }
++    true
++}
++
++#[cfg(test)]
++mod tests;
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs
+new file mode 100644
+index 0000000..2f767ed
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs
+@@ -0,0 +1,500 @@
++use super::*;
++
++const IDENTITY: [f32; 16] = [
++    1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0,
++];
++
++#[test]
++fn validates_exact_textures_and_temporal_data() {
++    let mut desc = D3D12_RESOURCE_DESC {
++        Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++        Width: INPUT[0].into(),
++        Height: INPUT[1],
++        DepthOrArraySize: 1,
++        SampleDesc: DXGI_SAMPLE_DESC {
++            Count: 1,
++            Quality: 0,
++        },
++        Format: DXGI_FORMAT_R16G16B16A16_FLOAT,
++        ..Default::default()
++    };
++    let formats = [DXGI_FORMAT_R16G16B16A16_FLOAT];
++    assert!(texture_shape(&desc, INPUT, &formats));
++    assert!(!texture_shape(&desc, UHD.output, &formats));
++    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    assert!(!texture_shape(&desc, INPUT, &formats));
++    let mut frame = Frame {
++        jitter: [0.0, 0.0],
++        motion_scale: [1.0, 1.0],
++        frame_time_ms: 17.0,
++        pre_exposure: 1.0,
++        reset: false,
++    };
++    assert_eq!(validate_temporal(&frame), Ok(()));
++    frame.jitter[0] = f32::NAN;
++    assert!(validate_temporal(&frame).is_err());
++    frame.jitter[0] = 0.0;
++    frame.motion_scale[1] = 0.0;
++    assert!(validate_temporal(&frame).is_err());
++
++    assert!(invertible(&IDENTITY));
++    assert!(!invertible(&[0.0; 16]));
++    let mut singular = IDENTITY;
++    singular[15] = 0.0;
++    assert!(!invertible(&singular));
++    singular[15] = f32::INFINITY;
++    assert!(!invertible(&singular));
++}
++
++fn allocate(
++    device: &ID3D12Device,
++    desc: &D3D12_RESOURCE_DESC,
++    heap: D3D12_HEAP_TYPE,
++    state: D3D12_RESOURCE_STATES,
++) -> ID3D12Resource {
++    let mut resource = None;
++    // SAFETY: descriptor and output pointer are live. The fixture holds each texture across the fence.
++    unsafe {
++        device
++            .CreateCommittedResource(
++                &D3D12_HEAP_PROPERTIES {
++                    Type: heap,
++                    CreationNodeMask: 1,
++                    VisibleNodeMask: 1,
++                    ..Default::default()
++                },
++                D3D12_HEAP_FLAG_NONE,
++                desc,
++                state,
++                None,
++                &mut resource,
++            )
++            .unwrap();
++    }
++    resource.unwrap()
++}
++
++fn transition(
++    list: &ID3D12GraphicsCommandList,
++    texture: &ID3D12Resource,
++    from: D3D12_RESOURCE_STATES,
++    to: D3D12_RESOURCE_STATES,
++) {
++    // SAFETY: this is a borrowed interface; the barrier's union does not release it.
++    let pResource = unsafe { std::mem::transmute_copy(texture) };
++    let barrier = D3D12_RESOURCE_BARRIER {
++        Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
++        Anonymous: D3D12_RESOURCE_BARRIER_0 {
++            Transition: std::mem::ManuallyDrop::new(D3D12_RESOURCE_TRANSITION_BARRIER {
++                pResource,
++                Subresource: D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
++                StateBefore: from,
++                StateAfter: to,
++            }),
++        },
++        ..Default::default()
++    };
++    // SAFETY: fixture owns this open list and tracks each texture state.
++    unsafe { list.ResourceBarrier(&[barrier]) };
++}
++
++#[link(name = "nvsdk_ngx_d", kind = "static")]
++unsafe extern "C" {
++    fn NVSDK_NGX_Parameter_GetD3d12Resource(
++        params: *mut c_void,
++        name: *const c_char,
++        out: *mut *mut c_void,
++    ) -> NgxResult;
++}
++
++fn reset_provider() {
++    let mut provider = PROVIDER.lock().unwrap();
++    let _sdk = SDK.lock().unwrap();
++    if let Some(ngx) = provider.ngx.take() {
++        // SAFETY: fixture fully fenced the last and only use of this feature.
++        unsafe {
++            assert_eq!(NVSDK_NGX_D3D12_ReleaseFeature(ngx.feature), SUCCESS);
++            assert_eq!(NVSDK_NGX_D3D12_DestroyParameters(ngx.params), SUCCESS);
++        }
++    }
++    *provider = Provider::default();
++}
++
++#[test]
++#[ignore = "requires RTX hardware with signed NGX and dxvk-nvapi"]
++fn renderer_rr_reads_back_reset_and_history() {
++    use windows::Win32::Foundation::{HANDLE, RECT};
++    use windows_sys::Win32::{
++        Foundation::{CloseHandle, WAIT_OBJECT_0},
++        System::Threading::{CreateEventW, WaitForSingleObject},
++    };
++
++    const READ: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++    const UAV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++    const RTV: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    const COPY: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    const RGBA: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    const SCALAR: DXGI_FORMAT = DXGI_FORMAT_R32_FLOAT;
++    const PAIR: DXGI_FORMAT = DXGI_FORMAT_R32G32_FLOAT;
++    const SAMPLES: [(u32, u32); 8] = [
++        (700, 550),
++        (2950, 550),
++        (670, 1450),
++        (2900, 1450),
++        (1860, 1000),
++        (1910, 1000),
++        (1930, 1000),
++        (1980, 1000),
++    ];
++
++    let device = external::host_device().expect("renderer D3D12 host");
++    assert!(initialize_nvapi());
++    let sr = capabilities(&device).expect("SR capabilities in a separate map");
++    // SAFETY: isolated test installs a dedicated direct queue and never shares its lists.
++    unsafe {
++        let queue: ID3D12CommandQueue = device
++            .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
++                Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
++                ..Default::default()
++            })
++            .unwrap();
++        let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
++        let event = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
++        assert!(!event.is_null());
++        let tex = |size: [u32; 2], format, flags| {
++            allocate(
++                &device,
++                &D3D12_RESOURCE_DESC {
++                    Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++                    Width: size[0].into(),
++                    Height: size[1],
++                    DepthOrArraySize: 1,
++                    MipLevels: 1,
++                    Format: format,
++                    SampleDesc: DXGI_SAMPLE_DESC {
++                        Count: 1,
++                        Quality: 0,
++                    },
++                    Flags: D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | flags,
++                    ..Default::default()
++                },
++                D3D12_HEAP_TYPE_DEFAULT,
++                RTV,
++            )
++        };
++        let input = |format| tex(INPUT, format, D3D12_RESOURCE_FLAG_NONE);
++        let textures = [
++            input(RGBA),
++            input(SCALAR),
++            input(PAIR),
++            input(RGBA),
++            input(RGBA),
++            input(RGBA),
++            input(PAIR),
++            input(SCALAR),
++            input(DXGI_FORMAT_R16_FLOAT),
++            tex(UHD.output, RGBA, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS),
++        ];
++        let views: ID3D12DescriptorHeap = device
++            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
++                NumDescriptors: textures.len() as u32,
++                ..Default::default()
++            })
++            .unwrap();
++        let base = views.GetCPUDescriptorHandleForHeapStart().ptr;
++        let stride =
++            device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize;
++        let handle = |i| D3D12_CPU_DESCRIPTOR_HANDLE {
++            ptr: base + i * stride,
++        };
++        for (i, texture) in textures.iter().enumerate() {
++            device.CreateRenderTargetView(texture, None, handle(i));
++        }
++        let readback = allocate(
++            &device,
++            &D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                Width: (SAMPLES.len() * 512) as u64,
++                Height: 1,
++                MipLevels: 1,
++                DepthOrArraySize: 1,
++                SampleDesc: DXGI_SAMPLE_DESC {
++                    Count: 1,
++                    Quality: 0,
++                },
++                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                ..Default::default()
++            },
++            D3D12_HEAP_TYPE_READBACK,
++            D3D12_RESOURCE_STATE_COPY_DEST,
++        );
++        let [
++            color,
++            depth,
++            motion,
++            diffuse,
++            specular,
++            normals,
++            reflected_motion,
++            hit,
++            dof,
++            output,
++        ] = &textures;
++        let projection = [
++            1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.001, 1.0, 0.0, 0.0, -0.1001, 0.0,
++        ];
++        let mut previous = [0; SAMPLES.len()];
++        const ARM_FRAMES: usize = 4;
++        const PASSES: usize = 3 + 4 * ARM_FRAMES;
++        let mut arms = [[[0u16; SAMPLES.len()]; ARM_FRAMES]; 4];
++        for pass in 0..PASSES {
++            let experiment = pass
++                .checked_sub(3)
++                .map(|offset| (offset / ARM_FRAMES, offset % ARM_FRAMES));
++            if experiment.is_some_and(|(_, frame)| frame == 0) {
++                reset_provider();
++            }
++            let allocator: ID3D12CommandAllocator = device
++                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
++                .unwrap();
++            let list: ID3D12GraphicsCommandList = device
++                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
++                .unwrap();
++            let scene = pass.min(2);
++            let episode_frame = experiment.map_or(0, |(_, frame)| frame);
++            let red = 0.25 + scene as f32 * 0.17 + episode_frame as f32 * 0.08;
++            let left = [red, 0.1, 0.1, 1.0];
++            let right = [0.05, if scene == 2 { 1.25 } else { 0.2 }, red, 1.0];
++            let values = [
++                left,
++                [2.0, 0.0, 0.0, 0.0],
++                [0.0; 4],
++                [0.7, 0.2, 0.15, 1.0],
++                [0.04, 0.04, 0.04, 1.0],
++                [0.0, 0.0, -1.0, 0.4],
++                [0.0; 4],
++                [3.0, 0.0, 0.0, 0.0],
++                [0.0; 4],
++                [-8.0; 4],
++            ];
++            for (i, (texture, value)) in textures.iter().zip(values).enumerate() {
++                let state = if i + 1 == textures.len() { UAV } else { READ };
++                if pass != 0 {
++                    transition(&list, texture, state, RTV);
++                }
++                list.ClearRenderTargetView(handle(i), &value, None);
++                if i == 0 {
++                    list.ClearRenderTargetView(
++                        handle(i),
++                        &right,
++                        Some(&[RECT {
++                            left: 640,
++                            top: 0,
++                            right: 1280,
++                            bottom: 720,
++                        }]),
++                    );
++                }
++                if scene == 2 && (i == 0 || texture.as_raw() == dof.as_raw()) {
++                    for (start, end, original, neighbor) in
++                        [(616, 640, left, right), (640, 664, right, left)]
++                    {
++                        let factor = 0.125 * (episode_frame as f32 + 1.0);
++                        let blurred = std::array::from_fn(|c| {
++                            (1.0 - factor) * original[c] + factor * neighbor[c]
++                        });
++                        let [r, g, b, _] = std::array::from_fn(|c| blurred[c] - original[c]);
++                        let value = if i == 0 {
++                            blurred
++                        } else if experiment.is_some_and(|(arm, _)| arm == 2) {
++                            [(r + 2.0 * g + b) / 4.0, 0.0, 0.0, 0.0]
++                        } else {
++                            [0.0; 4]
++                        };
++                        list.ClearRenderTargetView(
++                            handle(i),
++                            &value,
++                            Some(&[RECT {
++                                left: start,
++                                top: 0,
++                                right: end,
++                                bottom: 720,
++                            }]),
++                        );
++                    }
++                }
++                transition(&list, texture, RTV, state);
++            }
++
++            let reflections = if scene == 2 {
++                Reflections::HitDistance {
++                    distance: hit,
++                    world_to_view: &IDENTITY,
++                    view_to_clip: &projection,
++                }
++            } else {
++                Reflections::Motion(reflected_motion)
++            };
++            let frame = Frame {
++                jitter: [0.25 * (scene as f32 - 1.0), -0.16],
++                motion_scale: [1.0, 1.0],
++                frame_time_ms: 16.67,
++                pre_exposure: 1.0,
++                reset: pass == 2 || experiment.is_some_and(|(_, frame)| frame == 0),
++            };
++            let mut guides = Guides {
++                color,
++                depth,
++                depth_encoding: DepthEncoding::LinearView,
++                motion,
++                diffuse_albedo: diffuse,
++                specular_albedo: specular,
++                normals_roughness: normals,
++                reflections,
++                depth_of_field: experiment
++                    .is_some_and(|(arm, frame)| (arm == 1 || arm == 2) && frame < ARM_FRAMES - 1)
++                    .then_some(dof),
++                output,
++            };
++            if pass == 0 {
++                guides.output = color;
++                assert!(matches!(
++                    record(&list, &guides, &frame),
++                    Err(Error::Invalid(_))
++                ));
++                guides.output = output;
++                guides.depth_of_field = Some(hit);
++                assert_eq!(
++                    record(&list, &guides, &frame),
++                    Err(Error::Invalid("RR depth of field guide"))
++                );
++                guides.depth_of_field = None;
++            }
++            record(&list, &guides, &frame).expect("record actual Ray Reconstruction");
++            {
++                let provider = PROVIDER.lock().unwrap();
++                let _sdk = SDK.lock().unwrap();
++                let mut bound = std::ptr::null_mut();
++                let query = NVSDK_NGX_Parameter_GetD3d12Resource(
++                    provider.ngx.as_ref().unwrap().params,
++                    name!("DLSSD.DepthOfFieldGuide"),
++                    &mut bound,
++                );
++                if guides.depth_of_field.is_some() {
++                    assert_eq!(query, SUCCESS, "DOF guide parameter lookup");
++                    assert_eq!(bound, dof.as_raw(), "bound DOF guide pointer");
++                } else {
++                    assert!(bound.is_null(), "omitted DOF guide parameter still bound");
++                }
++            }
++            transition(&list, output, UAV, COPY);
++            let src = D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(output),
++                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                    SubresourceIndex: 0,
++                },
++            };
++            for (index, (x, y)) in SAMPLES.into_iter().enumerate() {
++                let dst = D3D12_TEXTURE_COPY_LOCATION {
++                    pResource: std::mem::transmute_copy(&readback),
++                    Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++                    Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                        PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                            Offset: 512 * index as u64,
++                            Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                                Format: RGBA,
++                                Width: 1,
++                                Height: 1,
++                                Depth: 1,
++                                RowPitch: 256,
++                            },
++                        },
++                    },
++                };
++                list.CopyTextureRegion(
++                    &dst,
++                    0,
++                    0,
++                    0,
++                    &src,
++                    Some(&D3D12_BOX {
++                        left: x,
++                        top: y,
++                        front: 0,
++                        right: x + 1,
++                        bottom: y + 1,
++                        back: 1,
++                    }),
++                );
++            }
++            transition(&list, output, COPY, UAV);
++            list.Close().unwrap();
++            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
++            let value = pass as u64 + 1;
++            queue.Signal(&fence, value).unwrap();
++            fence.SetEventOnCompletion(value, HANDLE(event)).unwrap();
++            let wait = WaitForSingleObject(event, 45_000);
++            assert_eq!(wait, WAIT_OBJECT_0, "GPU wait pass {pass}");
++            device.GetDeviceRemovedReason().unwrap();
++            let completed = fence.GetCompletedValue();
++            assert_eq!(completed, value);
++            let mut ptr = std::ptr::null_mut();
++            readback.Map(0, None, Some(&mut ptr)).unwrap();
++            let pixels = std::array::from_fn(|i| ptr.cast::<u16>().add(256 * i).read());
++            readback.Unmap(0, None);
++            eprintln!(
++                "renderer RR pass={pass} dof={} completed={completed} red16={pixels:04x?}",
++                guides.depth_of_field.is_some()
++            );
++            assert!(pixels.iter().all(|p| (1..0x7c00).contains(p)));
++            assert_ne!(pixels[0], pixels[1], "different synthetic surfaces");
++            if pass < 3 {
++                assert_ne!(pixels, previous, "frame output must change");
++            }
++            if let Some((arm, frame)) = experiment {
++                arms[arm][frame] = pixels;
++            }
++            previous = pixels;
++        }
++        let distance = |arm: usize, other: usize| -> u16 {
++            (0..ARM_FRAMES - 1)
++                .flat_map(|frame| arms[arm][frame][4..].iter().zip(&arms[other][frame][4..]))
++                .map(|(a, b)| a.abs_diff(*b))
++                .max()
++                .unwrap()
++        };
++        let repeat = distance(0, 3);
++        let zero = distance(0, 1);
++        let guide = distance(0, 2);
++        let against_zero = distance(1, 2);
++        eprintln!(
++            "DOF edge max half-ULP absent_repeat={repeat} zero_vs_absent={zero} guide_vs_absent={guide} guide_vs_zero={against_zero}"
++        );
++        assert_ne!(PROVIDER.lock().unwrap().ngx.as_ref().unwrap().params, sr);
++        let allocator: ID3D12CommandAllocator = device
++            .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
++            .unwrap();
++        let list: ID3D12GraphicsCommandList = device
++            .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
++            .unwrap();
++        let sr_feature = create_feature(&list, UHD, sr).expect("SR can create alongside RR");
++        assert_ne!(
++            PROVIDER.lock().unwrap().ngx.as_ref().unwrap().feature,
++            sr_feature
++        );
++        list.Close().unwrap();
++        queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
++        let sr_fence = PASSES as u64 + 1;
++        queue.Signal(&fence, sr_fence).unwrap();
++        fence.SetEventOnCompletion(sr_fence, HANDLE(event)).unwrap();
++        assert_eq!(WaitForSingleObject(event, 45_000), WAIT_OBJECT_0);
++        assert_eq!(fence.GetCompletedValue(), sr_fence);
++        device.GetDeviceRemovedReason().unwrap();
++        let _sdk = SDK.lock().unwrap();
++        assert_eq!(NVSDK_NGX_D3D12_ReleaseFeature(sr_feature), SUCCESS);
++        assert_eq!(NVSDK_NGX_D3D12_DestroyParameters(sr), SUCCESS);
++        assert_ne!(CloseHandle(event), 0);
++    }
++}

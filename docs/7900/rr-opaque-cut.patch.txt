@@ -1,0 +1,2115 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 696c191..27e7470 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -38,7 +38,7 @@ use crate::object::This;
+ use crate::pipeline::host::HostPipeline;
+
+ pub(crate) mod rr_camera;
+-mod opaque_current;
++pub(crate) mod opaque_current;
+
+ /// Shader interface metadata shared by every pipeline variant and draw.
+ pub(crate) struct TablePlan {
+@@ -3060,7 +3060,7 @@ impl State {
+         #[cfg(feature = "diagnostics")]
+         material_guides::after(self, list, p, material_witness);
+         #[cfg(feature = "diagnostics")]
+-        let _ = background_snapshot::after_apply(self, list, p);
++        let _ = background_snapshot::after_apply(self, list, p, [x, y, z]);
+         self.buffers_written();
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+         if let Some(role) = p.stages.first().and_then(|s| s.shader.ambient)
+diff --git a/crates/victory-gpu/src/draw/background_snapshot.rs b/crates/victory-gpu/src/draw/background_snapshot.rs
+index c95a283..25ee0ca 100644
+--- a/crates/victory-gpu/src/draw/background_snapshot.rs
++++ b/crates/victory-gpu/src/draw/background_snapshot.rs
+@@ -163,8 +163,19 @@ fn table(state: &State, compute: bool, offset: u32) -> Option<View> {
+     crate::descriptor::diagnostic_view(state.heaps[0], *base, offset)
+ }
+
+-pub(super) fn after_apply(state: &State, list: &HostList, pipeline: &HostPipeline) -> Option<()> {
+-    if !pipeline.compute || pipeline.stages.first()?.shader.hash != APPLY || !recording(list) {
++pub(super) fn after_apply(
++    state: &State,
++    list: &HostList,
++    pipeline: &HostPipeline,
++    groups: [u32; 3],
++) -> Option<()> {
++    let stage = pipeline.stages.first()?;
++    if !pipeline.compute
++        || stage.shader.hash != APPLY
++        || groups != [160, 90, 1]
++        || stage.translated().threads != Some([8, 8, 1])
++        || !recording(list)
++    {
+         return None;
+     }
+     let View::Unordered(color, 0, _) = table(state, true, 48)? else {
+@@ -412,7 +423,7 @@ pub(crate) fn submitted(runs: &[&HostList], submission: u64) -> Option<RrBackgro
+ static RETIRED: Mutex<Option<RrBackgroundSnapshot>> = Mutex::new(None);
+
+ impl RrBackgroundSnapshot {
+-    fn submitted_once(&self) -> bool {
++    pub(super) fn submitted_once(&self) -> bool {
+         self.submission_marks
+             .iter()
+             .all(|mark| mark.load(Ordering::Acquire) == self.key.submission)
+diff --git a/crates/victory-gpu/src/draw/opaque_current.rs b/crates/victory-gpu/src/draw/opaque_current.rs
+index 85147ed..38510d0 100644
+--- a/crates/victory-gpu/src/draw/opaque_current.rs
++++ b/crates/victory-gpu/src/draw/opaque_current.rs
+@@ -11,14 +11,60 @@ pub(super) const CBV_DWORDS: u32 = 1032;
+ pub(super) const CBV_BYTES: u32 = 832;
+ const HISTORY_OFFSET: usize = 628;
+
++#[cfg(feature = "diagnostics")]
++pub(crate) const NATIVE: u8 = 0;
++#[cfg(feature = "diagnostics")]
++pub(crate) const RESET_NATIVE: u8 = 1;
++#[cfg(feature = "diagnostics")]
++pub(crate) const CUT: u8 = 2;
++
++pub(crate) fn atomic_enabled() -> bool {
++    #[cfg(feature = "diagnostics")]
++    {
++        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        *ENABLED.get_or_init(|| {
++            let flag = |name| std::env::var_os(name).is_some_and(|v| v == "1");
++            flag("VICTORY_RR_ATOMIC_CUT")
++                && flag("VICTORY_RR_EARLY_SOURCE")
++                && super::rr_display::enabled()
++        })
++    }
++    #[cfg(not(feature = "diagnostics"))]
++    {
++        false
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++#[derive(Clone, Copy, Debug)]
++pub(crate) struct CutPair {
++    pub depth: u64,
++    pub motion: u64,
++    pub history: u64,
++    pub packed: u64,
++}
++
++#[cfg(feature = "diagnostics")]
++#[derive(Default)]
++pub(crate) struct CutRecord {
++    pub mode: Arc<std::sync::atomic::AtomicU8>,
++    pub constants: usize,
++    pub pairs: usize,
++    pub pair: Option<CutPair>,
++    pub submitted: bool,
++}
++
+ pub(super) fn enabled() -> bool {
+     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_OPAQUE_CURRENT").is_some_and(|v| v == "1"))
++    atomic_enabled()
++        || *ENABLED
++            .get_or_init(|| std::env::var_os("VICTORY_OPAQUE_CURRENT").is_some_and(|v| v == "1"))
+ }
+
+ fn cut_enabled() -> bool {
+     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+-    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_OPAQUE_CUT").is_some_and(|v| v == "1"))
++    atomic_enabled()
++        || *ENABLED.get_or_init(|| std::env::var_os("VICTORY_OPAQUE_CUT").is_some_and(|v| v == "1"))
+ }
+
+ fn select(hash: &str, kind: u32, max: u32) -> bool {
+@@ -134,8 +180,23 @@ pub(super) fn defer_constants(
+     // This one fill stays on the CPU so the subsequent ordered host step can
+     // edit its private copy before the GPU reaches the bound descriptor.
+     list.defer_fill(dst, src as *const u8, CBV_BYTES as usize);
++    #[cfg(feature = "diagnostics")]
++    let native_choice = if !alpha && atomic_enabled() {
++        let mut record = list.rr_opaque_cut();
++        record.constants += 1;
++        Some(record.mode.clone())
++    } else {
++        None
++    };
+     let address = dst as usize;
+     list.defer_host(move || {
++        #[cfg(feature = "diagnostics")]
++        if native_choice
++            .as_ref()
++            .is_some_and(|mode| mode.load(Ordering::Acquire) == NATIVE)
++        {
++            return;
++        }
+         // SAFETY: scratch_held allocated these private bytes. The preceding fill
+         // is complete, and the list's GPU execution has yet to read this binding.
+         let bytes =
+@@ -186,6 +247,8 @@ struct Temporal {
+     args: u64,
+     tiles: u64,
+     applied: Arc<AtomicBool>,
++    #[cfg(feature = "diagnostics")]
++    cut: Option<CutPair>,
+ }
+
+ struct Bilateral {
+@@ -209,13 +272,22 @@ impl Gate {
+         let paired = Arc::new(AtomicBool::new(false));
+         let complete = paired.clone();
+         let address = data as usize;
++        #[cfg(feature = "diagnostics")]
++        let native_choice = atomic_enabled().then(|| list.rr_opaque_cut().mode.clone());
+         let published = AtomicBool::new(false);
+         list.defer_host(move || {
+             if !published.swap(true, Ordering::AcqRel) {
+-                let count = command_count(
+-                    complete.load(Ordering::Acquire),
++                let paired = complete.load(Ordering::Acquire);
++                #[cfg(feature = "diagnostics")]
++                let count = native_command_count(
++                    paired,
+                     applied.load(Ordering::Acquire),
++                    native_choice
++                        .as_ref()
++                        .map(|choice| choice.load(Ordering::Acquire)),
+                 );
++                #[cfg(not(feature = "diagnostics"))]
++                let count = command_count(paired, applied.load(Ordering::Acquire));
+                 let cut = count == 0;
+                 // SAFETY: 4 aligned bytes of private upload storage, before first submission.
+                 unsafe { (address as *mut u32).write(count) };
+@@ -316,6 +388,12 @@ impl State {
+                     return None;
+                 }
+                 bilateral.gate.paired.store(true, Ordering::Release);
++                #[cfg(feature = "diagnostics")]
++                if atomic_enabled() {
++                    let mut record = list.rr_opaque_cut();
++                    record.pairs += 1;
++                    record.pair = temporal.cut;
++                }
+                 Some(bilateral.gate)
+             }
+             _ => None,
+@@ -330,6 +408,40 @@ impl State {
+             args: self.opaque_buffer(112, true, 32)?,
+             tiles: self.opaque_buffer(120, true, 57_600)?,
+             applied,
++            #[cfg(feature = "diagnostics")]
++            cut: atomic_enabled().then(|| self.atomic_pair()).flatten(),
++        })
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn atomic_pair(&self) -> Option<CutPair> {
++        use crate::resource::{alias_of, made_copy};
++        let serial = |title: usize| {
++            made_copy(title as This)
++                .map(|copy| copy.serial)
++                .filter(|&serial| serial != 0)
++        };
++        let read = |slot, dwords| match self.opaque_view(slot, dwords)? {
++            View::Shader(title, _) => Some(title),
++            _ => None,
++        };
++        let history = match self.opaque_view(1, 64)? {
++            View::Shader(title, _) => title,
++            placed @ View::Placed(false, _, _) => {
++                let View::Shader(title, _) = crate::descriptor::host::placed_texture(&placed)?
++                else {
++                    return None;
++                };
++                title
++            }
++            _ => return None,
++        };
++        let history = alias_of(history as This)? as usize;
++        Some(CutPair {
++            depth: serial(read(0, 752)?)?,
++            motion: serial(read(0, 528)?)?,
++            history: serial(history)?,
++            packed: serial(self.opaque_texture(128, true, 42)?)?,
+         })
+     }
+
+@@ -357,6 +469,140 @@ fn command_count(paired: bool, current: bool) -> u32 {
+     u32::from(!(paired && current))
+ }
+
++#[cfg(feature = "diagnostics")]
++fn native_command_count(paired: bool, applied: bool, mode: Option<u8>) -> u32 {
++    command_count(paired && mode.is_none_or(|mode| mode == CUT), applied)
++}
++
++#[cfg(feature = "diagnostics")]
++fn fallback_mode(dirty: &[u64], history: u64) -> u8 {
++    if history != 0 && dirty.contains(&history) {
++        RESET_NATIVE
++    } else {
++        NATIVE
++    }
++}
++
++#[cfg(all(test, feature = "diagnostics"))]
++#[test]
++fn only_adoption_cuts_and_native_history_reset_keeps_both_filters() {
++    assert_eq!(fallback_mode(&[0, 7], 11), NATIVE);
++    assert_eq!(fallback_mode(&[0, 7], 0), NATIVE);
++    let restore = fallback_mode(&[0, 7], 7);
++    assert_eq!(restore, RESET_NATIVE);
++    assert_eq!(native_command_count(true, true, Some(NATIVE)), 1);
++    assert_eq!(native_command_count(true, true, Some(restore)), 1);
++    assert_eq!(native_command_count(false, true, Some(CUT)), 1);
++    assert_eq!(native_command_count(true, false, Some(CUT)), 1);
++    assert_eq!(native_command_count(true, true, Some(CUT)), 0);
++    assert_eq!(native_command_count(true, true, None), 0);
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) fn choose_before_deferred(
++    host: &crate::host::Host,
++    runs: &[&HostList],
++    sequence: u64,
++    future: Option<crate::queue::ClosedFuture>,
++    source: Option<&super::reflection_dense::Source>,
++) {
++    if !atomic_enabled() {
++        return;
++    }
++    // A cut may leave one packed native history without its stock update.
++    // Retain the exact dirty backing IDs conservatively until another
++    // ownership path can prove stock writes. A full set disables new cuts.
++    static DIRTY: std::sync::Mutex<[u64; 16]> = std::sync::Mutex::new([0; 16]);
++    let mut dirty = DIRTY.lock().unwrap_or_else(|e| e.into_inner());
++    let mut eligible = None;
++    let mut count = 0;
++    for list in runs {
++        let mut record = list.rr_opaque_cut();
++        if record.constants == 0 {
++            continue;
++        }
++        count += 1;
++        if record.submitted {
++            if record.mode.load(Ordering::Acquire) != NATIVE {
++                crate::host::fail(format_args!(
++                    "a conditional opaque recording was submitted twice"
++                ));
++            }
++            continue;
++        }
++        record.submitted = true;
++        let Some(pair) = record
++            .pair
++            .filter(|_| record.constants == 1 && record.pairs == 1)
++        else {
++            continue;
++        };
++        let fallback = fallback_mode(&*dirty, pair.history);
++        if fallback == RESET_NATIVE {
++            record.mode.store(fallback, Ordering::Release);
++            tracing::info!(
++                sequence,
++                history = pair.history,
++                packed = pair.packed,
++                "RR opaque native history reset with full filters"
++            );
++        }
++        eligible = Some((pair, record.mode.clone()));
++    }
++    let (1, Some((pair, mode)), Some(future), Some(source)) = (count, eligible, future, source)
++    else {
++        return;
++    };
++    let Some(free) = dirty
++        .iter()
++        .position(|&id| id == pair.packed)
++        .or_else(|| dirty.iter().position(|&id| id == 0))
++    else {
++        return;
++    };
++    if pair.depth != future.packet.serials[1] || pair.motion != future.packet.serials[2] {
++        return;
++    }
++    // Type the exact source lists before committing the closed future slot.
++    if runs
++        .iter()
++        .any(|list| list.list.cast::<ID3D12CommandList>().is_err())
++    {
++        return;
++    }
++    let prepared = match super::rr_display::prepare_early(
++        host,
++        &future.request,
++        future.packet,
++        future.camera,
++        source,
++        sequence,
++    ) {
++        Ok(prepared) => prepared,
++        Err(reason) => {
++            tracing::info!(
++                sequence,
++                begun = future.packet.begun,
++                reason,
++                "RR early choice kept native"
++            );
++            return;
++        }
++    };
++    if future.request.adopt(prepared) {
++        dirty[free] = pair.packed;
++        mode.store(CUT, Ordering::Release);
++        tracing::info!(
++            sequence,
++            begun = future.packet.begun,
++            slot_epoch = future.packet.slot_epoch,
++            history = pair.history,
++            packed = pair.packed,
++            "RR adopted closed future slot before opaque cutoff"
++        );
++    }
++}
++
+ #[test]
+ fn defaults_to_native_filters_until_pair_and_override_are_ready() {
+     assert_eq!(command_count(false, false), 1);
+diff --git a/crates/victory-gpu/src/draw/reflection_capture.rs b/crates/victory-gpu/src/draw/reflection_capture.rs
+index 8bdc519..7ed8bcc 100644
+--- a/crates/victory-gpu/src/draw/reflection_capture.rs
++++ b/crates/victory-gpu/src/draw/reflection_capture.rs
+@@ -531,9 +531,39 @@ impl Readback {
+
+ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Option<Readback> {
+     let frame = crate::queue::presented() + 1;
+-    if !crate::rr_window::selected(frame, Some(requested_frame()?)) {
++    // Recording already scoped these events to the requested window. The title
++    // may advance Present while this ordered producer batch waits to submit.
++    if !super::rr_display::enabled() && !crate::rr_window::selected(frame, Some(requested_frame()?)) {
+         return None;
+     }
++    record_source(host, runs, sequence, frame, None)
++}
++
++pub(crate) fn early_identity(runs: &[&HostList]) -> Option<(u64, [u64; 2])> {
++    let mut keys = runs.iter().flat_map(|list| list.reflection_capture_events()).filter_map(|event| {
++        let Event::Prepass { depth, primary: Some(primary), .. } = event else { return None };
++        Some((primary.begun, [depth, primary.motion_serial]))
++    });
++    let key = keys.next()?;
++    keys.next().is_none().then_some(key)
++}
++
++pub(crate) fn stage_early(host: &Host, runs: &[&HostList], sequence: u64, packet: super::rr_display::Packet) -> Option<Readback> {
++    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*ENABLED.get_or_init(|| std::env::var_os("VICTORY_RR_EARLY_SOURCE").is_some_and(|v| v == "1"))
++        || !super::rr_display::enabled()
++    {
++        return None;
++    }
++    let planned = record_source(host, runs, sequence, crate::queue::presented() + 1, Some(packet))?;
++    tracing::info!(sequence, begun = packet.begun, prefix_epoch = packet.prefix_epoch,
++        slot_epoch = packet.slot_epoch, output_serial = packet.output_serial,
++        "RR exact source staged before deferred closures");
++    Some(planned)
++}
++
++fn record_source(host: &Host, runs: &[&HostList], sequence: u64, frame: u64,
++    future: Option<super::rr_display::Packet>) -> Option<Readback> {
+     let events: Vec<_> = runs
+         .iter()
+         .flat_map(|list| list.reflection_capture_events())
+@@ -645,7 +675,6 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+             list.list.barriers(&[transition(&kinds, COPY, READ)]);
+         }
+     }
+-    list.close();
+     let dense = primary.as_ref().and_then(|primary| {
+         super::reflection_dense::source(
+             runs,
+@@ -660,6 +689,15 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+             snapshots.distance_at_resolve,
+         )
+     });
++    if let Some(packet) = future {
++        if !dense.as_ref().is_some_and(|source| source.matches_closed_future(packet))
++            || !list.try_close_rr_section()
++        {
++            return None;
++        }
++    } else {
++        list.close();
++    }
+     Some(Readback {
+         list,
+         buffer,
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index 551fb8c..c3fc2c3 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -76,6 +76,26 @@ pub(crate) struct Source {
+     material: RrMaterialCandidates,
+ }
+
++impl Source {
++    pub(crate) fn matches_closed_future(&self, packet: super::rr_display::Packet) -> bool {
++        // The queue owns the future packet. Translators can stamp the
++        // source after the future prefix even when it executes first.
++        self.primary.begun == packet.begun
++            && self.depth_serial == packet.serials[1]
++            && self.primary.motion_serial == packet.serials[2]
++            && matching_projection(self.camera, packet.projection.map(f32::from_bits))
++    }
++
++    pub(crate) fn witness_cut(&self, before_deferred: u64) {
++        tracing::info!(
++            submit = self.submission, begun = self.primary.begun, prepass_epoch = self.primary.epoch,
++            occurrence = self.material.key.occurrence, depth = self.depth_serial,
++            motion = self.primary.motion_serial, before_deferred,
++            "RR order exact opaque source reached cut boundary"
++        );
++    }
++}
++
+ pub(super) fn source(
+     runs: &[&HostList],
+     primary: &Primary,
+@@ -155,29 +175,43 @@ fn matching_projection(native: [u32; 16], expected: [f32; 16]) -> bool {
+         .all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-5 * a.abs().max(1.0))
+ }
+
+-// The title records ahead of its submission worker. Pair current/previous
+-// successful SR commands where the host serializes their actual submissions.
+-fn accept_camera(current: &Camera, sequence: u64) -> Option<([f32; 16], RrShadowCameraStamp)> {
+-    static ACCEPTED: Mutex<Option<(Camera, u64)>> = Mutex::new(None);
+-    let mut accepted = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
+-    let previous = accepted.take();
+-    let adjacent = previous.filter(|(camera, submitted)| {
++static ACCEPTED: Mutex<Option<(Camera, u64)>> = Mutex::new(None);
++
++fn previous(
++    current: &Camera,
++    sequence: u64,
++    prior: Option<&(Camera, u64)>,
++) -> Option<([f32; 16], RrShadowCameraStamp)> {
++    let (prior, submission) = prior.filter(|(camera, submitted)| {
+         !current.reset_requested
+             && *submitted < sequence
+             && camera.stream == current.stream
+             && camera.begun.checked_add(1) == Some(current.begun)
+             && camera.epoch < current.epoch
+-    });
+-    *accepted = Some((current.clone(), sequence));
+-    let (prior, submission) = adjacent?;
++    })?;
+     let clip = crate::rr_history::previous_clip(&prior.native, current.native.origin)?;
+     Some((clip, RrShadowCameraStamp {
+         begun: prior.begun,
+         epoch: prior.epoch,
+-        submission,
++        submission: *submission,
+     }))
+ }
+
++// The title records ahead of its submission worker. Only the actual FFX
++// submission may advance the observation of the previous title camera.
++fn accept_camera(current: &Camera, sequence: u64) -> Option<([f32; 16], RrShadowCameraStamp)> {
++    let mut accepted = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
++    let previous = previous(current, sequence, accepted.as_ref());
++    *accepted = Some((current.clone(), sequence));
++    previous
++}
++
++pub(super) fn early_camera(camera: Camera, source_submission: u64) -> NativeCamera {
++    let accepted = ACCEPTED.lock().unwrap_or_else(|error| error.into_inner());
++    let previous = previous(&camera, source_submission, accepted.as_ref());
++    NativeCamera { camera, previous }
++}
++
+ fn ordered_source(camera: &Camera, sequence: u64) -> Result<Source, &'static str> {
+     let mut stored = SOURCE.lock().unwrap_or_else(|error| error.into_inner());
+     let source = stored.as_ref().ok_or("no earlier opaque material and reflection producer group")?;
+@@ -186,7 +220,6 @@ fn ordered_source(camera: &Camera, sequence: u64) -> Result<Source, &'static str
+         return Err("older opaque material and reflection producer group");
+     }
+     if source.primary.begun != camera.begun
+-        || source.primary.epoch >= camera.epoch
+         || source.submission >= sequence
+         || !matching_projection(source.camera, camera.jittered)
+     {
+@@ -210,7 +243,9 @@ pub(super) fn native_camera(runs: &[&HostList], sequence: u64) -> Option<NativeC
+ }
+
+ pub(super) struct NativeGuides {
+-    pub material: RrMaterialCandidates,
++    pub diffuse: ID3D12Resource,
++    pub specular: ID3D12Resource,
++    pub normal_roughness: ID3D12Resource,
+     pub reflection_motion: ID3D12Resource,
+     pub source_submit: u64,
+     pub stream: u64,
+@@ -227,22 +262,48 @@ impl NativeCamera {
+         serials: [u64; 3],
+         motion_scale: [f32; 2],
+     ) -> Result<NativeGuides, &'static str> {
++        self.check_view(begun, epoch, motion_scale)?;
++        let source = ordered_source(&self.camera, sequence)?;
++        self.record_source(list, &source, serials)
++    }
++
++    pub(super) fn record_early(
++        &self,
++        list: &HostList,
++        source: &Source,
++        source_submission: u64,
++        packet: super::rr_display::Packet,
++        motion_scale: [f32; 2],
++    ) -> Result<NativeGuides, &'static str> {
++        self.check_view(packet.begun, packet.prefix_epoch, motion_scale)?;
++        if source.submission != source_submission || !source.matches_closed_future(packet) {
++            return Err("early classifier does not match the native FFX packet");
++        }
++        self.record_source(list, source, packet.serials)
++    }
++
++    fn check_view(&self, begun: u64, epoch: u64, motion_scale: [f32; 2]) -> Result<(), &'static str> {
+         let camera = &self.camera;
+         if camera.begun != begun || camera.epoch != epoch || camera.motion_scale != motion_scale {
+             return Err("FFX snapshot does not match the native camera");
+         }
++        Ok(())
++    }
++
++    fn record_source(&self, list: &HostList, source: &Source, serials: [u64; 3]) -> Result<NativeGuides, &'static str> {
+         let (previous_clip, previous) = self.previous.ok_or("previous native camera unavailable")?;
+-        let source = ordered_source(camera, sequence)?;
+         if source.depth_serial != serials[1] || source.primary.motion_serial != serials[2] {
+             return Err("FFX depth/motion backings do not match the opaque producer");
+         }
+-        let output = dense(list, &source, camera, previous_clip)
++        let output = dense(list, source, &self.camera, previous_clip)
+             .ok_or("dense reflection guides unavailable")?;
+         Ok(NativeGuides {
+-            material: source.material,
++            diffuse: source.material.diffuse.clone(),
++            specular: source.material.specular.clone(),
++            normal_roughness: source.material.normal_roughness.clone(),
+             reflection_motion: output.motion,
+             source_submit: source.submission,
+-            stream: camera.stream,
++            stream: self.camera.stream,
+             previous,
+         })
+     }
+@@ -380,7 +441,21 @@ pub(crate) fn submitted(
+                     let readback = readback(host, &list, &proof, DXGI_FORMAT_R32_UINT)?;
+                     Some((readback, background.alpha_source.is_some()))
+                 });
++            let background = background
++                .filter(|background| {
++                    rr_shadow::glass_comparison()
++                        && background.camera.is_some()
++                        && background.key
++                            == (RrBackgroundKey {
++                                submission: sequence,
++                                epoch: snapshot.epoch,
++                                begun: snapshot.begun,
++                                serials: snapshot.serials,
++                            })
++                })
++                .cloned();
+             Some(Shadow {
++                background,
+                 snapshot,
+                 depth,
+                 motion: output.motion,
+@@ -478,6 +553,7 @@ fn inspect<T>(buffer: &ID3D12Resource, f: impl FnOnce(&[u32]) -> T) -> Option<T>
+ }
+
+ struct Shadow {
++    background: Option<RrBackgroundSnapshot>,
+     snapshot: Snapshot,
+     depth: ID3D12Resource,
+     motion: ID3D12Resource,
+@@ -663,6 +739,10 @@ impl Readback {
+             reflection_motion: shadow.motion,
+             reflection_counts: counts,
+             depth_of_field: shadow.snapshot.depth_of_field,
++            color_before_transparency: shadow
++                .background
++                .filter(RrBackgroundSnapshot::submitted_once)
++                .map(|background| background.color),
+             sr_output: shadow.snapshot.sr_output,
+         });
+     }
+diff --git a/crates/victory-gpu/src/draw/rr_display.rs b/crates/victory-gpu/src/draw/rr_display.rs
+index 51c8892..fd1e6d5 100644
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -7,7 +7,7 @@ use crate::{
+     object::This,
+     reflection_motion,
+ };
+-use std::sync::{Mutex, OnceLock};
++use std::sync::{Arc, Mutex, OnceLock};
+ use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
+ use windows::core::Interface;
+
+@@ -25,8 +25,39 @@ pub struct RrDisplayGuides<'a> {
+     pub reset: bool,
+ }
+
+-pub type RrDisplayRecord =
+-    for<'a> fn(&ID3D12GraphicsCommandList, &RrDisplayGuides<'a>) -> Result<(), &'static str>;
++pub type RrDisplayRecord = for<'a> fn(
++    &ID3D12GraphicsCommandList,
++    &RrDisplayGuides<'a>,
++) -> Result<RrDisplayRecording, &'static str>;
++
++/// A successful SDK recording that still belongs to a disposable list.
++pub struct RrDisplayRecording {
++    receipt: Option<(u64, fn(u64, bool))>,
++    reset: bool,
++}
++
++impl RrDisplayRecording {
++    pub fn new(token: u64, finish: fn(u64, bool), reset: bool) -> Self {
++        Self {
++            receipt: Some((token, finish)),
++            reset,
++        }
++    }
++
++    fn submitted(mut self) {
++        if let Some((token, finish)) = self.receipt.take() {
++            finish(token, true);
++        }
++    }
++}
++
++impl Drop for RrDisplayRecording {
++    fn drop(&mut self) {
++        if let Some((token, finish)) = self.receipt.take() {
++            finish(token, false);
++        }
++    }
++}
+
+ fn requested_frame() -> Option<u64> {
+     static REQUEST: OnceLock<Option<u64>> = OnceLock::new();
+@@ -62,10 +93,12 @@ pub(crate) fn selected() -> bool {
+         .is_some_and(|frame| crate::rr_window::selected(crate::queue::presented() + 1, Some(frame)))
+ }
+
++#[derive(Clone)]
+ pub(crate) struct Request {
+     present: u64,
+     begun: u64,
+     epoch: u64,
++    slot_epoch: u64,
+     serials: [u64; 3],
+     copies: [ID3D12Resource; 3],
+     output: ID3D12Resource,
+@@ -73,6 +106,105 @@ pub(crate) struct Request {
+     dof: ID3D12Resource,
+     frame: RrShadowFrame,
+     record: RrDisplayRecord,
++    projection: [u32; 16],
++    prepared: Arc<Mutex<Slot>>,
++}
++
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++pub(crate) struct Packet {
++    pub begun: u64,
++    pub prefix_epoch: u64,
++    pub slot_epoch: u64,
++    pub serials: [u64; 3],
++    pub output_serial: u64,
++    pub projection: [u32; 16],
++}
++
++#[derive(Default)]
++enum Slot {
++    #[default]
++    Open,
++    Adopted(Prepared),
++    Consumed,
++}
++
++impl Request {
++    /// Publish only while the queue owns this exact future prefix/slot/tail.
++    /// On success only this RR recording may execute in the reserved slot.
++    pub(crate) fn adopt(&self, prepared: Prepared) -> bool {
++        let mut slot = self
++            .prepared
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        if !matches!(*slot, Slot::Open) || prepared.packet != self.packet(self.slot_epoch) {
++            return false;
++        }
++        *slot = Slot::Adopted(prepared);
++        true
++    }
++
++    pub(crate) fn is_adopted(&self) -> bool {
++        matches!(
++            *self
++                .prepared
++                .lock()
++                .unwrap_or_else(|error| error.into_inner()),
++            Slot::Adopted(_)
++        )
++    }
++
++    fn take_prepared(&self) -> Option<Prepared> {
++        let mut slot = self
++            .prepared
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        match std::mem::replace(&mut *slot, Slot::Consumed) {
++            Slot::Adopted(prepared) => Some(prepared),
++            Slot::Open | Slot::Consumed => None,
++        }
++    }
++
++    pub(crate) fn packet(&self, slot_epoch: u64) -> Packet {
++        Packet {
++            begun: self.begun,
++            prefix_epoch: self.epoch,
++            slot_epoch,
++            serials: self.serials,
++            output_serial: self.output_serial,
++            projection: self.projection,
++        }
++    }
++}
++
++pub(crate) fn slot_ordered(
++    index: usize,
++    count: usize,
++    previous_epoch: Option<u64>,
++    sr: Option<(u64, u64)>,
++    packet: Packet,
++) -> bool {
++    index != 0
++        && index + 1 < count
++        && previous_epoch == Some(packet.prefix_epoch)
++        && sr == Some((packet.begun, packet.prefix_epoch))
++}
++
++#[test]
++fn closed_packet_requires_exact_prefix_sr_and_continuation() {
++    let packet = Packet {
++        begun: 8,
++        prefix_epoch: 31,
++        slot_epoch: 32,
++        serials: [6, 7, 9],
++        output_serial: 10,
++        projection: [0; 16],
++    };
++    assert!(slot_ordered(1, 3, Some(31), Some((8, 31)), packet));
++    assert!(!slot_ordered(0, 3, None, Some((8, 31)), packet));
++    assert!(!slot_ordered(1, 2, Some(31), Some((8, 31)), packet));
++    assert!(!slot_ordered(1, 3, Some(30), Some((8, 31)), packet));
++    assert!(!slot_ordered(1, 3, Some(31), Some((7, 31)), packet));
++    assert!(!slot_ordered(1, 3, Some(31), None, packet));
+ }
+
+ pub(crate) fn capture(
+@@ -113,6 +245,7 @@ pub(crate) fn capture(
+             present,
+             begun,
+             epoch,
++            slot_epoch: section.epoch(),
+             serials,
+             copies,
+             output: output.1.clone(),
+@@ -120,6 +253,10 @@ pub(crate) fn capture(
+             dof: dof.clone(),
+             frame,
+             record,
++            projection: camera
++                .current_relative_world_to_jittered_clip()
++                .map(f32::to_bits),
++            prepared: Arc::default(),
+         });
+         tracing::info!(present, begun, epoch, ?serials, "RR display slot armed");
+         Ok::<_, &'static str>(())
+@@ -135,10 +272,13 @@ pub(crate) fn capture(
+     }
+ }
+
+-static HISTORY: Mutex<Option<(u64, RrShadowCameraStamp)>> = Mutex::new(None);
++static HISTORY: Mutex<Option<(u64, RrShadowCameraStamp, bool)>> = Mutex::new(None);
+
+ pub(crate) struct Chosen {
+-    list: Box<HostList>,
++    _list: Box<HostList>,
++    command: ID3D12CommandList,
++    recorded: Option<RrDisplayRecording>,
++    cut: bool,
+     present: u64,
+     stream: u64,
+     current: RrShadowCameraStamp,
+@@ -150,13 +290,16 @@ pub(crate) struct Chosen {
+
+ impl Chosen {
+     pub(crate) fn command(&self) -> Option<ID3D12CommandList> {
+-        self.list.list.cast().ok()
++        Some(self.command.clone())
+     }
+
+     pub(crate) fn submitted(&mut self, fence: u64) {
+         self.fence = fence;
++        if let Some(recorded) = self.recorded.take() {
++            recorded.submitted();
++        }
+         *HISTORY.lock().unwrap_or_else(|error| error.into_inner()) =
+-            Some((self.stream, self.current));
++            Some((self.stream, self.current, self.cut));
+         tracing::info!(
+             present = self.present,
+             begun = self.current.begun,
+@@ -167,7 +310,8 @@ impl Chosen {
+             reset = self.reset,
+             feature = 13,
+             sr_gpu_evaluations = 0,
+-            native_filters = true,
++            native_filters = !self.cut,
++            cut_precommitted = self.cut,
+             guide_coverage = "diagnostic-opaque",
+             "RR display chose native FFX slot"
+         );
+@@ -187,22 +331,154 @@ impl Chosen {
+     }
+ }
+
++pub(crate) struct Prepared {
++    packet: Packet,
++    chosen: Chosen,
++}
++
++pub(crate) fn prepare_early(
++    host: &Host,
++    request: &Request,
++    packet: Packet,
++    camera: reflection_dense::Camera,
++    source: &reflection_dense::Source,
++    source_submit: u64,
++) -> Result<Prepared, &'static str> {
++    if packet != request.packet(request.slot_epoch) || request.is_adopted() {
++        return Err("exact future FFX slot is already prepared or changed");
++    }
++    let list = Box::new(
++        host.new_list()
++            .map_err(|_| "private native RR list allocation failed")?,
++    );
++    let native = reflection_dense::early_camera(camera, source_submit).record_early(
++        &list,
++        source,
++        source_submit,
++        packet,
++        request.frame.motion_scale,
++    )?;
++    let chosen = encode(request, list, native, 0, true)?;
++    Ok(Prepared { packet, chosen })
++}
++
++fn encode(
++    request: &Request,
++    list: Box<HostList>,
++    native: reflection_dense::NativeGuides,
++    sequence: u64,
++    cut: bool,
++) -> Result<Chosen, &'static str> {
++    // SAFETY: these FFX inputs will be written by the verified prefix before this slot.
++    let depth = unsafe { reflection_motion::copy_shadow_depth(&list, &request.copies[1]) }
++        .ok_or("exact FFX hardware depth view could not be copied")?;
++    let reset = *HISTORY.lock().unwrap_or_else(|error| error.into_inner())
++        != Some((native.stream, native.previous, cut));
++    let guides = RrDisplayGuides {
++        hdr: &request.copies[0],
++        depth: &depth,
++        motion: &request.copies[2],
++        diffuse: &native.diffuse,
++        specular: &native.specular,
++        normal_roughness: &native.normal_roughness,
++        reflection_motion: &native.reflection_motion,
++        dof: &request.dof,
++        output: &request.output,
++        frame: request.frame,
++        reset,
++    };
++    for resource in [
++        guides.hdr,
++        guides.depth,
++        guides.motion,
++        guides.diffuse,
++        guides.specular,
++        guides.normal_roughness,
++        guides.reflection_motion,
++        guides.dof,
++        guides.output,
++    ] {
++        list.keep(resource);
++    }
++    let recorded = (request.record)(&list.list, &guides)?;
++    let reset = recorded.reset;
++    if !list.try_close_rr_section() {
++        return Err("private NGX RR list did not close");
++    }
++    let command = list
++        .list
++        .cast()
++        .map_err(|_| "private RR command interface unavailable")?;
++    Ok(Chosen {
++        _list: list,
++        command,
++        recorded: Some(recorded),
++        cut,
++        present: request.present,
++        stream: native.stream,
++        current: RrShadowCameraStamp {
++            begun: request.begun,
++            epoch: request.epoch,
++            submission: sequence,
++        },
++        source_submit: native.source_submit,
++        output_serial: request.output_serial,
++        reset,
++        fence: 0,
++    })
++}
++
+ /// Resolve the native source and replace exactly one closed SR slot. The caller retains
+ /// both the untouched fallback and the chosen RR list through the same title fence.
+ pub(crate) fn select(host: &Host, runs: &[&HostList], sequence: u64) -> Option<(usize, Chosen)> {
+     let camera = reflection_dense::native_camera(runs, sequence);
+-    let mut requests = runs.iter().enumerate().filter_map(|(index, list)| {
+-        list.take_rr_display_request()
+-            .map(|request| (index, request))
+-    });
+-    let (index, request) = requests.next()?;
++    let mut requests: Vec<_> = runs
++        .iter()
++        .enumerate()
++        .filter_map(|(index, list)| {
++            list.take_rr_display_request()
++                .map(|request| (index, request))
++        })
++        .collect();
++    let adopted = requests
++        .iter()
++        .position(|(_, request)| request.is_adopted());
++    let slot = match adopted {
++        Some(index) => index,
++        None if requests.len() == 1 => 0,
++        None => {
++            for (_, request) in requests {
++                let _ = request.take_prepared();
++            }
++            return None;
++        }
++    };
++    let (index, request) = requests.swap_remove(slot);
++    for (_, other) in requests {
++        assert!(
++            other.take_prepared().is_none(),
++            "multiple committed RR slots on one provider"
++        );
++    }
++    let actual = request.packet(runs[index].epoch());
++    let ordered = slot_ordered(
++        index,
++        runs.len(),
++        index.checked_sub(1).map(|i| runs[i].epoch()),
++        runs[index].fidelityfx_sr_stamp(),
++        actual,
++    );
++    if let Some(Prepared { packet, mut chosen }) = request.take_prepared() {
++        // The lane may commit only when this exact closed command slot is permanently in its custody.
++        assert!(
++            ordered && packet == actual && chosen.source_submit < sequence,
++            "committed RR slot moved after the native filter cutoff"
++        );
++        chosen.current.submission = sequence;
++        return Some((index, chosen));
++    }
+     let try_record = || {
+-        if requests.count() != 0
+-            || index == 0
+-            || index + 1 >= runs.len()
+-            || runs[index - 1].epoch() != request.epoch
+-            || runs[index].fidelityfx_sr_stamp() != Some((request.begun, request.epoch))
+-        {
++        if !ordered {
+             return Err("FFX prefix, stock SR and title continuation are not uniquely ordered");
+         }
+         let camera = camera.ok_or("native FFX camera witness missing or ambiguous")?;
+@@ -218,55 +494,7 @@ pub(crate) fn select(host: &Host, runs: &[&HostList], sequence: u64) -> Option<(
+             request.serials,
+             request.frame.motion_scale,
+         )?;
+-        // SAFETY: these FFX inputs were frozen before the verified adjacent SR slot.
+-        let depth = unsafe { reflection_motion::copy_shadow_depth(&list, &request.copies[1]) }
+-            .ok_or("exact FFX hardware depth view could not be copied")?;
+-        let reset = *HISTORY.lock().unwrap_or_else(|error| error.into_inner())
+-            != Some((native.stream, native.previous));
+-        let guides = RrDisplayGuides {
+-            hdr: &request.copies[0],
+-            depth: &depth,
+-            motion: &request.copies[2],
+-            diffuse: &native.material.diffuse,
+-            specular: &native.material.specular,
+-            normal_roughness: &native.material.normal_roughness,
+-            reflection_motion: &native.reflection_motion,
+-            dof: &request.dof,
+-            output: &request.output,
+-            frame: request.frame,
+-            reset,
+-        };
+-        for resource in [
+-            guides.hdr,
+-            guides.depth,
+-            guides.motion,
+-            guides.diffuse,
+-            guides.specular,
+-            guides.normal_roughness,
+-            guides.reflection_motion,
+-            guides.dof,
+-            guides.output,
+-        ] {
+-            list.keep(resource);
+-        }
+-        (request.record)(&list.list, &guides)?;
+-        if !list.try_close_rr_section() {
+-            return Err("private NGX RR list did not close");
+-        }
+-        Ok(Chosen {
+-            list,
+-            present: request.present,
+-            stream: native.stream,
+-            current: RrShadowCameraStamp {
+-                begun: request.begun,
+-                epoch: request.epoch,
+-                submission: sequence,
+-            },
+-            source_submit: native.source_submit,
+-            output_serial: request.output_serial,
+-            reset,
+-            fence: 0,
+-        })
++        encode(&request, list, native, sequence, false)
+     };
+     match try_record() {
+         Ok(chosen) => Some((index, chosen)),
+diff --git a/crates/victory-gpu/src/draw/rr_shadow.rs b/crates/victory-gpu/src/draw/rr_shadow.rs
+index 151eadc..7fffdf6 100644
+--- a/crates/victory-gpu/src/draw/rr_shadow.rs
++++ b/crates/victory-gpu/src/draw/rr_shadow.rs
+@@ -26,6 +26,7 @@ pub struct RrShadowCameraStamp {
+ /// Fence-retired title resources. The material and reflection guide pixels are
+ /// diagnostic candidates from the same opaque prepass, with unresolved alpha
+ /// and sky ownership relative to the final FFX color/depth/motion inputs.
++#[derive(Clone)]
+ pub struct RrShadowInputs {
+     pub present: u64,
+     pub begun: u64,
+@@ -46,6 +47,15 @@ pub struct RrShadowInputs {
+     /// Exact stock 4K color UAV output from this same FFX dispatch.
+     pub sr_output: Option<(u64, ID3D12Resource)>,
+     pub depth_of_field: Option<ID3D12Resource>,
++    /// Native pre-alpha radiance on this exact FFX view and submission.
++    pub color_before_transparency: Option<ID3D12Resource>,
++}
++
++pub(super) fn glass_comparison() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| {
++        std::env::var_os("VICTORY_RR_GLASS_COMPARE").is_some_and(|value| value == "1")
++    })
+ }
+
+ static CONSUMER: OnceLock<fn(RrShadowInputs)> = OnceLock::new();
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 0168181..1f883b6 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -26,7 +26,7 @@ pub use crate::draw::background_snapshot::{RrBackgroundKey, RrBackgroundSnapshot
+ pub use crate::draw::rr_shadow::{RrShadowCameraStamp, RrShadowFrame, RrShadowInputs, rr_shadow_consumer};
+
+ #[cfg(feature = "diagnostics")]
+-pub use crate::draw::rr_display::{RrDisplayGuides, RrDisplayRecord};
++pub use crate::draw::rr_display::{RrDisplayGuides, RrDisplayRecord, RrDisplayRecording};
+
+ #[cfg(feature = "diagnostics")]
+ pub fn rr_display_enabled() -> bool {
+@@ -75,6 +75,7 @@ pub struct RrMaterialKey {
+ /// opaque prepass. Status 5 marks a computed candidate and does not establish
+ /// ownership against any later color, alpha or depth composite.
+ #[cfg(feature = "diagnostics")]
++#[derive(Clone)]
+ pub struct RrMaterialCandidates {
+     pub key: RrMaterialKey,
+     pub diffuse: ID3D12Resource,
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index cf03492..8743ab8 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1419,7 +1419,9 @@ pub(crate) struct HostList {
+     #[cfg(feature = "diagnostics")]
+     pass_stats: Mutex<Vec<pass_stats::Sample>>,
+     #[cfg(feature = "diagnostics")]
+-    rr_order_handoff: AtomicU64,
++    pub(crate) rr_order_handoff: AtomicU64,
++    #[cfg(feature = "diagnostics")]
++    rr_opaque_cut: Mutex<crate::draw::opaque_current::CutRecord>,
+     /// The work its indirect executions may still do (`indirect`): a
+     /// shader-writable word, zeroed when the list is submitted, and after
+     /// it what the clamp notes about mesh records. In memory the CPU maps.
+@@ -4762,6 +4764,8 @@ impl Host {
+                 pass_stats: Mutex::default(),
+                 #[cfg(feature = "diagnostics")]
+                 rr_order_handoff: AtomicU64::new(0),
++                #[cfg(feature = "diagnostics")]
++                rr_opaque_cut: Mutex::default(),
+                 budget: OnceLock::new(),
+                 card_budget: OnceLock::new(),
+                 indirect_args: Mutex::default(),
+@@ -6410,6 +6414,18 @@ impl Host {
+             batch.refresh_ahead(runs, |list, i| own.as_ref().is_some_and(|own| own.takes(list, i)));
+         }
+         stage.next("submit: the lists' steps");
++        #[cfg(feature = "diagnostics")]
++        let rr_cut = rr_order::before_cut(runs, this_submission);
++        #[cfg(feature = "diagnostics")]
++        let future_rr = rr_cut.and_then(|_| crate::draw::reflection_capture::early_identity(runs))
++            .and_then(|identity| crate::queue::closed_future(identity, this_submission));
++        #[cfg(feature = "diagnostics")]
++        let early_rr_source = future_rr.as_ref().and_then(|future|
++            crate::draw::reflection_capture::stage_early(self, runs, this_submission, future.packet));
++        #[cfg(feature = "diagnostics")]
++        crate::draw::opaque_current::choose_before_deferred(
++            self, runs, this_submission, future_rr, early_rr_source.as_ref().and_then(|check| check.dense.as_ref()),
++        );
+         #[cfg_attr(not(feature = "diagnostics"), allow(clippy::unused_enumerate_index))]
+         let mut rr_submission_valid = true;
+         for (_run, list) in runs.iter().enumerate() {
+@@ -6433,24 +6449,32 @@ impl Host {
+             lists.push(native);
+         }
+         #[cfg(feature = "diagnostics")]
+-        if rr_submission_valid
+-            && crate::draw::rr_display::enabled()
+-            && let Some((run, chosen)) = crate::draw::rr_display::select(self, runs, this_submission)
+-            && let Some(native) = chosen.command()
+-        {
+-            // Each run ends in its own native command, following any generated prelude.
+-            let command = firsts[run + 1] - 1;
+-            lists[command] = Some(native);
+-            runs[run].deferred().rr_display_chosen = Some(chosen);
++        if crate::draw::rr_display::enabled() {
++            let adopted = runs.iter().any(|list| list.rr_display_adopted());
++            if rr_submission_valid
++                && let Some((run, chosen)) = crate::draw::rr_display::select(self, runs, this_submission)
++                && let Some(native) = chosen.command()
++            {
++                // Each run ends in its own native command, following its prelude.
++                let command = firsts[run + 1] - 1;
++                lists[command] = Some(native);
++                runs[run].deferred().rr_display_chosen = Some(chosen);
++            } else if adopted {
++                fail(format_args!("the adopted RR slot lost its held native route"));
++            }
+         }
+         #[cfg(feature = "diagnostics")]
+         if let Some(last) = runs.last()
+-            && let Some(mut check) = crate::draw::reflection_capture::submitted(self, runs, this_submission)
++            && let Some(mut check) = early_rr_source
++                .or_else(|| crate::draw::reflection_capture::submitted(self, runs, this_submission))
+             && let Some(commands) = check.command()
+         {
+             marks.push((lists.len(), crate::copystat::Timed::Other));
+             lists.push(Some(commands));
+             if let Some(source) = check.dense.take() {
++                if let Some(cut) = rr_cut {
++                    source.witness_cut(cut);
++                }
+                 crate::draw::reflection_dense::queued(source);
+             }
+             last.deferred().reflection_backs.push(check);
+@@ -7219,6 +7243,8 @@ impl HostList {
+         #[cfg(feature = "diagnostics")]
+         self.rr_order_handoff.store(0, Ordering::Relaxed);
+         #[cfg(feature = "diagnostics")]
++        { *self.rr_opaque_cut() = Default::default(); }
++        #[cfg(feature = "diagnostics")]
+         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         {
+             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+@@ -8361,6 +8387,29 @@ impl HostList {
+         self.deferred().rr_display_request = Some(request);
+     }
+
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_opaque_cut(
++        &self
++    ) -> std::sync::MutexGuard<'_, crate::draw::opaque_current::CutRecord> {
++        self.rr_opaque_cut.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_display_packet(&self) -> Option<(crate::draw::rr_display::Packet, (u64, u64))> {
++        let deferred = self.deferred.try_lock().ok()?;
++        Some((deferred.rr_display_request.as_ref()?.packet(self.epoch()), deferred.fidelityfx_sr?))
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_display_owned(&self) -> Option<crate::draw::rr_display::Request> {
++        self.deferred.try_lock().ok()?.rr_display_request.clone()
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_display_adopted(&self) -> bool {
++        self.rr_display_owned().is_some_and(|request| request.is_adopted())
++    }
++
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn take_rr_display_request(&self) -> Option<crate::draw::rr_display::Request> {
+         self.deferred().rr_display_request.take()
+diff --git a/crates/victory-gpu/src/host/rr_order.rs b/crates/victory-gpu/src/host/rr_order.rs
+index b545441..4418f84 100644
+--- a/crates/victory-gpu/src/host/rr_order.rs
++++ b/crates/victory-gpu/src/host/rr_order.rs
+@@ -139,6 +139,33 @@ pub(crate) fn queue_ingress<'a>(
+     })
+ }
+
++/// Exact enqueue stamp stored with a thin job until its split lists can be inspected.
++pub(crate) struct ThinArrival {
++    queue: usize,
++    frame: u64,
++    order: u64,
++}
++
++pub(crate) fn thin_arrival(queue: usize) -> Option<ThinArrival> {
++    let target = target()?;
++    let frame = crate::queue::presented() + 1;
++    window(frame, target).then(|| ThinArrival { queue, frame, order: order() })
++}
++
++impl ThinArrival {
++    pub(crate) fn report(&self, epoch: u64, handoff_order: u64) {
++        tracing::info!(
++            frame = self.frame,
++            queue = self.queue,
++            list_epoch = epoch,
++            handoff_order,
++            before_order = self.order,
++            after_order = self.order,
++            "RR order FidelityFX packet entered virtual queue"
++        );
++    }
++}
++
+ impl QueueIngress {
+     pub(crate) fn queued(self) {
+         let after = order();
+@@ -156,16 +183,18 @@ impl QueueIngress {
+     }
+ }
+
+-pub(crate) fn lane_departure<'a>(queue: usize, lists: impl Iterator<Item = &'a HostList>) {
+-    let Some(target) = target() else { return };
++pub(crate) fn lane_departure<'a>(queue: usize, lists: impl Iterator<Item = &'a HostList>) -> bool {
++    let Some(target) = target() else { return false };
+     let frame = crate::queue::presented() + 1;
+     if !window(frame, target) {
+-        return;
++        return false;
+     }
+     let departed = order();
++    let mut opaque = false;
+     for list in lists {
+         let names = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
+         if names.iter().any(|name| name.contains(OPAQUE)) {
++            opaque = true;
+             tracing::info!(
+                 frame,
+                 queue,
+@@ -175,4 +204,53 @@ pub(crate) fn lane_departure<'a>(queue: usize, lists: impl Iterator<Item = &'a H
+             );
+         }
+     }
++    opaque
++}
++
++pub(crate) fn future_closed(queue: usize, packet: crate::draw::rr_display::Packet) {
++    let observed = order();
++    let crate::draw::rr_display::Packet {
++        begun,
++        prefix_epoch,
++        slot_epoch,
++        serials,
++        output_serial,
++        ..
++    } = packet;
++    tracing::info!(
++        queue,
++        observed,
++        begun,
++        prefix_epoch,
++        slot_epoch,
++        depth = serials[1],
++        motion = serials[2],
++        output_serial,
++        "RR order closed FFX packet already in virtual queue"
++    );
++}
++
++pub(crate) fn before_cut(runs: &[&HostList], submit: u64) -> Option<u64> {
++    let target = target()?;
++    let frame = crate::queue::presented() + 1;
++    if !window(frame, target) {
++        return None;
++    }
++    let at = order();
++    let mut opaque = false;
++    for (list_index, list) in runs.iter().enumerate() {
++        let names = list.pipelines.lock().unwrap_or_else(|e| e.into_inner());
++        if names.iter().any(|name| name.contains(OPAQUE)) {
++            opaque = true;
++            tracing::info!(
++                submit,
++                frame,
++                list_index,
++                list_epoch = list.epoch(),
++                before_deferred = at,
++                "RR order opaque batch reached deferred boundary"
++            );
++        }
++    }
++    opaque.then_some(at)
+ }
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index 9fefbb8..c9c0e19 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -132,6 +132,8 @@ struct List {
+     gate: Vec<ValueWait>,
+     #[cfg(all(windows, feature = "diagnostics"))]
+     rr_section: bool,
++    #[cfg(all(windows, feature = "diagnostics"))]
++    rr_detach_reserve: std::sync::Mutex<Option<Box<crate::host::HostList>>>,
+     /// With `VICTORY_THIN=1`, of a list the title has: what it wrote down
+     /// ([`thin`]; then there is no `host`).
+     #[cfg(windows)]
+@@ -383,6 +385,73 @@ pub(crate) unsafe fn isolate_rr_section<R, E>(
+     Ok(result)
+ }
+
++/// Include the original FidelityFX prefix after its stock section is split off.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) unsafe fn rr_queued_handoffs(
++    this: This,
++    mut report: impl FnMut(u64, u64),
++) {
++    use std::sync::atomic::Ordering::Acquire;
++    // SAFETY: a closed thin recording remains owned by the queue until detach.
++    let list = unsafe { &*this.cast::<List>() };
++    for host in list.earlier.iter().map(|part| &part.host).chain(list.host.iter()) {
++        let order = host.rr_order_handoff.load(Acquire);
++        if order != 0 {
++            report(host.epoch(), order);
++        }
++    }
++}
++
++/// Inspect the complete translated split held by a closed queue entry.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) unsafe fn closed_rr_packet(this: This) -> Option<crate::queue::ClosedFuture> {
++    use crate::draw::rr_display::slot_ordered;
++    if this.is_null() {
++        return None;
++    }
++    // SAFETY: the caller owns the queued recording and checked closed translation.
++    let list = unsafe { &*this.cast::<List>() };
++    if list.earlier.len() > 32 {
++        return None;
++    }
++    let mut packets = list.earlier.iter().enumerate().filter_map(|(i, part)| {
++        part.host.rr_display_packet().map(|packet| (i, packet))
++    });
++    let (index, (packet, stamp)) = packets.next()?;
++    let previous = index.checked_sub(1).map(|i| list.earlier[i].host.epoch());
++    let section = &list.earlier[index];
++    let next_waits = list.earlier.get(index + 1).map_or(&list.gate, |part| &part.waits);
++    let prefix = index.checked_sub(1).map(|i| &list.earlier[i])?;
++    // A wait before the prefix starts its run. Only a later wait can split
++    // the prefix from the exact stock slot or its continuation.
++    if packets.next().is_some()
++        || !section.waits.is_empty()
++        || !next_waits.is_empty()
++        || !slot_ordered(index, list.earlier.len() + 1, previous, Some(stamp), packet)
++    {
++        return None;
++    }
++    let continuation = list.earlier.get(index + 1).map(|part| &part.host).or(list.host.as_ref())?;
++    crate::queue::ClosedFuture::verify(&prefix.host, &section.host, continuation, packet)
++}
++
++/// Reserve the already closed replacement needed to detach this exact future FFX recording.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) unsafe fn reserve_rr_detach(this: This) -> bool {
++    // SAFETY: the lane owns this closed translated list until its future detach.
++    let list = unsafe { &*this.cast::<List>() };
++    let Ok(mut reserve) = list.rr_detach_reserve.try_lock() else { return false };
++    if reserve.is_some() {
++        return true;
++    }
++    let Some(host) = fresh_list() else { return false };
++    if !host.try_close_rr_section() {
++        return false;
++    }
++    *reserve = Some(Box::new(host));
++    true
++}
++
+ /// Whether list `this` recorded a wait for a memory value (with waits cut
+ /// into lists).
+ #[cfg(windows)]
+@@ -434,12 +503,24 @@ pub(crate) fn detach_parts(lists: &[This]) -> Parts {
+             }
+             continue;
+         }
+-        let Some(fresh) = fresh_list() else {
++        #[cfg(feature = "diagnostics")]
++        let reserved = if crate::draw::opaque_current::atomic_enabled() {
++            // SAFETY: the closed recording is no longer used by the title.
++            unsafe { &*this.cast::<List>() }.rr_detach_reserve.lock()
++                .unwrap_or_else(|e| e.into_inner()).take().map(|host| *host)
++        } else {
++            None
++        };
++        #[cfg(not(feature = "diagnostics"))]
++        let reserved = None;
++        let Some(fresh) = reserved.or_else(|| {
++            let host = fresh_list()?;
++            // The title's next call is a reset, which wants a closed list.
++            host.close();
++            Some(host)
++        }) else {
+             continue;
+         };
+-        // A new host list is open; the title's next call on its list is a
+-        // reset, which wants it closed.
+-        fresh.close();
+         // SAFETY: one of our lists, closed and submitted: nothing records
+         // into it until the title resets it.
+         let list = unsafe { &mut *this.cast_mut().cast::<List>() };
+@@ -656,6 +737,8 @@ fn boxed(kind: u32, pipeline: This, thin: bool) -> Box<List> {
+         gate: Vec::new(),
+         #[cfg(all(windows, feature = "diagnostics"))]
+         rr_section: false,
++        #[cfg(all(windows, feature = "diagnostics"))]
++        rr_detach_reserve: Default::default(),
+         #[cfg(windows)]
+         thin: Default::default(),
+     });
+@@ -720,6 +803,7 @@ extern "system" fn reset(this: This, allocator: This, pipeline: This) -> HRESULT
+         #[cfg(feature = "diagnostics")]
+         {
+             list.rr_section = false;
++            list.rr_detach_reserve.get_mut().unwrap_or_else(|e| e.into_inner()).take();
+         }
+     }
+     #[cfg(windows)]
+diff --git a/crates/victory-gpu/src/list/thin.rs b/crates/victory-gpu/src/list/thin.rs
+index 3b46ee0..8325e34 100644
+--- a/crates/victory-gpu/src/list/thin.rs
++++ b/crates/victory-gpu/src/list/thin.rs
+@@ -230,6 +230,13 @@ impl Recording {
+         held(&self.inner).back as This
+     }
+
++    /// Nonblocking access to a closed backing for a lane-locked witness.
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn closed_back(&self) -> Option<This> {
++        let inner = self.inner.try_lock().ok()?;
++        (self.done() && inner.closed && inner.back != 0).then_some(inner.back as This)
++    }
++
+     /// Translates what there is.
+     fn run(&self) {
+         loop {
+diff --git a/crates/victory-gpu/src/queue.rs b/crates/victory-gpu/src/queue.rs
+index 325882c..57fe37e 100644
+--- a/crates/victory-gpu/src/queue.rs
++++ b/crates/victory-gpu/src/queue.rs
+@@ -442,6 +442,9 @@ pub(crate) fn before_sync() {
+     }
+ }
+
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) use behind::{ClosedFuture, closed_future};
++
+ /// Whether submissions go into the line of a thread of ours ([`behind`]).
+ #[cfg(windows)]
+ pub(crate) fn line_on() -> bool {
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+index 4808838..6247ae0 100644
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -84,6 +84,10 @@ pub(super) trait Work: Send {
+     }
+     /// Does it. `forced`: its wait was not met.
+     fn go(self, forced: bool);
++    /// Notify a job while its new queue entry is owned by the lane.
++    #[cfg(feature = "diagnostics")]
++    fn arrived(&mut self, _queue: usize) {}
++
+     /// Renderer port #7 (`crate::port_journal`, from renderer patch #4): a mark taken when an entry is
+     /// put in the line (by the thread that puts it, before the line's lock):
+     /// the round of the heaps' records begun after that. 0: none.
+@@ -187,6 +191,10 @@ impl<W: Work> Lane<W> {
+         let number = state.next;
+         state.next += 1;
+         state.items.push_back(Entry { number, queue, what, mark });
++        #[cfg(feature = "diagnostics")]
++        if let Some(entry) = state.items.back_mut() {
++            entry.what.arrived(queue);
++        }
+     }
+
+     /// Adds to the end of the line, and has it looked at.
+@@ -449,7 +457,7 @@ enum Job {
+     Run(usize, Vec<crate::list::Detached>, Vec<usize>),
+     /// A submission whose lists are being translated ([`crate::list::thin`]):
+     /// the parts of it are known when they are.
+-    Lists(usize, Recordings),
++    Lists(usize, Recordings, #[cfg(feature = "diagnostics")] Option<crate::host::rr_order::ThinArrival>),
+     /// Parts taken along with a submission ([`crate::host::joins`]): where they
+     /// begin in the order, and the signals given behind them.
+     Joined(usize, Vec<crate::list::Detached>, Vec<usize>, Vec<usize>, Vec<(usize, u64)>),
+@@ -468,6 +476,17 @@ enum Job {
+ // it becomes are handed to other threads the same way).
+ unsafe impl Send for Job {}
+
++#[cfg(feature = "diagnostics")]
++impl Job {
++    fn has_adopted_rr(&self) -> bool {
++        match self {
++            Job::Run(_, lists, order) | Job::Joined(_, lists, order, ..) =>
++                order.iter().any(|&index| lists[index].host().rr_display_adopted()),
++            _ => false,
++        }
++    }
++}
++
+ enum Ask {
+     Wait(usize, u64),
+     Value(crate::list::ValueWait),
+@@ -481,7 +500,7 @@ impl Work for Job {
+         match self {
+             &Job::Wait(fence, value) => Some(Ask::Wait(fence, value)),
+             Job::Value(wait) => Some(Ask::Value(*wait)),
+-            Job::Lists(_, lists) => Some(Ask::Lists(lists.clone())),
++            Job::Lists(_, lists, ..) => Some(Ask::Lists(lists.clone())),
+             _ => None,
+         }
+     }
+@@ -491,9 +510,16 @@ impl Work for Job {
+     }
+
+     fn unfold(self) -> Vec<Self> {
+-        let Job::Lists(queue, recordings) = self else {
++        let Job::Lists(queue, ref recordings, ..) = self else {
+             return vec![self];
+         };
++        #[cfg(feature = "diagnostics")]
++        if let Job::Lists(_, _, Some(arrival)) = &self {
++            for back in recordings.iter().filter_map(|recording| recording.closed_back()) {
++                // SAFETY: the finished thin backings are still in this lane's custody.
++                unsafe { crate::list::rr_queued_handoffs(back, |epoch, stamp| arrival.report(epoch, stamp)) };
++            }
++        }
+         let lists: Vec<This> = recordings.iter().map(|r| r.back()).collect();
+         let jobs = jobs_of(queue as This, &lists);
+         // It stood for one submission not begun.
+@@ -552,6 +578,10 @@ impl Work for Job {
+     }
+
+     fn take_along(&mut self, next: Job) -> Result<bool, Job> {
++        #[cfg(feature = "diagnostics")]
++        if self.has_adopted_rr() || next.has_adopted_rr() {
++            return Err(next);
++        }
+         let (most, most_lists) = crate::host::joins();
+         if most < 2 {
+             return Err(next);
+@@ -610,11 +640,23 @@ impl Work for Job {
+         Ok(run)
+     }
+
++    #[cfg(feature = "diagnostics")]
++    fn arrived(&mut self, queue: usize) {
++        if let Job::Lists(_, _, arrival) = self {
++            *arrival = crate::host::rr_order::thin_arrival(queue);
++        }
++    }
++
+     fn go(self, forced: bool) {
+         #[cfg(feature = "diagnostics")]
+-        if let Job::Run(queue, lists, order) | Job::Joined(queue, lists, order, ..) = &self {
+-            crate::host::rr_order::lane_departure(*queue, order.iter().map(|&i| lists[i].host()));
+-        }
++        let _future = match &self {
++            Job::Run(queue, lists, order) | Job::Joined(queue, lists, order, ..)
++                if !forced && crate::host::rr_order::lane_departure(*queue, order.iter().map(|&i| lists[i].host())) =>
++            {
++                FutureScope::new(Some(*queue))
++            }
++            _ => FutureScope::new(None),
++        };
+         let began = Instant::now();
+         let _doing = crate::timeline::span(match self {
+             Job::Run(..) => "the line: a submission",
+@@ -825,6 +867,138 @@ pub(super) fn drain() {
+     STATS[DRAINS].fetch_add(1, Relaxed);
+ }
+
++#[cfg(feature = "diagnostics")]
++thread_local! {
++    static OPAQUE_LANE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
++}
++
++#[cfg(feature = "diagnostics")]
++struct FutureScope;
++
++#[cfg(feature = "diagnostics")]
++impl FutureScope {
++    fn new(queue: Option<usize>) -> Self {
++        OPAQUE_LANE.set(queue);
++        Self
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++impl Drop for FutureScope {
++    fn drop(&mut self) {
++        OPAQUE_LANE.set(None);
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) struct ClosedFuture {
++    pub packet: crate::draw::rr_display::Packet,
++    pub request: crate::draw::rr_display::Request,
++    pub camera: crate::draw::reflection_dense::Camera,
++}
++
++#[cfg(feature = "diagnostics")]
++impl ClosedFuture {
++    pub(crate) fn verify(
++        prefix: &crate::host::HostList,
++        section: &crate::host::HostList,
++        continuation: &crate::host::HostList,
++        packet: crate::draw::rr_display::Packet,
++    ) -> Option<Self> {
++        use windows::{Win32::Graphics::Direct3D12::ID3D12CommandList, core::Interface};
++        for list in [prefix, section, continuation] {
++            list.list.cast::<ID3D12CommandList>().ok()?;
++        }
++        let [camera] = prefix.reflection_dense_cameras().try_into().ok()?;
++        let request = section.rr_display_owned()?;
++        (request.packet(section.epoch()) == packet && !request.is_adopted())
++            .then_some(Self { packet, request, camera })
++    }
++}
++
++/// Inspect the exact producer's future FFX slot at the last safe CPU boundary.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn closed_future(
++    (begun, [depth, motion]): (u64, [u64; 2]),
++    source_submit: u64,
++) -> Option<ClosedFuture> {
++    let queue = OPAQUE_LANE.get()?;
++    let Ok(state) = LANE.state.try_lock() else {
++        tracing::info!(begun, source_submit, "RR future FFX lane snapshot busy");
++        return None;
++    };
++    let exact = |packet: crate::draw::rr_display::Packet| {
++        packet.begun == begun && packet.serials[1..] == [depth, motion]
++    };
++    let mut selected = None;
++    let mut entries = 0;
++    let mut pending = 0;
++    let mut barriers = 0;
++    let mut closed = 0;
++    let mut duplicate = false;
++    let mut bounded = false;
++    let mut consider = |candidate: ClosedFuture, backing| {
++        closed += 1;
++        if exact(candidate.packet) {
++            duplicate |= selected.replace((candidate, backing)).is_some();
++        }
++    };
++    // Only this worker will remove these same-queue entries. Skip signals and
++    // waits while inspecting custody; their actual execution stays in place.
++    for entry in state.items.iter().filter(|entry| entry.queue == queue) {
++        if entries == 128 {
++            bounded = true;
++            break;
++        }
++        entries += 1;
++        match &entry.what {
++            Job::Run(_, lists, order) | Job::Joined(_, lists, order, ..) => {
++                let runs: Vec<_> = order.iter().map(|&i| lists[i].host()).collect();
++                for window in runs.windows(3) {
++                    let [prefix, section, tail] = [window[0], window[1], window[2]];
++                    if let Some((packet, stamp)) = section.rr_display_packet()
++                        && crate::draw::rr_display::slot_ordered(1, 3, Some(prefix.epoch()), Some(stamp), packet)
++                        && let Some(candidate) = ClosedFuture::verify(prefix, section, tail, packet)
++                    {
++                        consider(candidate, None);
++                    }
++                }
++            }
++            Job::Lists(_, recordings, ..) => {
++                for recording in recordings.iter() {
++                    if let Some(back) = recording.closed_back() {
++                        // SAFETY: the worker owns this lane, and translation has closed the backing.
++                        if let Some(candidate) = unsafe { crate::list::closed_rr_packet(back) } {
++                            consider(candidate, Some(back));
++                        }
++                    } else {
++                        pending += 1;
++                    }
++                }
++            }
++            Job::Wait(..) | Job::Value(..) | Job::Signal(..) => barriers += 1,
++            Job::Present(..) => break,
++        }
++    }
++    drop(state);
++    tracing::info!(queue, begun, source_submit, entries, pending, barriers, closed,
++        exact = selected.is_some(), duplicate, bounded, "RR future FFX at opaque cutoff");
++    if duplicate || bounded {
++        return None;
++    }
++    let (future, back) = selected?;
++    if crate::draw::opaque_current::atomic_enabled()
++        && let Some(back) = back
++        // SAFETY: the same lane worker is still inside the earlier submission.
++        && !unsafe { crate::list::reserve_rr_detach(back) }
++    {
++        tracing::info!(queue, begun, source_submit, "RR future FFX could not reserve closed detach");
++        return None;
++    }
++    crate::host::rr_order::future_closed(queue, future.packet);
++    Some(future)
++}
++
+ /// A submission of `lists` to queue `this`.
+ pub(super) fn submit(this: This, lists: &[This]) {
+     let queue = this as usize;
+@@ -836,16 +1010,7 @@ pub(super) fn submit(this: This, lists: &[This]) {
+         let before = QUEUED.fetch_add(1, Relaxed);
+         STATS[DEPTH].fetch_add(before, Relaxed);
+         STATS[DEEPEST].fetch_max(before + 1, Relaxed);
+-        #[cfg(feature = "diagnostics")]
+-        let witness = crate::host::rr_order::queue_ingress(
+-            queue,
+-            recordings.iter().filter_map(|recording| crate::list::host_list(recording.back())),
+-        );
+-        LANE.push(queue, [Job::Lists(queue, recordings)]);
+-        #[cfg(feature = "diagnostics")]
+-        if let Some(witness) = witness {
+-            witness.queued();
+-        }
++        LANE.push(queue, [Job::Lists(queue, recordings, #[cfg(feature = "diagnostics")] None)]);
+         room(before + 1);
+         return;
+     }
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+index 5a9f842..0563eb2 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+@@ -81,6 +81,15 @@ static SHADOW_PROVIDER: Mutex<Provider> = Mutex::new(Provider {
+     failed: false,
+ });
+
++#[cfg(feature = "diagnostics")]
++static GLASS_SHADOW_PROVIDER: Mutex<Provider> = Mutex::new(Provider {
++    ngx: None,
++    depth_encoding: None,
++    has_history: false,
++    history_stream: None,
++    failed: false,
++});
++
+ #[cfg(feature = "diagnostics")]
+ pub(super) fn shadow_enabled() -> bool {
+     static ENABLED: OnceLock<bool> = OnceLock::new();
+@@ -96,11 +105,54 @@ static DISPLAY_PROVIDER: Mutex<Provider> = Mutex::new(Provider {
+     failed: false,
+ });
+
++#[cfg(feature = "diagnostics")]
++#[derive(Default)]
++struct DisplayRecording {
++    issued: u64,
++    pending: Option<u64>,
++}
++
++#[cfg(feature = "diagnostics")]
++impl DisplayRecording {
++    fn begin(&mut self) -> Option<u64> {
++        if self.pending.is_some() {
++            return None;
++        }
++        self.issued = self.issued.checked_add(1)?;
++        self.pending = Some(self.issued);
++        self.pending
++    }
++
++    fn finish(&mut self, token: u64) -> bool {
++        if self.pending != Some(token) {
++            return false;
++        }
++        self.pending = None;
++        true
++    }
++}
++
++#[cfg(feature = "diagnostics")]
++static DISPLAY_RECORDING: Mutex<DisplayRecording> = Mutex::new(DisplayRecording {
++    issued: 0,
++    pending: None,
++});
++
++#[cfg(feature = "diagnostics")]
++fn finish_display(token: u64, submitted: bool) {
++    let mut ownership = DISPLAY_RECORDING.lock().unwrap_or_else(|error| error.into_inner());
++    if ownership.finish(token) && !submitted {
++        let mut provider = DISPLAY_PROVIDER.lock().unwrap_or_else(|error| error.into_inner());
++        provider.has_history = false;
++        provider.history_stream = None;
++    }
++}
++
+ #[cfg(feature = "diagnostics")]
+ pub(super) fn record_display(
+     commands: &ID3D12GraphicsCommandList,
+     inputs: &external::RrDisplayGuides<'_>,
+-) -> Result<(), &'static str> {
++) -> Result<external::RrDisplayRecording, &'static str> {
+     // Feature creation appends GPU work. Keep it off the disposable choice list.
+     if DISPLAY_PROVIDER
+         .lock()
+@@ -110,6 +162,13 @@ pub(super) fn record_display(
+     {
+         return Err("native display RR must complete feature-13 preflight");
+     }
++    let token = DISPLAY_RECORDING.lock().unwrap_or_else(|error| error.into_inner())
++        .begin().ok_or("native display RR already has an unsubmitted recording")?;
++    let reset = {
++        let provider = DISPLAY_PROVIDER.lock().unwrap_or_else(|error| error.into_inner());
++        inputs.reset || !provider.has_history || provider.history_stream.is_some()
++    };
++    let receipt = external::RrDisplayRecording::new(token, finish_display, reset);
+     let guides = Guides {
+         color: inputs.hdr,
+         depth: inputs.depth,
+@@ -128,7 +187,7 @@ pub(super) fn record_display(
+         motion_scale: inputs.frame.motion_scale,
+         frame_time_ms: inputs.frame.frame_time_ms,
+         pre_exposure: inputs.frame.pre_exposure,
+-        reset: inputs.reset,
++        reset,
+     };
+     // SAFETY: the native slot proves its producer order, snapshot states,
+     // exact stock output UAV and fencing on the title direct queue.
+@@ -136,7 +195,8 @@ pub(super) fn record_display(
+         .map_err(|error| match error {
+             Error::Invalid(reason) | Error::RecordingFailed(reason) => reason,
+             Error::Unavailable => "NGX feature 13 unavailable",
+-        })
++        })?;
++    Ok(receipt)
+ }
+
+ /// # Safety
+@@ -147,7 +207,12 @@ pub(super) unsafe fn record_shadow(
+     guides: &Guides<'_>,
+     frame: &Frame,
+ ) -> Result<(), Error> {
+-    unsafe { record_on_stream(&SHADOW_PROVIDER, commands, guides, frame, None) }
++    let provider = if guides.color_before_transparency.is_some() {
++        &GLASS_SHADOW_PROVIDER
++    } else {
++        &SHADOW_PROVIDER
++    };
++    unsafe { record_on_stream(provider, commands, guides, frame, None) }
+ }
+
+ /// Record RR and attach the camera receipt to its own direct command list.
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+index 1a2b02a..97b9bdd 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+@@ -66,6 +66,7 @@ fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(),
+         })?
+     };
+     let mut last: Option<ShadowStamp> = None;
++    let mut guided_last: Option<ShadowStamp> = None;
+     let mut evaluated = 0;
+     while evaluated < limit {
+         let Ok(inputs) = receive.recv_timeout(Duration::from_secs(15)) else {
+@@ -100,7 +101,30 @@ fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(),
+                 submission: inputs.submission,
+             },
+         };
+-        evaluate(&device, &queue, inputs, reset)?;
++        let compare = pair_folder().is_some()
++            && std::env::var_os("VICTORY_RR_GLASS_COMPARE").is_some_and(|value| value == "1");
++        if compare && inputs.color_before_transparency.is_some() {
++            let guided_reset = !guided_last.is_some_and(|prior| {
++                prior.matches_previous(inputs.present, inputs.stream, inputs.previous_camera)
++            });
++            evaluate(&device, &queue, inputs.clone(), reset, false)?;
++            match evaluate(&device, &queue, inputs, guided_reset, true) {
++                Ok(()) => guided_last = Some(current),
++                Err(error) => {
++                    guided_last = None;
++                    tracing::warn!(%error, present = current.present, "RR before-transparency comparison unavailable");
++                }
++            }
++        } else {
++            if compare {
++                tracing::warn!(
++                    present = inputs.present,
++                    "RR before-transparency comparison has no exact native background snapshot"
++                );
++            }
++            guided_last = None;
++            evaluate(&device, &queue, inputs, reset, false)?;
++        }
+         last = Some(current);
+         evaluated += 1;
+     }
+@@ -185,6 +209,7 @@ fn evaluate(
+     queue: &ID3D12CommandQueue,
+     inputs: external::RrShadowInputs,
+     reset: bool,
++    with_transparency_guide: bool,
+ ) -> Result<(), Error> {
+     // SAFETY: all inputs are immutable, fence-retired snapshots from this device.
+     unsafe {
+@@ -263,7 +288,18 @@ fn evaluate(
+             specular_albedo: &inputs.material.specular,
+             normals_roughness: &inputs.material.normal_roughness,
+             reflections: rr::Reflections::Motion(&inputs.reflection_motion),
+-            color_before_transparency: None,
++            color_before_transparency: if with_transparency_guide {
++                Some(
++                    inputs
++                        .color_before_transparency
++                        .as_ref()
++                        .ok_or(Error::Invalid(
++                            "missing exact native before-transparency color",
++                        ))?,
++                )
++            } else {
++                None
++            },
+             depth_of_field: inputs.depth_of_field.as_ref(),
+             output: &output,
+         };
+@@ -331,7 +367,13 @@ fn evaluate(
+             Err(Error::Invalid("output readback pointer"))
+         } else {
+             let pixels = std::slice::from_raw_parts(ptr.cast::<u16>(), readback_bytes / 2);
+-            report(&inputs, &pixels[..PIXELS * 4], reset).and_then(|rr_hash| {
++            report(
++                &inputs,
++                &pixels[..PIXELS * 4],
++                reset,
++                with_transparency_guide,
++            )
++            .and_then(|rr_hash| {
+                 if let Some((folder, serial, _)) = pair {
+                     let rr = &pixels[..PIXELS * 4];
+                     let sr = &pixels[PIXELS * 4..];
+@@ -345,8 +387,16 @@ fn evaluate(
+                     if sr_nonzero == 0 {
+                         return Err(Error::Invalid("empty stock 4K SR control"));
+                     }
+-                    save_pair(folder, &inputs, serial, reset, (rr, rr_hash), (sr, sr_hash))
+-                        .map_err(Error::Export)?;
++                    save_pair(
++                        folder,
++                        &inputs,
++                        serial,
++                        reset,
++                        with_transparency_guide,
++                        (rr, rr_hash),
++                        (sr, sr_hash),
++                    )
++                    .map_err(Error::Export)?;
+                 }
+                 Ok(())
+             })
+@@ -357,13 +407,19 @@ fn evaluate(
+     Ok(())
+ }
+
+-fn report(inputs: &external::RrShadowInputs, output: &[u16], reset: bool) -> Result<u64, Error> {
++fn report(
++    inputs: &external::RrShadowInputs,
++    output: &[u16],
++    reset: bool,
++    with_transparency_guide: bool,
++) -> Result<u64, Error> {
+     let (finite, touched, nonzero, digest) = output_stats(output);
+     let complete = finite == PIXELS && touched == PIXELS && nonzero > 0;
+     tracing::info!(
+         feature = 13,
+         complete,
+         reset,
++        color_before_transparency = with_transparency_guide,
+         output = ?UHD.output,
+         present = inputs.present,
+         begun = inputs.begun,
+@@ -388,11 +444,20 @@ fn save_pair(
+     inputs: &external::RrShadowInputs,
+     sr_serial: u64,
+     reset: bool,
++    with_transparency_guide: bool,
+     (rr, rr_hash): (&[u16], u64),
+     (sr, sr_hash): (&[u16], u64),
+ ) -> io::Result<()> {
+     std::fs::create_dir_all(folder)?;
+-    let stem = format!("frame-{}-submit-{}", inputs.present, inputs.submission);
++    let suffix = if with_transparency_guide {
++        "-before-transparency"
++    } else {
++        ""
++    };
++    let stem = format!(
++        "frame-{}-submit-{}{suffix}",
++        inputs.present, inputs.submission
++    );
+     let staging = folder.join(format!(".{stem}-{}.part", std::process::id()));
+     let pair = folder.join(stem);
+     std::fs::create_dir(&staging)?;
+@@ -405,7 +470,7 @@ fn save_pair(
+         std::fs::write(
+             staging.join("receipt.txt"),
+             format!(
+-                "tap=FFX upscaler output before title postprocessing\nreference=stock SR same dispatch\nfeature=13\nwidth={WIDTH}\nheight={HEIGHT}\nformat=RGBA16F native HDR\npresent={}\nbegun={}\nepoch={}\nsubmit={}\nsource_submit={}\nsr_serial={sr_serial}\nreset={reset}\nprevious_camera_begun={}\nprevious_camera_epoch={}\nprevious_camera_submit={}\npre_exposure={}\nrr_fnv1a64={rr_hash:016x}\nsr_fnv1a64={sr_hash:016x}\n",
++                "tap=FFX upscaler output before title postprocessing\nreference=stock SR same dispatch\nfeature=13\nwidth={WIDTH}\nheight={HEIGHT}\nformat=RGBA16F native HDR\npresent={}\nbegun={}\nepoch={}\nsubmit={}\nsource_submit={}\nsr_serial={sr_serial}\nreset={reset}\ncolor_before_transparency={with_transparency_guide}\nprevious_camera_begun={}\nprevious_camera_epoch={}\nprevious_camera_submit={}\npre_exposure={}\nrr_fnv1a64={rr_hash:016x}\nsr_fnv1a64={sr_hash:016x}\n",
+                 inputs.present,
+                 inputs.begun,
+                 inputs.epoch,

@@ -217,7 +217,7 @@ counter in the diagnostics build records the first use of each linked pipeline.
 tippythetaidum’s half-view work and the associated Linux tests are recorded
 with the original source patch at commit `4331d2b`. Its matched checkpoint
 runs measured 5.17 FPS on the historical baseline and 5.19 FPS with PR927.
-[Historical source kit](https://github.com/ThomasHFWright/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
+[Historical source kit](https://github.com/TomTomAIbot/LinVxtory/tree/4331d2b95ab2a56af74884c1b62a2966a35588b3/docs/pr995-candidate) · [Linux integration notes](../pr927-integration.md)
 
 ## Small buffer copies in GPU memory
 
