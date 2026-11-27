@@ -1,0 +1,633 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 33e0ec5b8c96c806f635a6990f2babde67261215..055527057fdfed569b5f940bb85eec027122f8bf 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -2994,6 +2994,8 @@ impl State {
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
+         #[cfg(feature = "diagnostics")]
++        self.trace_provenance(list, "dispatch", true);
++        #[cfg(feature = "diagnostics")]
+         if crate::pipeline::is_builder(self.pipeline as This) {
+             crate::capture::op(list as *const _ as usize, || format!("builder {}", p.name));
+             self.list_dropped_roots([x, y, z]);
+@@ -3163,6 +3165,86 @@ impl State {
+         }
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    fn traced_table_view(&self, compute: bool, slot: u8, offset: u32) -> Option<View> {
++        let Root::Table(base) = self.roots_ref(compute).get(usize::from(slot))? else {
++            return None;
++        };
++        let heap = self.heap_of(*base)?;
++        let handle = base.checked_add(u64::from(offset) * 4)?;
++        if heap.samplers() || heap.index(handle.checked_add(11)?).is_none() {
++            return None;
++        }
++        crate::descriptor::view(handle)
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn trace_provenance(&self, list: &HostList, name: &'static str, compute: bool) {
++        use crate::provenance::{Pass, active};
++        if !active() {
++            return;
++        }
++        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
++            return;
++        };
++        let mut pass = Pass::new(name, self.pipeline);
++        if !compute {
++            for (slot, &handle) in self.target_handles.iter().enumerate() {
++                if let Some(target) = crate::descriptor::rtv_record(handle) {
++                    pass.texture(
++                        "rt", (true, true), (slot as u32, 0), target.resource,
++                        target.desc().map(|d| d.Format.0 as u32),
++                    );
++                }
++            }
++            let format = crate::descriptor::dsv_record(self.depth_handle)
++                .and_then(|record| record.depth_desc()).map(|d| d.Format.0 as u32);
++            pass.texture(
++                "ds", (true, self.depth_state != DEPTH_READ), (0, 0), self.depth as This, format,
++            );
++        }
++        for stage in &p.stages {
++            pass.shader(&stage.shader.hash);
++            let t = stage.translated();
++            let mut view = |slot: u8, offset: u32, expected: Option<ResourceType>| {
++                let Some(binding) = self.traced_table_view(compute, slot, offset) else {
++                    return;
++                };
++                let (role, writes, resource, desc) = match (expected, binding) {
++                    (None | Some(ResourceType::Srv), View::Shader(r, d)) => ("srv", false, r, d),
++                    (None | Some(ResourceType::Uav), View::Unordered(r, _, d)) => ("uav", true, r, d),
++                    (None | Some(ResourceType::Srv), View::Placed(false, r, d)) => {
++                        let address = u64::from(d[10]) | u64::from(d[11]) << 32;
++                        let Some(resource) = crate::resource::texture_at_made(address, &r) else {
++                            return;
++                        };
++                        ("srv_placed", false, resource as usize, d[..10].try_into().ok())
++                    }
++                    _ => return,
++                };
++                pass.texture(
++                    role, (true, writes), (u32::from(slot), offset), resource as This,
++                    desc.map(|d| crate::resource::pc_format(d[0])),
++                );
++            };
++            for u in &t.used {
++                if u.root == RootType::Table && matches!(u.kind, ResourceType::Srv | ResourceType::Uav) {
++                    view(u.slot, u.table_offset_dwords, Some(u.kind));
++                }
++            }
++            for index in &t.host.root_indexed_views {
++                let constant = self.user_value(
++                    compute, index.constant_slot, RootType::Constants, index.constant_dword,
++                );
++                let byte = index.byte_offset.wrapping_add(constant << index.shift);
++                if byte / 32 < crate::descriptor::host::DYNAMIC {
++                    view(index.table_slot, byte / 32 * 8, None);
++                }
++            }
++        }
++        list.provenance(pass);
++    }
++
+     /// What a draw or dispatch runs, for the device-removed report
+     /// (diagnostics): the pipeline, then per stage the user data it gets
+     /// (with the view at that heap index, if one is), the host addresses
+@@ -3427,6 +3509,8 @@ impl State {
+                 Ok(l6) => {
+                     #[cfg(feature = "diagnostics")]
+                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
++                    #[cfg(feature = "diagnostics")]
++                    self.trace_provenance(list, "mesh", false);
+                     self.mesh_scissor(list, true);
+                     #[cfg(feature = "diagnostics")]
+                     if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+@@ -3897,9 +3981,8 @@ impl State {
+             let t = stage.translated();
+             for u in &t.used {
+                 let what = match (u.root, self.roots_ref(compute).get(usize::from(u.slot))) {
+-                    (RootType::Table, Some(Root::Table(table))) => {
+-                        let handle = table + u64::from(u.table_offset_dwords) * 4;
+-                        describe(crate::descriptor::view(handle).as_ref())
++                    (RootType::Table, Some(Root::Table(_))) => {
++                        describe(self.traced_table_view(compute, u.slot, u.table_offset_dwords).as_ref())
+                     }
+                     (root, _) => format!("{root:?}"),
+                 };
+@@ -3937,6 +4020,8 @@ impl State {
+             };
+             #[cfg(feature = "diagnostics")]
+             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
++            #[cfg(feature = "diagnostics")]
++            self.trace_provenance(list, "draw", false);
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+@@ -4042,6 +4127,8 @@ impl State {
+         if ran {
+             #[cfg(feature = "diagnostics")]
+             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
++            #[cfg(feature = "diagnostics")]
++            self.trace_provenance(list, "indexed", false);
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+@@ -4262,6 +4349,8 @@ impl State {
+                 #[cfg(feature = "diagnostics")]
+                 list.note_op(|| self.op_text(format!("indirect mesh at {arguments:#x} launched"), false));
+                 #[cfg(feature = "diagnostics")]
++                self.trace_provenance(list, "indirect_mesh", false);
++                #[cfg(feature = "diagnostics")]
+                 list.ran_indirect(launch.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+                 self.mesh_scissor(list, true);
+                 crate::launch::record(&l6, launch.first, args.gpu(arguments), budget, crate::indirect::rest());
+@@ -4380,6 +4469,8 @@ impl State {
+             self.op_text(format!("indirect kind {kind} max {max} at {arguments:#x}"), kind == DISPATCH)
+         });
+         #[cfg(feature = "diagnostics")]
++        self.trace_provenance(list, "indirect", kind == DISPATCH);
++        #[cfg(feature = "diagnostics")]
+         list.ran_indirect(p.pso.as_raw() as usize, &p.name, kind, max, &self.user);
+         if kind == MESH {
+             self.mesh_scissor(list, true);
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 25b4803e4c46ba07080478e7b3fad52fe43866e8..0d8a57ce0e9acc38632d0db053235575593fe399 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -39,6 +39,24 @@ impl Recording<'_> {
+         Some(())
+     }
+ 
++    /// Records the actual evaluated FidelityFX resource handoff for diagnostics.
++    #[cfg(feature = "diagnostics")]
++    pub fn trace_upscale(&self, color: This, depth: This, motion: This, output: This) {
++        crate::capture::op(std::ptr::from_ref(self.0) as usize, || {
++            format!("FFX_NGX_SR color={color:?} depth={depth:?} motion={motion:?} output={output:?}")
++        });
++        if crate::provenance::active() {
++            let mut pass = crate::provenance::Pass::new("FFX_NGX_SR", 0);
++            for (slot, (role, resource, write)) in [
++                ("color", color, false), ("depth", depth, false),
++                ("motion", motion, false), ("output", output, true),
++            ].into_iter().enumerate() {
++                pass.texture(role, (!write, write), (slot as u32, 0), resource, None);
++            }
++            self.0.provenance(pass);
++        }
++    }
++
+     /// Access flushes any pending host barriers before the provider runs.
+     pub fn commands(&self) -> &ID3D12GraphicsCommandList {
+         &self.0.list
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..2f05a2da11c876f87a553d84bf5c1e6ff75010bd 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1436,6 +1436,8 @@ pub(crate) struct HostList {
+     /// data without marker texts), with the host GPU range a copy reads.
+     #[cfg(feature = "diagnostics")]
+     notes: std::sync::Arc<Mutex<Vec<Note>>>,
++    #[cfg(feature = "diagnostics")]
++    provenance: Mutex<crate::provenance::Recording>,
+     /// With `VICTORY_GPU_TIMING`: a GPU timestamp before each noted command
+     /// and at the end, and where they are read back.
+     #[cfg(feature = "diagnostics")]
+@@ -4694,6 +4696,8 @@ impl Host {
+                 #[cfg(feature = "diagnostics")]
+                 notes,
+                 #[cfg(feature = "diagnostics")]
++                provenance: Mutex::default(),
++                #[cfg(feature = "diagnostics")]
+                 stamps: OnceLock::new(),
+             })
+         }
+@@ -6379,6 +6383,8 @@ impl Host {
+         }
+         #[cfg(feature = "diagnostics")]
+         let sending = crate::timeline::ticks();
++        #[cfg(feature = "diagnostics")]
++        crate::provenance::submitted(this_submission, runs);
+         if late {
+             *submitted += 1;
+             #[cfg(feature = "diagnostics")]
+@@ -7019,6 +7025,10 @@ impl HostList {
+         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         #[cfg(feature = "diagnostics")]
+         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
++        #[cfg(feature = "diagnostics")]
++        if crate::provenance::enabled() {
++            *self.provenance_recording() = Default::default();
++        }
+         {
+             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+             (scratch.current, scratch.used) = (0, 0);
+@@ -7465,6 +7475,16 @@ impl HostList {
+         list.cast().ok()
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn provenance_recording(&self) -> std::sync::MutexGuard<'_, crate::provenance::Recording> {
++        self.provenance.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn provenance(&self, pass: crate::provenance::Pass) {
++        self.provenance_recording().push(pass);
++    }
++
+     /// Notes what the command about to be recorded does, as a marker
+     /// command whose text the list keeps (diagnostics, with device-removed
+     /// data on): the report pairs the breadcrumbs' marker commands with the
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index df03e719b155445730e2ae3584cabe9fc3659db8..c06426dd42948940480b8b3448b04ccf15f3b757 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -25,6 +25,8 @@ mod texlate;
+ mod texstore;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod capture;
++#[cfg(all(windows, feature = "diagnostics"))]
++mod provenance;
+ #[cfg(windows)]
+ mod compose;
+ pub mod console;
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index 1e60358b6ce5fecbd4789760c15ce983a538490a..1eb6b1687c8aca647c8997503e1aadf3ae355d1f 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -955,6 +955,8 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
+             ensure_state(list, src, COPY_SOURCE);
+             #[cfg(feature = "diagnostics")]
+             list.note_op(|| format!("copy resource {src:?} to {dst:?}"));
++            #[cfg(feature = "diagnostics")]
++            crate::provenance::transfer(list, "copy_resource", src, dst);
+             // SAFETY: an open list and live textures.
+             unsafe { list.list.CopyResource(to, from) };
+         } else if let (Some((to, a)), Some((from, b))) = (
+@@ -1147,6 +1149,8 @@ extern "system" fn copy_texture_region(
+             return;
+         }
+         ensure_state(list, dst.resource, COPY_DEST);
++        #[cfg(feature = "diagnostics")]
++        crate::provenance::transfer(list, "copy_region", src.resource, dst.resource);
+         let mut to_location = dst;
+         to_location.resource = to.as_raw().cast_const().cast();
+         let host_box = (!source_box.is_null()).then(|| source_box.cast::<D3D12_BOX>());
+@@ -1305,6 +1309,8 @@ extern "system" fn resolve(
+         crate::texture::host_written(dst);
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| format!("resolve {src:?} to {dst:?} format {format}"));
++        #[cfg(feature = "diagnostics")]
++        crate::provenance::transfer(list, "resolve", src, dst);
+         // SAFETY: an open list and live textures; the region is inside both.
+         unsafe {
+             let (a, b) = (to.GetDesc(), from.GetDesc());
+@@ -1374,6 +1380,8 @@ extern "system" fn clear_rtv(
+             unsafe { std::slice::from_raw_parts(rects.cast(), count as usize) }
+         });
+         const RENDER_TARGET: u32 = 0x4;
++        #[cfg(feature = "diagnostics")]
++        crate::provenance::transfer(list, "clear_rt", std::ptr::null(), record.resource);
+         let rtv = host.rtv(Some(texture), record.desc().as_ref());
+         // SAFETY: an open list, a fresh view of a live texture.
+         unsafe {
+@@ -1428,6 +1436,8 @@ extern "system" fn clear_dsv(
+         if crate::resource::depth_and_unordered(record.resource) {
+             crate::resource::DEPTH_UNORDERED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         }
++        #[cfg(feature = "diagnostics")]
++        crate::provenance::transfer(list, "clear_depth", std::ptr::null(), record.resource);
+         let dsv = host.dsv(texture, record.depth_desc().as_ref());
+         // SAFETY: an open list, a fresh view of a live texture.
+         unsafe {
+diff --git a/crates/victory-gpu/src/provenance.rs b/crates/victory-gpu/src/provenance.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..6164f00685e884434093c525565a6e75dd7292ae
+--- /dev/null
++++ b/crates/victory-gpu/src/provenance.rs
+@@ -0,0 +1,289 @@
++//! Bounded CPU-side texture binding history, written in host submission order.
++//! shortcut: accesses cover texture bindings and title copies at resource
++//! granularity, add GPU-resolved descriptor indices and subresource coverage
++//! when candidate bindings cannot establish the required chain.
++
++use std::collections::HashMap;
++use std::fmt::Write as _;
++use std::io::{BufWriter, Write as _};
++use std::sync::{Mutex, OnceLock};
++
++use crate::host::HostList;
++use crate::object::This;
++use windows::core::Interface;
++
++const MAX_PASSES_PER_LIST: usize = 2048;
++const MAX_BINDINGS: usize = 128;
++const MAX_ROWS_PER_FRAME: usize = 200_000;
++
++struct Capture {
++    warmup: u64,
++    last: u64,
++    path: std::ffi::OsString,
++}
++
++fn capture() -> Option<&'static Capture> {
++    static CAPTURE: OnceLock<Option<Capture>> = OnceLock::new();
++    CAPTURE
++        .get_or_init(|| {
++            let path = std::env::var_os("VICTORY_PROVENANCE")?;
++            let frames = std::env::var("VICTORY_PROVENANCE_FRAMES").ok()?;
++            let (first, last) = frames.split_once('-').unwrap_or((&frames, &frames));
++            let (first, last): (u64, u64) = (first.parse().ok()?, last.parse().ok()?);
++            (last.checked_sub(first)? < 8).then_some(Capture {
++                warmup: first.saturating_sub(2),
++                last,
++                path,
++            })
++        })
++        .as_ref()
++}
++
++fn frame() -> u64 {
++    crate::queue::presented() + 1
++}
++
++pub(crate) fn enabled() -> bool {
++    capture().is_some()
++}
++
++pub(crate) fn active() -> bool {
++    capture().is_some_and(|c| (c.warmup..=c.last).contains(&frame()))
++}
++
++#[derive(Default)]
++pub(crate) struct Recording {
++    passes: Vec<Pass>,
++    truncated: bool,
++}
++
++pub(crate) struct Pass {
++    name: &'static str,
++    recorded: u64,
++    pipeline: usize,
++    shaders: String,
++    bindings: Vec<Binding>,
++    truncated: bool,
++}
++
++struct Binding {
++    role: &'static str,
++    read: bool,
++    write: bool,
++    slot: u32,
++    offset: u32,
++    title: usize,
++    serial: u64,
++    host: usize,
++    dimensions: [u64; 3],
++    format: i32,
++    view: Option<u32>,
++}
++
++impl Pass {
++    pub(crate) fn new(name: &'static str, pipeline: usize) -> Self {
++        Self {
++            name,
++            recorded: frame(),
++            pipeline,
++            shaders: String::new(),
++            bindings: Vec::new(),
++            truncated: false,
++        }
++    }
++
++    pub(crate) fn shader(&mut self, hash: &str) {
++        if !self.shaders.is_empty() {
++            self.shaders.push(',');
++        }
++        self.shaders.push_str(hash);
++    }
++
++    pub(crate) fn texture(
++        &mut self,
++        role: &'static str,
++        (read, write): (bool, bool),
++        (slot, offset): (u32, u32),
++        title: This,
++        view: Option<u32>,
++    ) {
++        let Some(copy) = crate::resource::made_copy(title) else {
++            return;
++        };
++        if self.bindings.len() == MAX_BINDINGS {
++            self.truncated = true;
++            return;
++        }
++        // SAFETY: the Arc keeps the backing allocation alive.
++        let d = unsafe { copy.texture.GetDesc() };
++        self.bindings.push(Binding {
++            role,
++            read,
++            write,
++            slot,
++            offset,
++            title: title as usize,
++            serial: copy.serial,
++            host: copy.texture.as_raw() as usize,
++            dimensions: [d.Width, d.Height.into(), d.DepthOrArraySize.into()],
++            format: d.Format.0,
++            view,
++        });
++    }
++}
++
++impl Recording {
++    pub(crate) fn push(&mut self, pass: Pass) {
++        if pass.bindings.is_empty() {
++            return;
++        }
++        if self.passes.len() == MAX_PASSES_PER_LIST {
++            self.truncated = true;
++            return;
++        }
++        self.passes.push(pass);
++    }
++}
++
++pub(crate) fn transfer(list: &HostList, name: &'static str, source: This, target: This) {
++    if active() {
++        let mut pass = Pass::new(name, 0);
++        pass.texture("source", (true, false), (0, 0), source, None);
++        pass.texture("target", (false, true), (0, 0), target, None);
++        list.provenance(pass);
++    }
++}
++
++type Versions = HashMap<u64, u64>;
++
++fn advance(versions: &mut Versions, accesses: impl Iterator<Item = (u64, bool)>) {
++    // One new version per written resource, even if several bindings alias it.
++    let mut written = [0; MAX_BINDINGS];
++    let mut count = 0;
++    for (serial, write) in accesses {
++        if write && !written[..count].contains(&serial) {
++            written[count] = serial;
++            count += 1;
++            *versions.entry(serial).or_default() += 1;
++        }
++    }
++}
++
++struct Output {
++    file: BufWriter<std::fs::File>,
++    versions: Versions,
++    rows: usize,
++    frame: u64,
++    failed: bool,
++}
++
++pub(crate) fn submitted(sequence: u64, lists: &[&HostList]) {
++    if !active() {
++        return;
++    }
++    static OUTPUT: OnceLock<Option<Mutex<Output>>> = OnceLock::new();
++    let Some(output) = OUTPUT.get_or_init(|| {
++        let file = match std::fs::File::create(&capture()?.path) {
++            Ok(file) => file,
++            Err(error) => {
++                tracing::warn!(%error, "could not open texture provenance output");
++                return None;
++            }
++        };
++        let mut file = BufWriter::new(file);
++        writeln!(file, "frame\tsubmit\tlist_index\tlist_epoch\tpass\trecorded_frame\tkind\tpipeline\tshaders\trole\tslot\toffset\ttitle\tserial\thost\twidth\theight\tdepth_or_array\tresource_format\tview_format\treads\twrites").ok()?;
++        Some(Mutex::new(Output { file, versions: Versions::new(), rows: 0, frame: 0, failed: false }))
++    }) else {
++        return;
++    };
++    let mut output = output.lock().unwrap_or_else(|e| e.into_inner());
++    let frame = frame();
++    if output.frame != frame {
++        output.frame = frame;
++        output.rows = 0;
++    }
++    if output.failed || output.rows >= MAX_ROWS_PER_FRAME {
++        return;
++    }
++    if let Err(error) = output.write_submission(frame, sequence, lists) {
++        output.failed = true;
++        tracing::warn!(%error, "could not write texture provenance output");
++    }
++}
++
++impl Output {
++    fn write_submission(
++        &mut self,
++        frame: u64,
++        sequence: u64,
++        lists: &[&HostList],
++    ) -> std::io::Result<()> {
++        for (list_index, list) in lists.iter().enumerate() {
++            let recording = list.provenance_recording();
++            let epoch = list.epoch();
++            if recording.truncated {
++                writeln!(
++                    self.file,
++                    "# truncated list {sequence}/{list_index}/{epoch}"
++                )?;
++            }
++            for (order, pass) in recording.passes.iter().enumerate() {
++                if self.rows + pass.bindings.len() >= MAX_ROWS_PER_FRAME {
++                    writeln!(
++                        self.file,
++                        "# truncated frame {frame} at {MAX_ROWS_PER_FRAME} rows"
++                    )?;
++                    self.rows = MAX_ROWS_PER_FRAME;
++                    return self.file.flush();
++                }
++                if pass.truncated {
++                    writeln!(
++                        self.file,
++                        "# truncated bindings {sequence}/{list_index}/{order}"
++                    )?;
++                }
++                let mut prefix = String::new();
++                let _ = write!(
++                    prefix,
++                    "{frame}\t{sequence}\t{list_index}\t{epoch}\t{order}\t{}\t{}\t{:#x}\t{}",
++                    pass.recorded, pass.name, pass.pipeline, pass.shaders
++                );
++                for b in &pass.bindings {
++                    let old = self.versions.get(&b.serial).copied().unwrap_or(0);
++                    let [w, h, d] = b.dimensions;
++                    writeln!(
++                        self.file,
++                        "{prefix}\t{}\t{}\t{}\t{:#x}\t{}\t{:#x}\t{w}\t{h}\t{d}\t{}\t{}\t{}\t{}",
++                        b.role,
++                        b.slot,
++                        b.offset,
++                        b.title,
++                        b.serial,
++                        b.host,
++                        b.format,
++                        b.view.map(|v| v.to_string()).unwrap_or_default(),
++                        b.read.then(|| old.to_string()).unwrap_or_default(),
++                        b.write.then(|| (old + 1).to_string()).unwrap_or_default(),
++                    )?;
++                }
++                self.rows += pass.bindings.len();
++                advance(
++                    &mut self.versions,
++                    pass.bindings.iter().map(|b| (b.serial, b.write)),
++                );
++            }
++        }
++        self.file.flush()
++    }
++}
++
++#[test]
++fn a_pass_increments_shared_writes_once_and_does_not_increment_reads() {
++    let mut versions = Versions::new();
++    advance(
++        &mut versions,
++        [(9, false), (3, true), (3, true)].into_iter(),
++    );
++    advance(&mut versions, [(3, false), (4, true)].into_iter());
++    assert_eq!(versions, Versions::from([(3, 1), (4, 1)]));
++}
+diff --git a/crates/victory-gpu/src/texture.rs b/crates/victory-gpu/src/texture.rs
+index 404cd15a11fc23a21bf7d2b1cedfb78b2cc2266f..98247c831599d733a53ee0b6bbb2fa7087f13224 100644
+--- a/crates/victory-gpu/src/texture.rs
++++ b/crates/victory-gpu/src/texture.rs
+@@ -313,6 +313,8 @@ pub(crate) fn alias(list: &HostList, placed: This, source: This) -> bool {
+     );
+     #[cfg(feature = "diagnostics")]
+     list.note_op(|| format!("alias copy of {source:?} into {placed:?}"));
++    #[cfg(feature = "diagnostics")]
++    crate::provenance::transfer(list, "alias", source, placed);
+     // SAFETY: an open list and live resources; the buffer is as big as
+     // the footprints and rests in the common state between copies.
+     unsafe {
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index d1a740bad974029bcdbc6d72c24ce6a01426ecca..4363c98b8b61b57106559e1383b2baa2c4aaf30d 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -478,6 +478,13 @@ fn record(
+         tracing::warn!(result, "NGX did not evaluate the upscale");
+         return Err("NGX evaluation failed");
+     }
++    #[cfg(feature = "diagnostics")]
++    list.trace_upscale(
++        info.resources[0].resource.cast::<Object>(),
++        info.resources[1].resource.cast::<Object>(),
++        info.resources[2].resource.cast::<Object>(),
++        output,
++    );
+     external::output_written(output);
+     Ok(())
+ }

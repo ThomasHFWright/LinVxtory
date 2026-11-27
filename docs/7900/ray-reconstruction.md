@@ -164,3 +164,56 @@ Use the original external control directory for SR replays. A future
 in-game caller must choose SR before it skips stock denoising and handle
 a failure during NGX recording without presenting a partially written
 command list.
+
+## Submitted 720p cell frame
+
+A guarded SR replay captured the cell at frame 1780 on the real AOC window.
+The trace contains 154,683 texture-binding rows across 15,381 recorded
+operations in its three-frame window, with zero truncation markers. The
+separately captured SR input/output tuple matched the one in submission
+9156, list 31, pass 6. Recording occurred in presentation interval 1779,
+and the list was submitted in interval 1780. Correlate by submission and
+backing identity across the interval boundary.
+
+| Handoff | Backing at this SR call | Observed binding immediately upstream or downstream |
+| --- | --- | --- |
+| Color | 1280×720 RGBA16F | DOF composite bound it as a render target immediately before SR. The preceding heat-haze pass also bound the scene color for writing. |
+| Depth | 1280×720 R32G8X24 typeless | Alpha velocity/depth resolve was its last observed writer binding. |
+| Primary motion | 1280×720 RG16F | Heat haze bound it for UAV access. Its actual per-pixel contribution needs numeric validation. |
+| Output | 3840×2160 RGBA16F | Display-resolution tiled hair filtering reads the reconstructed scene. |
+
+The trace follows an alpha-reflection denoising product through a packed
+radiance alias into the heat-haze and DOF color path. RR cannot receive
+fresh noisy HDR by simply selecting feature 13 at the SR call. Moving the
+evaluation before DOF also requires a valid 4K continuation for the later
+effects and hair. The frame image shows the rear ponytail, wire window and
+lit cell; it is an SR reference.
+
+To reproduce this diagnostic, apply the [graph trace source
+overlay](rr-graph.patch.txt) to a separate fresh reconstruction of the
+4K control. From the kit root:
+
+```sh
+kit=$(realpath docs/7900)
+sh build.sh "$TRACE_SRC"
+cd "$TRACE_SRC"
+test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
+git apply --index "$kit/rr-graph.patch.txt"
+test "$(git write-tree)" = 15258f1aa5fa8f547be63ad68b246bdbe37da942
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Use the [4K control replay settings](README.md#build-and-launch) and choose
+a frame in the cell. The frame number varies with loading. Set
+`VICTORY_PROVENANCE` to a writable private Windows filename,
+`VICTORY_PROVENANCE_FRAMES` to the selected frame, `VICTORY_CAPTURE` to
+an existing private Windows directory, and `VICTORY_CAPTURE_FRAMES` to
+the same frame number. The diagnostic includes two warm-up intervals.
+
+The TSV records declared texture accesses, including backing serial,
+version, shape, typed view where available, and host queue order. RTV and
+UAV bindings are potential writes. The trace does not establish per-pixel
+execution, subresource coverage, all GPU-dependent bindless reads, or GPU
+completion. Stop following a producer chain at a truncation or unknown
+version. Run timing comparisons with tracing disabled.

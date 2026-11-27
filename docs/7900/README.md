@@ -25,6 +25,9 @@ ponytail, wire window and lighting remained visible in the cell.
 This is one 4K baseline replay. A matched speed comparison and longer
 session have yet to run. The feature in this build is Super Resolution.
 
+The [Ray Reconstruction research](ray-reconstruction.md) includes separate
+4K hardware probes and the submitted cell-frame graph.
+
 ## Build and launch
 
 Set up Rust 1.98.1 and the Windows x64 MSVC cross toolchain, with Cargo's
