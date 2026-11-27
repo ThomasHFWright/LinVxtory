@@ -909,3 +909,12 @@ SR command. Its signal and accepted 4K Present identify stock SR with
 all replacement flags clear. The same signal certified the camera for
 the next frame, and the replay presented full-route RR after the warmup.
 [Reproduction and opt-in build](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
+
+In the first camera-turn run of this build, 227 of 229 accepted Presents
+used the full RR route and the other two used exact stock SR. The native
+Presents show confirmed fallback at 2004 and 2071. The 47 verified RR
+images show the ponytail and newly revealed lighting on the wall and
+shelf. Nearby frames around the shelf showed no large duplicate edges.
+The two replays reached different character and door poses, so this
+sample cannot estimate a matched disocclusion error. Pipeline first-use
+work overlapped the capture window. Timing comes from a separate run.
