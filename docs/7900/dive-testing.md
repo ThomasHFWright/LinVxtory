@@ -170,3 +170,36 @@ continued to present 4K SR.
 The next replay reproduced the same-frame material and camera join and
 evaluated RR offscreen at Present 1918. The AOC showed the title’s SR
 output. [4K output and guide coverage](ray-reconstruction.md#offscreen-title-evaluation-at-present-1918)
+
+## Capture native 4K SR and RR from one game frame
+
+After applying the four cell-test patches, add the optional [HDR pair
+overlay](rr-cell-pair.patch.txt) and rebuild with the same diagnostics
+flags. This adds a local EXR writer and a bounded evaluation sequence.
+
+```sh
+git apply --index "$kit/rr-cell-pair.patch.txt"
+test "$(git write-tree)" = 5025e20d5658f9a3691999bd85fa726dcc5c4b26
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Set `VICTORY_RR_PAIR_DIR` to a fresh, writable Windows path in the
+run’s private capture directory. Set `VICTORY_RR_SHADOW_LIMIT=4`
+and `VICTORY_DOF_GUIDE=1` in addition to the cell-test flags above.
+Arm the five-Present trigger after the playable scene appears. Allow
+about 127 MiB for each two-image pair.
+
+Each completed `frame-<present>-submit-<submission>` directory contains
+`rr.exr`, `sr.exr` and `receipt.txt`. Both images preserve the native
+3840×2160 RGBA16F upscaler output before downstream title post-processing
+and UI. Both use the same experimental current-frame lighting and
+post-filter cuts. The reference is the SR provider in this experiment.
+Use the published control separately to compare against its native lighting.
+
+Use the same exposure and view transform on both images. Record the
+Present, preceding camera receipt, reset flag, pre-exposure and hashes.
+A continuous history sequence starts with a reset and only reuses history
+when the current view references the preceding accepted camera. The
+title continues to present SR during this comparison. Keep the EXRs and
+game images local.
