@@ -75,6 +75,8 @@ script checks all 263 original inputs when it reconstructs the measured
 4K tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`. It checks each
 subsequent overlay tree before building the diagnostic DLSS profile.
 [Current build locks](perf-build-trees.txt)
+The last overlay, [dt-max.patch.txt](dt-max.patch.txt), adds the opt-in
+`VICTORY_DT_MAX` switch and changes nothing while it is unset.
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
@@ -123,6 +125,12 @@ export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
 This selects the 4K baseline with ray tracing active and the ambient
 substitute disabled. The preset waits up to five seconds on a pipeline's
 first use. A cold run can spend several minutes compiling.
+
+Below 15 FPS the title counts each frame as at most 1/15 s, so game time
+runs slower than real time (about 0.44× at 6.5 FPS). `VICTORY_DT_MAX=0.2`
+raises that limit to 0.2 s, so game time keeps up down to 5 FPS. It is
+unset in the preset; vehicles, combat and other fast motion are untested
+with it, so try 0.1 or leave it unset if something misbehaves.
 
 ## Findings
 

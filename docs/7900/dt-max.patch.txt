@@ -1,0 +1,240 @@
+diff --git a/crates/victory-loader/src/hooks.rs b/crates/victory-loader/src/hooks.rs
+index b34dc0d9f6b8ef05099c27024854b979f8ee5524..d68394f75be660a50f9ad3afb91f57259c25d2ee 100644
+--- a/crates/victory-loader/src/hooks.rs
++++ b/crates/victory-loader/src/hooks.rs
+@@ -72,17 +72,211 @@ unsafe fn apply(base: usize, p: &Patch) -> bool {
+         tracing::warn!(what = p.what, "hook skipped: the bytes are not the expected ones");
+         return false;
+     }
++    // SAFETY: the bytes are the ones checked above.
++    if !unsafe { write(at, p.new) } {
++        return false;
++    }
++    tracing::info!(what = p.what, "hook applied");
++    true
++}
++
++/// Writes `new` at `at` in mapped image memory, whatever its protection.
++///
++/// # Safety
++/// `at..at + new.len()` is mapped image memory that no thread is executing.
++unsafe fn write(at: *mut u8, new: &[u8]) -> bool {
+     let mut old = 0;
+     // SAFETY: changing the protection of those bytes only, restored below.
+-    if unsafe { VirtualProtect(at as _, p.new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
++    if unsafe { VirtualProtect(at as _, new.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
+         return false;
+     }
+-    // SAFETY: writable now; the bytes are the ones checked above.
++    // SAFETY: writable now; the caller vouches for the address.
+     unsafe {
+-        std::ptr::copy_nonoverlapping(p.new.as_ptr(), at, p.new.len());
+-        VirtualProtect(at as _, p.new.len(), old, &mut old);
+-        FlushInstructionCache(GetCurrentProcess(), at as _, p.new.len());
++        std::ptr::copy_nonoverlapping(new.as_ptr(), at, new.len());
++        VirtualProtect(at as _, new.len(), old, &mut old);
++        FlushInstructionCache(GetCurrentProcess(), at as _, new.len());
+     }
+-    tracing::info!(what = p.what, "hook applied");
+     true
+ }
++
++// `VICTORY_DT_MAX=<seconds>` raises the ceiling of the
++// title's game step. The timer update (RAGE fwTimer, 1.0.2.1 RVA 0x2226040)
++// does `dt = min(1/15, measured)`, so below 15 fps every frame counts 1/15 s
++// and the game runs in slow motion (at 5 fps, a third of real time). With a
++// higher ceiling game time follows real time down to 1/ceiling fps.
++//
++// Found by a byte pattern (not an RVA) so other builds with the same code
++// match too; it must match exactly once in the executable sections:
++//   test r9b, r9b ; je +?? ; vmovss xmm3, [rip + d] ; cmp byte [rip + ?], 0 ;
++//   vminss xmm0, xmm3, xmm1
++// `d` must point at 1/15 (0x3d888889). Only `d` changes: it is pointed at a
++// new float written into the int3 padding after the function's `ret`, so the
++// 63 other readers of the shared 1/15 constant keep it. xmm3 is the ceiling
++// on both of the function's paths (also when the time scale is not 1).
++
++/// Environment variable: the game step's ceiling in seconds (unset = 1/15).
++pub(crate) const DT_MAX_ENV: &str = "VICTORY_DT_MAX";
++
++/// The timer update's clamp; `None` = any byte.
++const DT_CLAMP_SIG: &[Option<u8>] = &[
++    Some(0x45), Some(0x84), Some(0xC9), Some(0x74), None, // test r9b, r9b ; je
++    Some(0xC5), Some(0xFA), Some(0x10), Some(0x1D), None, None, None, None, // vmovss xmm3, [rip + d]
++    Some(0x80), Some(0x3D), None, None, None, None, Some(0x00), // cmp byte ptr [rip + ?], 0
++    Some(0xC5), Some(0xE2), Some(0x5D), Some(0xC1), // vminss xmm0, xmm3, xmm1
++];
++/// Offset of `d` in the pattern, and of the end of its instruction.
++const DT_DISP: usize = 9;
++const DT_NEXT: usize = 13;
++/// 1/15 as an f32.
++const ONE_FIFTEENTH: u32 = 0x3D88_8889;
++/// How far after the pattern the function's `ret` + padding may be.
++const PAD_SEARCH: usize = 0x200;
++
++/// Where the new ceiling lives once applied (0 = not applied), for the diagnostics A/B.
++static DT_SLOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
++
++/// IMAGE_SCN_MEM_EXECUTE.
++const SCN_EXECUTE: u32 = 0x2000_0000;
++
++/// Parses `VICTORY_DT_MAX`: seconds, 1/15..=1.
++pub(crate) fn dt_max_from_env() -> Option<f32> {
++    let v = std::env::var(DT_MAX_ENV).ok()?;
++    match v.trim().parse::<f32>() {
++        Ok(s) if s.is_finite() && (1.0 / 15.0..=1.0).contains(&s) => Some(s),
++        _ => {
++            tracing::warn!(value = %v, "{DT_MAX_ENV} ignored: seconds from 0.0667 to 1 expected");
++            None
++        }
++    }
++}
++
++/// Points the timer update's 1/15 ceiling at `secs`. Returns whether it applied.
++///
++/// # Safety
++/// `base` is the mapped image `info` describes, and no title code is running yet.
++pub(crate) unsafe fn set_dt_max(base: usize, info: &victory_pe::ImageInfo, secs: f32) -> bool {
++    let mut hits = Vec::new();
++    for s in info.sections.iter().filter(|s| s.characteristics & SCN_EXECUTE != 0) {
++        // SAFETY: a mapped section of the image.
++        let text = unsafe { std::slice::from_raw_parts((base + s.rva as usize) as *const u8, s.virtual_size as usize) };
++        let n = DT_CLAMP_SIG.len();
++        let mut i = 0;
++        while i + n <= text.len() {
++            if text[i] == 0x45 && DT_CLAMP_SIG.iter().zip(&text[i..i + n]).all(|(p, b)| p.is_none_or(|p| p == *b)) {
++                hits.push((s, i));
++            }
++            i += 1;
++        }
++    }
++    let [(sec, at)] = hits[..] else {
++        tracing::warn!(matches = hits.len(), "{DT_MAX_ENV} skipped: the timer clamp pattern must match exactly once");
++        return false;
++    };
++    let text = (base + sec.rva as usize) as *mut u8;
++    let size = sec.virtual_size as usize;
++    // SAFETY: inside the section (the pattern matched there).
++    let disp = i32::from_le_bytes(unsafe { *(text.add(at + DT_DISP) as *const [u8; 4]) });
++    let next = text as usize + at + DT_NEXT;
++    let old_const = next.wrapping_add_signed(disp as isize);
++    let in_image = old_const >= base && old_const + 4 <= base + info.size_of_image as usize;
++    // SAFETY: checked to be inside the mapped image.
++    if !in_image || unsafe { (old_const as *const u32).read_unaligned() } != ONE_FIFTEENTH {
++        tracing::warn!("{DT_MAX_ENV} skipped: the clamp does not read 1/15");
++        return false;
++    }
++    // The int3 padding after the function's `ret`: a run of 8+ 0xCC after a 0xC3.
++    // SAFETY: bounded by the section.
++    let tail = unsafe { std::slice::from_raw_parts(text.add(at), (size - at).min(PAD_SEARCH)) };
++    let Some(slot) = tail.windows(9).position(|w| w[0] == 0xC3 && w[1..].iter().all(|b| *b == 0xCC)).map(|r| {
++        // the first 4-aligned address after the ret that keeps 4 bytes inside the 8 checked
++        let pad = text as usize + at + r + 1;
++        (pad + 1 + 3) & !3
++    }) else {
++        tracing::warn!("{DT_MAX_ENV} skipped: no int3 padding after the timer update");
++        return false;
++    };
++    let new_disp = slot as i64 - next as i64;
++    let Ok(new_disp) = i32::try_from(new_disp) else { return false };
++    // SAFETY: padding bytes (never executed), then the displacement checked above.
++    let ok = unsafe { write(slot as *mut u8, &secs.to_le_bytes()) && write(text.add(at + DT_DISP), &new_disp.to_le_bytes()) };
++    if ok {
++        DT_SLOT.store(slot, std::sync::atomic::Ordering::Relaxed);
++    }
++    tracing::info!(
++        ok,
++        secs,
++        clamp_rva = format_args!("{:#x}", sec.rva as usize + at + 5),
++        slot_rva = format_args!("{:#x}", slot - base),
++        "{DT_MAX_ENV}: game step ceiling raised from 1/15 s"
++    );
++    ok
++}
++
++/// Environment variable (diagnostics, 1.0.2.1 only): every `<seconds>` an
++/// info line with the game timer's step and how far game time and real time
++/// moved, read from the title's timers. With `VICTORY_DT_PROBE_FLIP=<seconds>`
++/// (and `VICTORY_DT_MAX` applied) the ceiling switches between 1/15 and
++/// `VICTORY_DT_MAX` every that many seconds: an A/B within one run (each
++/// probe line says which ceiling was live, `ceil`).
++#[cfg(feature = "diagnostics")]
++pub(crate) const DT_PROBE_ENV: &str = "VICTORY_DT_PROBE";
++
++/// Starts the `VICTORY_DT_PROBE` thread.
++#[cfg(feature = "diagnostics")]
++pub(crate) fn start_dt_probe(base: usize, hash: &blake3::Hash) {
++    /// The game timer (fwTimer: +0 ms u32, +4 frames u32, +0xc dt f32) and the unclamped real-time one.
++    const GAME: usize = 0xabb_ef40;
++    const REAL: usize = 0x74f_a558;
++    let Some(every) = std::env::var(DT_PROBE_ENV).ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| *s > 0.0) else {
++        return;
++    };
++    if !hash.to_hex().starts_with(BUILD_1_0_2_1) {
++        return;
++    }
++    let flip = std::env::var("VICTORY_DT_PROBE_FLIP").ok().and_then(|v| v.trim().parse::<f64>().ok()).filter(|s| *s > 0.0);
++    std::thread::spawn(move || {
++        let slot = DT_SLOT.load(std::sync::atomic::Ordering::Relaxed);
++        let start = std::time::Instant::now();
++        let mut high = slot != 0;
++        let high_secs = if slot != 0 {
++            // SAFETY: the slot written by `set_dt_max`.
++            unsafe { (slot as *const f32).read_volatile() }
++        } else {
++            1.0 / 15.0
++        };
++        // SAFETY (all reads): static timers in the mapped .data of this exact build; torn reads are harmless here.
++        let rd = |a: usize| unsafe { ((base + a) as *const u32).read_volatile() };
++        let rf = |a: usize| f32::from_bits(rd(a));
++        let (mut g0, mut f0, mut r0, mut t0) = (rd(GAME), rd(GAME + 4), rd(REAL), std::time::Instant::now());
++        loop {
++            std::thread::sleep(std::time::Duration::from_secs_f64(every));
++            let ceil = if high { high_secs } else { f32::from_bits(ONE_FIFTEENTH) };
++            let (g, f, r, t) = (rd(GAME), rd(GAME + 4), rd(REAL), std::time::Instant::now());
++            let wall = t.duration_since(t0).as_secs_f64() * 1000.0;
++            let game = g.wrapping_sub(g0) as f64;
++            tracing::info!(
++                game_ms = game as u64,
++                real_ms = r.wrapping_sub(r0),
++                wall_ms = wall as u64,
++                frames = f.wrapping_sub(f0),
++                speed = format!("{:.3}", game / wall),
++                dt = format!("{:.4}", rf(GAME + 0xc)),
++                real_dt = format!("{:.4}", rf(REAL + 0xc)),
++                game_total_ms = g,
++                ceil = format!("{ceil:.4}"),
++                "dt probe ({DT_PROBE_ENV})"
++            );
++            (g0, f0, r0, t0) = (g, f, r, t);
++            if let Some(flip) = flip.filter(|_| slot != 0) {
++                let want = (start.elapsed().as_secs_f64() / flip) as u64 % 2 == 0;
++                if want != high {
++                    high = want;
++                    let v = if high { high_secs } else { f32::from_bits(ONE_FIFTEENTH) };
++                    // SAFETY: the 4 padding bytes `set_dt_max` filled; never executed, read by one vmovss.
++                    let ok = unsafe { write(slot as *mut u8, &v.to_le_bytes()) };
++                    tracing::info!(ok, ceil = v, "dt probe: ceiling switched (VICTORY_DT_PROBE_FLIP)");
++                }
++            }
++        }
++    });
++}
+diff --git a/crates/victory-loader/src/windows.rs b/crates/victory-loader/src/windows.rs
+index b15bb8d28a4e8d77d7a0cfaece07ff77519a6ca7..92c6c862625eb972dd86b195fc8dd72d2fd92bad 100644
+--- a/crates/victory-loader/src/windows.rs
++++ b/crates/victory-loader/src/windows.rs
+@@ -89,6 +89,13 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
+         let applied = unsafe { crate::hooks::disarm_watchdog(loaded.base(), &prepared.original_hash) };
+         tracing::info!(applied, "title watchdog hooks ({})", crate::hooks::NO_WATCHDOG_ENV);
+     }
++    // `VICTORY_DT_MAX=<seconds>` raises the game step's 1/15 s ceiling.
++    if let Some(secs) = crate::hooks::dt_max_from_env().filter(|_| !loaded.info.is_dll()) {
++        // SAFETY: just mapped, and no title code has run.
++        unsafe { crate::hooks::set_dt_max(loaded.base(), &loaded.info, secs) };
++    }
++    #[cfg(feature = "diagnostics")]
++    crate::hooks::start_dt_probe(loaded.base(), &prepared.original_hash);
+     tracing::info!(
+         base = format_args!("{:#x}", loaded.base()),
+         preferred = format_args!("{:#x}", loaded.info.image_base),
