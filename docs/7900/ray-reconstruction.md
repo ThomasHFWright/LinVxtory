@@ -640,6 +640,13 @@ five-frame diagnostic trigger. The renderer safely kept SR and the
 original filters when those input anchors were missing. The test
 captured the camera sequence and recorded no presented RR for analysis.
 
+After moving native background recording into the continuous RR window,
+the next replay submitted 276 optical RR slots and 86 SR slots. The
+earlier atomic decision adopted zero filter bypasses. The downstream
+tracker could not match these provider submissions to individual DXGI
+Presents, and the camera did not reach the intended turn. The run used
+capture and input and supplies no comparable timing result.
+
 The native glass producer was independently identified in a stock 4K
 cell replay. At Present 1937, submission 11993, the active transmission
 draw passed 186,626 raster samples and changed 186,624 pixels of the
