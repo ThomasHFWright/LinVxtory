@@ -663,3 +663,25 @@ describe Streamline Super Resolution and Frame Generation. The 4K control
 here remains pinned to the tested renderer.
 
 For command-driven 4K frame captures and shareable Present receipts, see the [inkVI-dive test instructions](dive-testing.md).
+
+### Optical input and opaque bypass on the same frames
+
+With the experimental alpha and GI variants off, the continuous replay
+retired 140 feature-13 slots with the protected glass input and the
+opaque post-filter bypass selected, including the guide warmup. Each
+of those slots submitted one RR evaluation and zero SR evaluations.
+This run traced the selection and GPU fence. The earlier bounded test
+directly measured the native dispatch counts for the two post-filters.
+
+The 4K capture with request ID 1946 shows the face in profile, the
+ponytail and ripples in the portion of the pane still in view. Captures
+1954, 1956, 1968 and 1998 show the turn uncovering the bunk, far wall,
+door and bookshelf. These request IDs match fenced RR slots. The resource trace still
+lost attribution before final DXGI presentation, so the captures alone
+cannot prove frame-by-frame provider or absence of temporal ghosting.
+
+Stock SR returned after the RR window. In that transition, fence 16736
+retired both native opaque post-filters with 104,352 compute invocations
+each. Sequence 16753 accepted the refreshed packed history from that
+same backing. The replay used capture and scripted camera motion, so
+its frame times are unsuitable for comparison against the SR control.
