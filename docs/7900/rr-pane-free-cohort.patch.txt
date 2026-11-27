@@ -1,0 +1,80 @@
+diff --git a/crates/victory-gpu/src/draw/display_transmission.rs b/crates/victory-gpu/src/draw/display_transmission.rs
+index ca182f2..2b9ea1e 100644
+--- a/crates/victory-gpu/src/draw/display_transmission.rs
++++ b/crates/victory-gpu/src/draw/display_transmission.rs
+@@ -42,8 +42,8 @@ impl Proof {
+         &self.epochs
+     }
+ 
+-    pub(crate) fn first_pane_epoch(&self) -> u64 {
+-        self.epochs[2]
++    pub(crate) fn first_pane_epoch(&self) -> Option<u64> {
++        self.epochs.get(2).copied()
+     }
+ 
+     pub(crate) fn draws(&self, packet: rr_display::Packet) -> Option<&[[ID3D12Resource; 2]]> {
+@@ -269,9 +269,10 @@ fn collect_exact(
+             output.push(draw.images);
+         }
+     }
+-    (!output.is_empty()).then_some(Proof {
+-        packet,
+-        draws: output,
+-        epochs,
+-    }).ok_or("no native pane draw in the closed future cohort")
++    // An empty pane set is usable only after the exact HDR/alpha bracket
++    // closed and none of its lists reported a rejected or dropped capture.
++    if output.is_empty() && !rr_display::continuous() {
++        return Err("no native pane draw in the closed future cohort");
++    }
++    Ok(Proof { packet, draws: output, epochs })
+ }
+diff --git a/crates/victory-gpu/src/draw/rr_display.rs b/crates/victory-gpu/src/draw/rr_display.rs
+index b7c923d..9b6d060 100644
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -507,14 +507,18 @@ fn encode(
+         let draws = optical
+             .draws(request.packet(request.slot_epoch))
+             .ok_or("native glass capture packet does not match FFX")?;
+-        // SAFETY: exact native draw copies and final FFX HDR were recorded on
+-        // the verified ordered prefix. The GPU reads them before the SDK call.
+-        Some(
+-            unsafe {
+-                reflection_motion::display_transmission_overlay(&list, &request.copies[0], draws)
+-            }
+-            .ok_or("native glass split did not record")?,
+-        )
++        if draws.is_empty() {
++            None
++        } else {
++            // SAFETY: exact native draw copies and final FFX HDR were recorded
++            // on the ordered prefix. The GPU reads them before the SDK call.
++            Some(
++                unsafe {
++                    reflection_motion::display_transmission_overlay(&list, &request.copies[0], draws)
++                }
++                .ok_or("native glass split did not record")?,
++            )
++        }
+     } else {
+         None
+     };
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+index 449b0d5..e5b08c7 100644
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -943,8 +943,11 @@ impl ClosedFuture {
+         if crate::draw::alpha_current::enabled() {
+             let alpha = crate::draw::alpha_current::future(runs, self.packet)?;
+             let order = |epoch| runs.iter().position(|list| list.epoch() == epoch);
+-            if order(alpha.reader_epoch()).ok_or("alpha reader epoch missing from cohort")?
+-                >= order(proof.first_pane_epoch()).ok_or("first pane epoch missing from cohort")?
++            // The alpha lease already proves reader order before FFX. An
++            // actual pane imposes the additional earlier-read constraint.
++            if let Some(pane) = proof.first_pane_epoch()
++                && order(alpha.reader_epoch()).ok_or("alpha reader epoch missing from cohort")?
++                    >= order(pane).ok_or("first pane epoch missing from cohort")?
+             {
+                 return Err("alpha packed reader is not before the first native pane");
+             }

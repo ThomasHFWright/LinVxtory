@@ -99,6 +99,7 @@ if [ "$control" -eq 0 ]; then
     done < "$kit/perf-build-trees.txt"
     if [ "$rr" -eq 1 ]; then
         apply_locked_patch 182c2119e9e17ed516e3855045f3151b445c4d70 rr-normal-activation.patch.txt
+        apply_locked_patch d6adab8c7687f8bc1ec4e794168f5490b864db78 rr-pane-free-cohort.patch.txt
     fi
 fi
 if [ "$tree" != "$expected" ]; then

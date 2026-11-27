@@ -937,6 +937,32 @@ angles differed from the stock run, and full-frame registration failed
 across the turn. The review uses locally aligned crops and adjacent
 frames from the same replay.
 
+### Continuous startup investigation
+
+A normal launch can request RR without a benchmark trigger. The physical
+AOC replay confirmed full-route 4K RR over more than four minutes. The
+first intro FidelityFX slot still used SR, before the later accepted
+scene path had enough guide and queue evidence.
+
+A closed HDR and alpha bracket can contain no captured pane draw. In
+continuous mode, the proof now accepts that empty pane set when all
+lists passed capture validation. A native pane still requires its
+original depth/HDR serials and draw ordering. The alpha replacement
+still needs its exact writer and reader. With no pane, the already
+composed title color goes directly into RR.
+
+A hardware diagnostic of this change executed feature 13 on intro FFX
+frame 1369 with a history reset, zero SR GPU evaluations and all five
+targeted replacements. The first FFX frame, 1366, still executed SR.
+An animated letterbox limited accepted Present attribution for the early
+RR frames, so this is a GPU-slot result.
+
+A separate exact input/output tap on a stationary frame pair measured
+the under-bunk metal dropping by 3.15 EV in the color entering RR and
+2.07 EV in its linear output. Both frames used RR history, fixed
+pre-exposure and an empty optical layer at that patch. The image
+variation begins upstream of RR on that pair.
+
 ### Capture-free timing with the stock fallback guard
 
 The same executable ran both arms on the physical AOC with the same
