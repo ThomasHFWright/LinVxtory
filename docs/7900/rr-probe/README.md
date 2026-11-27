@@ -104,3 +104,25 @@ standard deviation was 8.95 in the input and 0.90 at the corresponding 4K
 pixel centers (3x+1, 3y+1), in 8-bit sRGB values. This describes the 600
 samples in that synthetic tile. Gameplay quality requires a separate
 in-game comparison.
+
+### Verify a transparency layer inside one RR evaluation
+
+Run the same executable with `--transparency-test`. The four synthetic
+arms use one feature-13 evaluation apiece and reset the feature history.
+The scene has a known straight reference and a second reference displaced
+by 23 input pixels horizontally and 13 vertically inside a pane. The
+fixture verifies the FP16 base and premultiplied overlay reconstruct the
+intended input color at all 921,600 input pixels before running NGX.
+
+| Arm | Mean absolute error vs. straight | Mean absolute error vs. displaced |
+| --- | ---: | ---: |
+| Omit layer | 0.002062 | 0.197035 |
+| Bind displaced pane | 0.197585 | 0.000062 |
+| Bind straight pane at the same coverage | 0.000062 | 0.197583 |
+| Omit layer again | 0.002744 | 0.196741 |
+
+The RTX 5090 readbacks used 29,808 linear RGB samples inside the pane
+for each arm. The guided output follows the pattern supplied in the
+overlay. This provides a possible single-evaluation way to keep the
+game’s native refraction. It still requires the original refracted
+colors and a verified mask at the point the game hands the frame to RR.

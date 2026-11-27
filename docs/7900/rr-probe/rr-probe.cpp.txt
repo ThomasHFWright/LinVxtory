@@ -68,10 +68,52 @@ ComPtr<ID3D12Resource> buffer(ID3D12Device* device, UINT64 size, D3D12_HEAP_TYPE
     return resource(device, heap, desc, state, name);
 }
 
-enum Guide { Color, Depth, Motion, Diffuse, Specular, NormalsRoughness, SpecularMotion, Output };
+enum Guide { Color, Depth, Motion, Diffuse, Specular, NormalsRoughness, SpecularMotion, Output, Overlay };
 using Pixel = std::array<float, 4>;
 
+bool opticalTest = false;
+
+bool pane(unsigned x, unsigned y) {
+    return x >= 416 && x < 864 && y >= 248 && y < 472;
+}
+
+Pixel opticalPattern(unsigned x, unsigned y) {
+    return {0.40f + 0.27f * std::sin(float(x) * 0.083f + std::sin(float(y) * 0.049f)),
+            0.37f + 0.23f * std::cos(float(y) * 0.113f + std::sin(float(x) * 0.037f)),
+            0.22f + 0.12f * std::sin(float(x + y) * 0.057f), 1.0f};
+}
+
+Pixel originalComposite(unsigned x, unsigned y, bool warped) {
+    return warped && pane(x, y) ? opticalPattern(x + 23, y + 13) : opticalPattern(x, y);
+}
+
+Pixel opticalLayer(unsigned x, unsigned y, bool warped) {
+    return pane(x, y) ? originalComposite(x, y, warped) : Pixel{};
+}
+
+void verifyOpticalSplit() {
+    unsigned warpedPixels = 0;
+    for (unsigned y = 0; y < inputHeight; ++y) {
+        for (unsigned x = 0; x < inputWidth; ++x) {
+            const Pixel base = opticalPattern(x, y);
+            const Pixel original = originalComposite(x, y, true);
+            const Pixel overlay = opticalLayer(x, y, true);
+            warpedPixels += pane(x, y) && base != original;
+            for (unsigned c = 0; c < 3; ++c) {
+                const auto fp16 = [](float v) { return XMConvertHalfToFloat(XMConvertFloatToHalf(v)); };
+                if (fp16(base[c]) * (1 - overlay[3]) + fp16(overlay[c]) != fp16(original[c]))
+                    fail("optical native-composite separation");
+            }
+        }
+    }
+    if (warpedPixels != 448 * 224)
+        fail("optical test pattern has incomplete warped coverage");
+    std::printf("optical split verified pixels=%u full_coverage_warp=%u\n", inputWidth * inputHeight, warpedPixels);
+}
+
 Pixel texel(Guide guide, unsigned x, unsigned y, unsigned frame) {
+    if (opticalTest && guide == Color)
+        return opticalPattern(x, y);
     const bool foreground = x > 270 && x < 1040 && y > 150 && y < 570;
     const bool tile = ((x / 43) ^ (y / 31)) & 1;
     switch (guide) {
@@ -95,6 +137,8 @@ Pixel texel(Guide guide, unsigned x, unsigned y, unsigned frame) {
         return foreground ? Pixel{0.0f, 0.0f, -1.0f, 0.3f} : Pixel{0.0f, 0.6f, -0.8f, 0.65f};
     case Output:
         return {-8.0f, -8.0f, -8.0f, -8.0f};
+    case Overlay:
+        return opticalLayer(x, y, frame == 1);
     }
     fail("unknown guide");
 }
@@ -218,7 +262,7 @@ uint64_t readOutput(const Texture& output, ID3D12Resource* readback, unsigned fr
                 frame, static_cast<unsigned long long>(hash), unwritten, nonfinite, nonzero,
                 minRed, maxRed, changed, samples);
     if (unwritten || nonfinite || nonzero < outputWidth * outputHeight / 10 ||
-        maxRed - minRed < 0.01f || changed < samples / 100)
+        maxRed - minRed < 0.01f || (!opticalTest && changed < samples / 100))
         fail("RR output verification");
     return hash;
 }
@@ -278,11 +322,59 @@ void exportPreview(const Texture& output, ID3D12Resource* readback, unsigned fra
     readback->Unmap(0, &noWrite);
 }
 
+struct OpticalError {
+    double unwarped = 0, warped = 0, outside = 0;
+};
+
+OpticalError readOptical(const Texture& output, ID3D12Resource* readback, unsigned frame) {
+    const D3D12_RANGE read{0, static_cast<SIZE_T>(output.size)};
+    void* mapped = nullptr;
+    check(readback->Map(0, &read, &mapped), "Map optical output");
+    double unwarped = 0, warped = 0, outside = 0;
+    unsigned insideCount = 0, outsideCount = 0;
+    for (unsigned y = 8; y < inputHeight - 8; y += 3) {
+        const auto* row = reinterpret_cast<const uint16_t*>(
+            static_cast<const unsigned char*>(mapped) + output.layout.Offset +
+            (3 * y + 1) * output.layout.Footprint.RowPitch);
+        for (unsigned x = 8; x < inputWidth - 8; x += 3) {
+            const bool interior = x >= 424 && x < 856 && y >= 256 && y < 464;
+            const bool exterior = x < 408 || x >= 872 || y < 240 || y >= 480;
+            if (!interior && !exterior)
+                continue;
+            const Pixel a = originalComposite(x, y, false);
+            const Pixel b = originalComposite(x, y, true);
+            const uint16_t* pixel = row + 4 * (3 * x + 1);
+            for (unsigned c = 0; c < 3; ++c) {
+                const float value = XMConvertHalfToFloat(pixel[c]);
+                if (interior) {
+                    unwarped += std::abs(value - a[c]);
+                    warped += std::abs(value - b[c]);
+                    ++insideCount;
+                } else {
+                    outside += std::abs(value - a[c]);
+                    ++outsideCount;
+                }
+            }
+        }
+    }
+    const D3D12_RANGE noWrite{0, 0};
+    readback->Unmap(0, &noWrite);
+    if (insideCount == 0 || outsideCount == 0)
+        fail("missing optical comparison regions");
+    const OpticalError error{unwarped / insideCount, warped / insideCount, outside / outsideCount};
+    std::printf("optical frame=%u unwarped_mae=%.6f warped_mae=%.6f outside_mae=%.6f inside_components=%u outside_components=%u\n",
+                frame, error.unwarped, error.warped, error.outside, insideCount, outsideCount);
+    return error;
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     const bool preview = argc == 2 && std::strcmp(argv[1], "--preview") == 0;
-    if (argc != 1 && !preview)
-        fail("usage: rr-probe.exe [--preview]");
+    opticalTest = argc == 2 && std::strcmp(argv[1], "--transparency-test") == 0;
+    if (argc != 1 && !preview && !opticalTest)
+        fail("usage: rr-probe.exe [--preview|--transparency-test]");
+    if (opticalTest)
+        verifyOpticalSplit();
     static_assert(NVSDK_NGX_Feature_RayReconstruction == 13);
     std::printf("feature=RayReconstruction id=%u sdk_api=0x%x input=%ux%u output=%ux%u "
                 "mode=UltraPerformance\n", unsigned(NVSDK_NGX_Feature_RayReconstruction),
@@ -399,7 +491,7 @@ int main(int argc, char** argv) {
         fail("null RR feature handle");
     submit("rr_create", 1);
 
-    Texture inputs[Output], output;
+    Texture inputs[Output], output, overlay;
     auto createInput = [&](Guide guide, DXGI_FORMAT format, const wchar_t* name) {
         inputs[guide].create(device.Get(), inputWidth, inputHeight, format, D3D12_RESOURCE_FLAG_NONE, name);
     };
@@ -412,6 +504,9 @@ int main(int argc, char** argv) {
     createInput(SpecularMotion, DXGI_FORMAT_R32G32_FLOAT, L"RR specular motion");
     output.create(device.Get(), outputWidth, outputHeight, rgbaFormat,
                   D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"RR output");
+    if (opticalTest)
+        overlay.create(device.Get(), inputWidth, inputHeight, rgbaFormat,
+                       D3D12_RESOURCE_FLAG_NONE, L"RR native premultiplied transparency");
     const auto readback = buffer(device.Get(), output.size, D3D12_HEAP_TYPE_READBACK,
                                  D3D12_RESOURCE_STATE_COPY_DEST, L"RR readback");
 
@@ -428,15 +523,23 @@ int main(int argc, char** argv) {
     eval.InMVScaleX = eval.InMVScaleY = eval.InPreExposure = eval.InExposureScale = 1.0f;
     eval.InFrameTimeDeltaInMsec = 16.67f;
 
-    uint64_t hashes[2];
-    for (unsigned frame = 0; frame < 2; ++frame) {
+    uint64_t hashes[4]{};
+    OpticalError optics[4];
+    for (unsigned frame = 0; frame < (opticalTest ? 4u : 2u); ++frame) {
         for (unsigned guide = 0; guide < Output; ++guide)
             inputs[guide].fill(list.Get(), static_cast<Guide>(guide), frame, inputState);
         output.fill(list.Get(), Output, frame, outputState);
-        eval.InReset = (frame == 0);
+        eval.InReset = opticalTest || frame == 0;
+        if (opticalTest) {
+            // 0 omitted, 1 native warped pane, 2 same-coverage straight pane,
+            // 3 omitted again using the same SDK feature and parameter map.
+            overlay.fill(list.Get(), Overlay, frame, inputState);
+            eval.pInTransparencyLayer = (frame == 1 || frame == 2) ? overlay.image.Get() : nullptr;
+            eval.InTransparencyLayerSubrectBase = {0, 0};
+        }
         // The synthetic scene is stationary. Jitter and noise advance between samples.
-        eval.InJitterOffsetX = frame ? 0.25f : -0.25f;
-        eval.InJitterOffsetY = frame ? 1.0f / 6.0f : -1.0f / 6.0f;
+        eval.InJitterOffsetX = opticalTest ? 0.0f : (frame ? 0.25f : -0.25f);
+        eval.InJitterOffsetY = opticalTest ? 0.0f : (frame ? 1.0f / 6.0f : -1.0f / 6.0f);
         std::printf("evaluate frame=%u reset=%d jitter=%.4f,%.4f\n", frame, eval.InReset,
                     eval.InJitterOffsetX, eval.InJitterOffsetY);
         ngxCheck(NGX_D3D12_EVALUATE_DLSSD_EXT(list.Get(), feature, params, &eval), "ngx_rr_evaluate");
@@ -447,9 +550,21 @@ int main(int argc, char** argv) {
         transition(list.Get(), output.image.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, outputState);
         submit(frame ? "rr_history" : "rr_reset", frame + 2);
         hashes[frame] = readOutput(output, readback.Get(), frame);
+        if (opticalTest)
+            optics[frame] = readOptical(output, readback.Get(), frame);
     }
-    if (hashes[0] == hashes[1])
+    if (opticalTest) {
+        for (unsigned frame : {0u, 2u, 3u}) {
+            if (!(optics[frame].unwarped < 0.065 && optics[frame].unwarped * 2 < optics[frame].warped))
+                fail("optical negative/clearing control did not preserve the unwarped pattern");
+        }
+        if (!(optics[1].warped < 0.065 && optics[1].warped * 2 < optics[1].unwarped))
+            fail("optical overlay did not preserve the native displacement");
+        if (optics[1].outside > 0.065 || hashes[0] == hashes[1] || hashes[2] == hashes[1])
+            fail("optical overlay did not isolate the native pane");
+    } else if (hashes[0] == hashes[1]) {
         fail("reset and history outputs are identical");
+    }
     if (preview)
         exportPreview(output, readback.Get(), 1);
 
@@ -457,5 +572,7 @@ int main(int argc, char** argv) {
     ngxCheck(NVSDK_NGX_D3D12_DestroyParameters(params), "ngx_destroy_parameters");
     ngxCheck(NVSDK_NGX_D3D12_Shutdown1(device.Get()), "ngx_shutdown");
     CloseHandle(event);
-    std::puts("PASS D3D12 Ray Reconstruction created, evaluated, fenced, and verified on both frames");
+    std::puts(opticalTest
+        ? "PASS single-evaluation D3D12 RR optical transparency, no-warp controls and null clearing"
+        : "PASS D3D12 Ray Reconstruction created, evaluated, fenced, and verified on both frames");
 }
