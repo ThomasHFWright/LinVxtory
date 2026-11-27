@@ -126,7 +126,18 @@ Both tests use synthetic geometry.
 
 To reproduce, start with a fresh external source directory, the existing
 [4K build environment](README.md#build-and-launch), and a separate test
-prefix. From the LinVxtory root:
+prefix. The renderer's build script expects
+`lib/Windows_x86_64/nvsdk_ngx_d.lib` in its SDK directory. For the official
+tag's nested `x64` layout, stage a local copy once:
+
+```sh
+mkdir -p "$VICTORY_DLSS_SDK/lib/Windows_x86_64"
+cp "$DLSS_SDK/lib/Windows_x86_64/x64/nvsdk_ngx_d.lib" \
+   "$VICTORY_DLSS_SDK/lib/Windows_x86_64/"
+```
+
+Here `DLSS_SDK` points to the official SDK and `VICTORY_DLSS_SDK` to the
+private staging directory. From the LinVxtory root:
 
 ```sh
 kit=$(realpath docs/7900)
