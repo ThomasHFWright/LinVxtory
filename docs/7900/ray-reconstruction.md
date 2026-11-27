@@ -785,9 +785,13 @@ three-second warmup. Shots and input stayed outside the timed windows.
 
 All 367 RR Presents used the optical layer and the opaque, alpha and
 probe replacements. Accepted throughput rose 16.4% in this pair.
-The arm switched between RR and SR 98 times. The most frequent logged
-fallback was an unavailable previous native camera. Lighting
-instability was observed during the opt-in run. The recorded timing
+The arm switched between RR and SR 98 times. In this window 67 stock
+frames lacked the current qualified camera, and 56 more followed a
+frame that could therefore supply no previous camera. A separate
+diagnostic sampled the first failure at the FidelityFX call. Each
+sample had matching VelocityFill data and an empty independent
+reflection projection bucket. Lighting instability was observed
+during the opt-in run. The recorded timing
 describes this mixed configuration, including its fallbacks. Stable
 continuous RR and the visual impact of switching still require proof.
 
