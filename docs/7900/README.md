@@ -1,7 +1,8 @@
 # Series S 4K DLSS replay on RTX 5090
 
 This is the renderer built by the root [build script](../../build.sh). It uses
-[VIctory-7900XTX at 014d52d](https://github.com/avatarmanz/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
+avatarmanz’s VIctory-7900XTX source at 014d52d from the
+[public source mirror](https://github.com/TheInfamous404/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
 with LinVxtory's Linux and face/hair work, CPU submission changes, bounded
 readback capture, and direct 4K DLSS Super Resolution. The patches are
 GPL-3.0-or-later like the renderer. The kit provides source, settings, and

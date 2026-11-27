@@ -12,7 +12,7 @@ base=014d52dedf837d1ac660a0bd256c4704be9eeb40
 base_tree=0b2726fef1258f1d7817afdf0af8b251870e408b
 linux_tree=0ab430bbecb29f450d2d9e837673ad10aa1210b4
 tested_tree=3d033cbd633757d2fd15f97a4323d566e8a043ba
-base_url=https://github.com/avatarmanz/VIctory-7900XTX.git
+base_url=https://github.com/TheInfamous404/VIctory-7900XTX.git
 kit="$root/docs/7900"
 
 if [ -z "${VICTORY_DLSS_SDK:-}" ] ||
