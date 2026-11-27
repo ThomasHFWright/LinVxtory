@@ -496,6 +496,69 @@ pair setup. Compare the original and `-before-transparency` EXR
 directories after matching their Present, camera, submission, reset,
 exposure and SR image bytes.
 
+#### In-game optical overlay comparison
+
+A second stationary cell replay used the SDK’s transparency layer,
+which upscales its input without denoising it. The renderer measured
+where the original transmission draws changed native HDR. Inside that
+footprint, it passed the original final HDR samples as the premultiplied
+layer with full coverage and used the native pre-transmission HDR as
+their base. Outside the footprint, the base was the original final HDR.
+The two inputs recompose the original RGB at each 720p sample. The
+capture measures the transmission footprint before heat haze and DOF.
+
+At Present 1756, submission 9849, the footprint covered 195,736 of
+921,600 input pixels with zero rejected samples. Independent RR
+evaluations used the same frame, DOF guide and reset, and their stock SR
+reference EXRs were byte-identical. Both 4K RR outputs had 8,294,400
+finite, written, nonzero pixels. The title presented SR.
+
+| Mid-scale log-luminance contrast relative to SR | Standard RR | Optical overlay |
+| --- | ---: | ---: |
+| Tower and silhouette | 79% | 105% |
+| Right roof | 73% | 104% |
+| Courtyard table slats | 55% | 103% |
+| Left roof | 69% | 123% |
+
+The tower, right roof and table recovered much of the intended wavy
+detail. The left roof overshot SR contrast. These contrast ratios use
+the difference between Gaussian blurs of three and nine 4K pixels.
+Using the nearest-scaled native footprint, log-luminance mean absolute
+error relative to SR fell 14.2% in the interior more than nine pixels
+from the boundary. It rose 4.2% in the nine-pixel band on either side
+of the boundary, where a few bright flecks appeared near the character’s
+silhouette. Farther outside, the error was about 0.054 in both cases.
+These are selected regions of one stationary reset frame. The mask’s
+final influence after heat haze and DOF, stability during camera motion
+and native presentation quality still need testing. Timing requires a
+separate single-provider replay.
+
+Add the optional [optical overlay patch](rr-glass-optical.patch.txt) to
+the glass comparison tree `30256e4ebd5b64af8f6fcadaffb0a0fce44b31e1`
+and verify the resulting tree before rebuilding with the same 4K
+diagnostics settings.
+
+```sh
+git apply --index "$kit/rr-glass-optical.patch.txt"
+test "$(git write-tree)" = f72e9620745e6b93c08671667e6d9c99c8026298
+```
+
+Use the private [HDR pair setup](dive-testing.md#capture-native-4k-sr-and-rr-from-one-game-frame)
+and leave the native filters enabled. Clear the optional
+`VICTORY_RR_GLASS_COMPARE`, `VICTORY_OPAQUE_CURRENT`,
+`VICTORY_OPAQUE_CUT` and `VICTORY_ALPHA_CURRENT` switches. Set
+`VICTORY_RR_GLASS_OVERLAY_TEST=1`, `VICTORY_RR_TRANSMISSION_FRAME=1`,
+`VICTORY_RR_BACKGROUND_FRAME=1`, `VICTORY_RR_SHADOW_LIMIT=1` and
+`VICTORY_DOF_GUIDE=1`. To save per-draw masks, set
+`VICTORY_RR_TRANSMISSION_MASK_DIR` to an existing private directory.
+Arm the trigger facing a stationary pane. Compare the ordinary and
+`-native-transmission-overlay` output directories only when their
+receipts agree on the Present, camera, submission, reset, exposure and
+SR reference bytes. The optical receipt reports
+`observed_pre_haze_transmission_pixels`. Require positive coverage and
+zero rejected samples in the matching renderer log. Keep all captures
+and generated files local.
+
 ## Native output and fallback
 
 The bounded display experiment selected RR in the actual 4K FFX slot
@@ -508,8 +571,8 @@ character faced away in the two RR captures.
 
 Presents 2455–2457 selected SR when the current opaque producer could
 not be matched. Both providers used the native denoisers throughout
-this test. Removing redundant native work and preserving the wavy glass
-are still open. A 55-second RR performance comparison awaits those
+this test. Preserving pane edges in motion and removing redundant native
+work are still open. A 55-second RR performance comparison awaits those
 changes. [Reproduce the native output test](dive-testing.md#test-the-native-4k-upscaler-slot-on-the-aoc)
 
 A follow-up tested whether the renderer could commit the later RR slot
@@ -525,9 +588,9 @@ cell replay. At Present 1937, submission 11993, the active transmission
 draw passed 186,626 raster samples and changed 186,624 pixels of the
 1280×720 HDR buffer. Its footprint excluded the character where she
 occluded the pane and included the visible wire. Its bounding rectangle
-would have included 86,584 additional pixels. This draw precedes heat
-haze and depth of field, so preserving the final glass still needs a
-comparison at the upscaler output.
+would have included 86,584 additional pixels. The in-game optical
+overlay comparison above uses the per-draw footprint at this point in
+the pipeline.
 
 The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
 introduces a different NVIDIA renderer baseline. Its [DLSS implementation

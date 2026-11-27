@@ -1,0 +1,1354 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 031277665581238fba58e2c2a5347c2d0eed915f..edda176b8b05813bc6382a25f4df60129b3ec5c6 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -11,6 +11,8 @@
+ #[cfg(feature = "diagnostics")]
+ pub(crate) mod background_snapshot;
+ #[cfg(feature = "diagnostics")]
++pub(crate) mod transmission_witness;
++#[cfg(feature = "diagnostics")]
+ pub(crate) mod material_guides;
+ #[cfg(feature = "diagnostics")]
+ pub(crate) mod reflection_capture;
+@@ -3474,8 +3476,13 @@ impl State {
+                     if x > 65_535 {
+                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
+                     }
++                    #[cfg(feature = "diagnostics")]
++                    let transmission = crate::pipeline::host_pipeline(self.pipeline as This)
++                        .and_then(|p| transmission_witness::before(self, list, p, false, x.min(65_535)));
+                     // SAFETY: an open list with everything set.
+                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
++                    #[cfg(feature = "diagnostics")]
++                    transmission_witness::after(list, transmission);
+                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                     self.mesh_scissor(list, false);
+                     DRAWN.fetch_add(1, Ordering::Relaxed);
+@@ -4502,6 +4509,12 @@ impl State {
+         );
+         let gated_count = gate.as_ref().map(opaque_current::Gate::binding);
+         let count_arg = gated_count.or_else(|| counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at))));
++        #[cfg(feature = "diagnostics")]
++        let transmission = if kind == MESH {
++            transmission_witness::before(self, list, p, true, max)
++        } else {
++            None
++        };
+         unsafe {
+             list.list.ExecuteIndirect(
+                 &signature,
+@@ -4513,6 +4526,8 @@ impl State {
+             )
+         };
+         #[cfg(feature = "diagnostics")]
++        transmission_witness::after(list, transmission);
++        #[cfg(feature = "diagnostics")]
+         crate::host::pass_stats::after(list, stats);
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+diff --git a/crates/victory-gpu/src/draw/background_snapshot.rs b/crates/victory-gpu/src/draw/background_snapshot.rs
+index e688606513682d090a0b2aa5a2835b3738bece88..4aeb1ac6774f7bad1f3cd79f3fdfb5ef4ee90aab 100644
+--- a/crates/victory-gpu/src/draw/background_snapshot.rs
++++ b/crates/victory-gpu/src/draw/background_snapshot.rs
+@@ -395,6 +395,10 @@ pub(crate) fn submitted(runs: &[&HostList], submission: u64) -> Option<RrBackgro
+ static RETIRED: Mutex<Option<RrBackgroundSnapshot>> = Mutex::new(None);
+ 
+ impl RrBackgroundSnapshot {
++    pub(super) fn producer_epochs(&self) -> [u64; 2] {
++        self.producer_epochs
++    }
++
+     pub(super) fn submitted_once(&self) -> bool {
+         self.submission_marks
+             .iter()
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index 9f98ddeac9cbf85f156b888fd32234ebd20d2c1f..c50580b316e83d36286d23577df7068d30109c85 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -186,6 +186,7 @@ pub(crate) fn submitted(
+     runs: &[&HostList],
+     sequence: u64,
+     background: Option<&RrBackgroundSnapshot>,
++    transmission: Option<&[super::transmission_witness::Images]>,
+ ) -> Option<Readback> {
+     if !enabled() {
+         return None;
+@@ -288,7 +289,7 @@ pub(crate) fn submitted(
+             )?;
+             let background = background
+                 .filter(|background| {
+-                    rr_shadow::glass_comparison()
++                    (rr_shadow::glass_comparison() || super::transmission_witness::overlay_test())
+                         && background.camera.is_some()
+                         && background.key
+                             == (RrBackgroundKey {
+@@ -299,8 +300,23 @@ pub(crate) fn submitted(
+                             })
+                 })
+                 .cloned();
++            let observed = transmission
++                .zip(background.as_ref())
++                .and_then(|(draws, _)| {
++                    // SAFETY: checked identical submit/key; original native copies precede this list.
++                    let split = unsafe {
++                        reflection_motion::pack_observed_transmission(
++                            &list,
++                            &snapshot.copies[0],
++                            draws,
++                        )?
++                    };
++                    let status = readback(host, &list, &split.rejected, DXGI_FORMAT_R32_UINT)?;
++                    Some((split, status))
++                });
+             Some(Shadow {
+                 background,
++                observed,
+                 snapshot,
+                 depth,
+                 motion: output.motion,
+@@ -398,6 +414,10 @@ fn inspect<T>(buffer: &ID3D12Resource, f: impl FnOnce(&[u32]) -> T) -> Option<T>
+ 
+ struct Shadow {
+     background: Option<RrBackgroundSnapshot>,
++    observed: Option<(
++        reflection_motion::RrNativeTransmissionOverlay,
++        ID3D12Resource,
++    )>,
+     snapshot: Snapshot,
+     depth: ID3D12Resource,
+     motion: ID3D12Resource,
+@@ -505,6 +525,33 @@ impl Readback {
+             );
+             return;
+         }
++        let background = shadow
++            .background
++            .filter(RrBackgroundSnapshot::submitted_once);
++        let observed_transmission =
++            shadow
++                .observed
++                .zip(background.as_ref())
++                .and_then(|((split, status), _)| {
++                    let (covered, rejected) = inspect(&status, |statuses| {
++                        statuses
++                            .iter()
++                            .fold((0, 0), |(covered, rejected), &status| {
++                                (
++                                    covered + u32::from(status == 1),
++                                    rejected + u32::from(status > 1),
++                                )
++                            })
++                    })?;
++                    tracing::info!(
++                        present = shadow.snapshot.present,
++                        submission = self.submission,
++                        covered,
++                        rejected,
++                        "RR observed pre-haze transmission split retired"
++                    );
++                    (covered != 0 && rejected == 0).then_some((split.base, split.overlay, covered))
++                });
+         let [hdr, _, motion] = shadow.snapshot.copies;
+         rr_shadow::deliver(RrShadowInputs {
+             present: shadow.snapshot.present,
+@@ -524,10 +571,10 @@ impl Readback {
+             reflection_motion: shadow.motion,
+             reflection_counts: counts,
+             depth_of_field: shadow.snapshot.depth_of_field,
+-            color_before_transparency: shadow
+-                .background
+-                .filter(RrBackgroundSnapshot::submitted_once)
++            color_before_transparency: background
++                .filter(|_| rr_shadow::glass_comparison())
+                 .map(|background| background.color),
++            observed_transmission,
+             sr_output: shadow.snapshot.sr_output,
+         });
+     }
+diff --git a/crates/victory-gpu/src/draw/rr_shadow.rs b/crates/victory-gpu/src/draw/rr_shadow.rs
+index 09bdd27470b8a96a97d78b7ea1326f1388fb04dc..0ccbf8711922c8409e7394a010c1c9f342c0be3d 100644
+--- a/crates/victory-gpu/src/draw/rr_shadow.rs
++++ b/crates/victory-gpu/src/draw/rr_shadow.rs
+@@ -49,6 +49,8 @@ pub struct RrShadowInputs {
+     pub depth_of_field: Option<ID3D12Resource>,
+     /// Native pre-alpha radiance on this exact FFX view and submission.
+     pub color_before_transparency: Option<ID3D12Resource>,
++    /// Exact native sample split using the preceding native draw footprint.
++    pub observed_transmission: Option<(ID3D12Resource, ID3D12Resource, u32)>,
+ }
+ 
+ pub(super) fn glass_comparison() -> bool {
+diff --git a/crates/victory-gpu/src/draw/transmission_witness.rs b/crates/victory-gpu/src/draw/transmission_witness.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c6d4a8b5bd96b34378d48bb6eb8d8c1795ff016
+--- /dev/null
++++ b/crates/victory-gpu/src/draw/transmission_witness.rs
+@@ -0,0 +1,526 @@
++//! Fence-retired raster and color witnesses for native 720p transmission draws.
++
++use super::{HostList, HostPipeline, Root, State, View, background_snapshot};
++use crate::host::{host, transition};
++use std::path::PathBuf;
++use std::sync::{Arc, OnceLock};
++use windows::Win32::Graphics::{Direct3D12::*, Dxgi::Common::*};
++
++const WIDTH: u32 = 1280;
++const HEIGHT: u32 = 720;
++const PITCH: u32 = WIDTH * 8;
++const BYTES: u64 = (PITCH * HEIGHT) as u64;
++const SIZE: u64 = 2 * BYTES + 8;
++const HDR: DXGI_FORMAT = DXGI_FORMAT_R16G16B16A16_FLOAT;
++const DEPTH: DXGI_FORMAT = DXGI_FORMAT_R32G8X24_TYPELESS;
++const PYRAMID: DXGI_FORMAT = DXGI_FORMAT_R11G11B10_FLOAT;
++const MAX_DRAWS_PER_LIST: usize = 8;
++
++fn frame() -> Option<u64> {
++    static FRAME: OnceLock<Option<u64>> = OnceLock::new();
++    *FRAME.get_or_init(|| {
++        std::env::var("VICTORY_RR_TRANSMISSION_FRAME")
++            .ok()?
++            .parse()
++            .ok()
++    })
++}
++
++pub(super) fn overlay_test() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED
++        .get_or_init(|| std::env::var_os("VICTORY_RR_GLASS_OVERLAY_TEST").is_some_and(|v| v == "1"))
++}
++
++pub(crate) type Images = [ID3D12Resource; 2];
++
++#[derive(Clone, Copy)]
++struct Identity {
++    shader: &'static str,
++    mesh: &'static str,
++    indirect: bool,
++    groups_or_commands: u32,
++    hdr: u64,
++    opaque_depth: u64,
++    raster_depth: u64,
++    pyramid: u64,
++    mip_count: u16,
++    scissor: [i32; 4],
++}
++
++pub(super) struct Pending {
++    identity: Identity,
++    texture: Arc<crate::resource::HostTexture>,
++    readback: ID3D12Resource,
++    query: ID3D12QueryHeap,
++    preview: Option<ID3D12Resource>,
++}
++
++pub(crate) struct Witness {
++    identity: Identity,
++    readback: ID3D12Resource,
++    preview: Option<Images>,
++    background: Option<background_snapshot::RrBackgroundSnapshot>,
++    submission: Option<u64>,
++    epoch: u64,
++    ordinal: usize,
++}
++
++fn descriptor(
++    state: &State,
++    list: &HostList,
++    offset: u32,
++) -> Option<(Arc<crate::resource::HostTexture>, [u32; 10])> {
++    let Root::Table(base) = state.roots_ref(false).first()? else {
++        return None;
++    };
++    let View::Shader(title, Some(words)) =
++        crate::descriptor::diagnostic_view(state.heaps[0], *base, offset)?
++    else {
++        return None;
++    };
++    let (resource, state) = list.guide_texture(title)?;
++    (D3D12_RESOURCE_STATES(state as i32).contains(D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE)
++        && resource.base == 0
++        && words[1] == 4
++        && words[6] == 0
++        && crate::resource::first_mip(&words) == 0)
++        .then_some((resource, words))
++}
++
++pub(super) fn before(
++    state: &State,
++    list: &HostList,
++    pipeline: &HostPipeline,
++    indirect: bool,
++    groups_or_commands: u32,
++) -> Option<Pending> {
++    let requested = frame()?;
++    let present = crate::queue::presented() + 1;
++    if !crate::rr_window::selected(
++        present,
++        (present.abs_diff(requested) <= 1).then_some(present),
++    ) {
++        return None;
++    }
++    let contains = |hash| {
++        pipeline
++            .stages
++            .iter()
++            .any(|stage| stage.shader.hash == hash)
++    };
++    let (mesh, shader) = [
++        ("97356b4fcf9fbb3f", "139ebdf08050bc7c"),
++        ("c908001e7117c686", "139ebdf08050bc7c"),
++        ("43c92378a1d4222d", "c720c39d47924869"),
++    ]
++    .into_iter()
++    .find(|&(mesh, shader)| contains(mesh) && contains(shader))?;
++    let pending = (|| {
++        if groups_or_commands == 0
++            || (indirect && groups_or_commands != 1)
++            || super::mesh_test() == 2
++            || list.transmission_count() >= MAX_DRAWS_PER_LIST
++        {
++            return None;
++        }
++        let [target] = state.targets.as_slice() else {
++            return None;
++        };
++        let [viewport] = state.viewports.as_slice() else {
++            return None;
++        };
++        let [scissor] = state.scissors.as_slice() else {
++            return None;
++        };
++        if [
++            viewport.TopLeftX,
++            viewport.TopLeftY,
++            viewport.Width,
++            viewport.Height,
++            viewport.MinDepth,
++            viewport.MaxDepth,
++        ] != [0.0, 0.0, WIDTH as f32, HEIGHT as f32, 0.0, 1.0]
++            || scissor.left < 0
++            || scissor.top < 0
++            || scissor.right > WIDTH as i32
++            || scissor.bottom > HEIGHT as i32
++            || scissor.left >= scissor.right
++            || scissor.top >= scissor.bottom
++        {
++            return None;
++        }
++        let (texture, color_state) = background_snapshot::rendered(list, *target, HDR)?;
++        let (raster, raster_state) = background_snapshot::rendered(list, state.depth, DEPTH)?;
++        let (opaque, opaque_view) = descriptor(state, list, 832)?;
++        let (pyramid, pyramid_view) = descriptor(state, list, 1144)?;
++        // SAFETY: retained live host resources validated by the diagnostic bindings.
++        let (opaque_desc, pyramid_desc) =
++            unsafe { (opaque.texture.GetDesc(), pyramid.texture.GetDesc()) };
++        let full_size = |desc: D3D12_RESOURCE_DESC| {
++            desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++                && desc.Width == u64::from(WIDTH)
++                && desc.Height == HEIGHT
++                && desc.DepthOrArraySize == 1
++                && desc.SampleDesc.Count == 1
++        };
++        if color_state != D3D12_RESOURCE_STATE_RENDER_TARGET
++            || (raster_state != D3D12_RESOURCE_STATE_DEPTH_WRITE
++                && !raster_state.contains(D3D12_RESOURCE_STATE_DEPTH_READ))
++            || !full_size(opaque_desc)
++            || !full_size(pyramid_desc)
++            || opaque_desc.Format != DEPTH
++            || opaque_desc.MipLevels != 1
++            || crate::resource::pc_format(opaque_view[0])
++                != DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS.0 as u32
++            || pyramid_desc.Format != PYRAMID
++            || pyramid_desc.MipLevels < 2
++            || crate::resource::pc_format(pyramid_view[0]) != PYRAMID.0 as u32
++            || opaque.serial == raster.serial
++        {
++            return None;
++        }
++        let identity = Identity {
++            shader,
++            mesh,
++            indirect,
++            groups_or_commands,
++            hdr: texture.serial,
++            opaque_depth: opaque.serial,
++            raster_depth: raster.serial,
++            pyramid: pyramid.serial,
++            mip_count: pyramid_desc.MipLevels,
++            scissor: [scissor.left, scissor.top, scissor.right, scissor.bottom],
++        };
++        let host = host()?;
++        let readback = host.read_back_buffer(SIZE)?;
++        let mut query = None;
++        // SAFETY: a direct list with native raster state already established; query is private.
++        unsafe {
++            host.device
++                .CreateQueryHeap(
++                    &D3D12_QUERY_HEAP_DESC {
++                        Type: D3D12_QUERY_HEAP_TYPE_OCCLUSION,
++                        Count: 1,
++                        NodeMask: 0,
++                    },
++                    &mut query,
++                )
++                .ok()?;
++        }
++        let query = query?;
++        let preview = if overlay_test() {
++            Some(background_snapshot::copy(list, &(texture.clone(), color_state))?.1)
++        } else {
++            None
++        };
++        list.keep(&texture.texture);
++        list.keep(&readback);
++        list.keep(&query);
++        // SAFETY: validated native render target, exact compatible readback footprint; restore state.
++        unsafe {
++            copy_color(list, &texture.texture, &readback, 0);
++            list.list.BeginQuery(&query, D3D12_QUERY_TYPE_OCCLUSION, 0);
++        }
++        Some(Pending {
++            identity,
++            texture,
++            readback,
++            query,
++            preview,
++        })
++    })();
++    if pending.is_none() {
++        if overlay_test() {
++            list.reject_transmission_overlay();
++        }
++        tracing::warn!(
++            present,
++            epoch = list.epoch(),
++            shader,
++            mesh,
++            indirect,
++            groups_or_commands,
++            "RR native transmission witness could not verify draw contract or capture budget"
++        );
++    }
++    pending
++}
++
++pub(super) fn after(list: &HostList, pending: Option<Pending>) {
++    let Some(Pending {
++        identity,
++        texture,
++        readback,
++        query,
++        preview,
++    }) = pending
++    else {
++        return;
++    };
++    // SAFETY: ends the query from before(), then copies the same restored render target.
++    unsafe {
++        list.list.EndQuery(&query, D3D12_QUERY_TYPE_OCCLUSION, 0);
++        list.list.ResolveQueryData(
++            &query,
++            D3D12_QUERY_TYPE_OCCLUSION,
++            0,
++            1,
++            &readback,
++            2 * BYTES,
++        );
++        copy_color(list, &texture.texture, &readback, BYTES);
++    }
++    let preview = preview.and_then(|before| {
++        let (_, after) =
++            background_snapshot::copy(list, &(texture, D3D12_RESOURCE_STATE_RENDER_TARGET))?;
++        Some([before, after])
++    });
++    if overlay_test() && preview.is_none() {
++        list.reject_transmission_overlay();
++    }
++    list.transmission_witness(Witness {
++        preview,
++        identity,
++        readback,
++        background: None,
++        submission: None,
++        epoch: list.epoch(),
++        ordinal: list.transmission_count(),
++    });
++}
++
++unsafe fn copy_color(
++    list: &HostList,
++    texture: &ID3D12Resource,
++    readback: &ID3D12Resource,
++    offset: u64,
++) {
++    // SAFETY: same device, native target and matching single-subresource readback footprint.
++    unsafe {
++        let from = D3D12_TEXTURE_COPY_LOCATION {
++            pResource: std::mem::transmute_copy(texture),
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: 0,
++            },
++        };
++        let to = D3D12_TEXTURE_COPY_LOCATION {
++            pResource: std::mem::transmute_copy(readback),
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: offset,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: HDR,
++                        Width: WIDTH,
++                        Height: HEIGHT,
++                        Depth: 1,
++                        RowPitch: PITCH,
++                    },
++                },
++            },
++        };
++        let target = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        let source = D3D12_RESOURCE_STATE_COPY_SOURCE;
++        list.list.barriers(&[transition(texture, target, source)]);
++        list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
++        list.list.barriers(&[transition(texture, source, target)]);
++    }
++}
++
++pub(crate) fn submitted(
++    runs: &[&HostList],
++    submission: u64,
++    background: Option<&background_snapshot::RrBackgroundSnapshot>,
++) -> Option<Vec<Images>> {
++    if frame().is_none() {
++        return None;
++    }
++    let interval = background.and_then(|background| {
++        background.camera.as_ref()?;
++        let [begin, end] = background.producer_epochs();
++        let left = runs.iter().position(|list| list.epoch() == begin)?;
++        let right = runs.iter().rposition(|list| list.epoch() == end)?;
++        (right > left + 1).then_some(((left + 1)..right, background))
++    });
++    for (i, list) in runs.iter().enumerate() {
++        let matching = interval
++            .as_ref()
++            .and_then(|(range, background)| range.contains(&i).then_some(*background));
++        list.mark_transmission(submission, matching);
++    }
++    if !overlay_test() {
++        return None;
++    }
++    let (range, _) = interval?;
++    let mut images = Vec::new();
++    for list in &runs[range] {
++        list.transmission_overlay_images(&mut images)?;
++        if images.len() > MAX_DRAWS_PER_LIST {
++            return None;
++        }
++    }
++    (!images.is_empty()).then_some(images)
++}
++
++impl Witness {
++    pub(crate) fn mark(
++        &mut self,
++        submission: u64,
++        background: Option<&background_snapshot::RrBackgroundSnapshot>,
++    ) {
++        // A re-executed list may overwrite its earlier query and images.
++        if self.submission.replace(submission).is_some() {
++            self.submission = Some(u64::MAX);
++            self.background = None;
++        } else {
++            self.background = background
++                .filter(|background| {
++                    self.identity.hdr == background.key.serials[0]
++                        && self.identity.opaque_depth == background.key.serials[1]
++                })
++                .cloned();
++        }
++    }
++
++    pub(crate) fn overlay_images(&self) -> Option<Images> {
++        self.background.as_ref()?;
++        self.preview.clone()
++    }
++
++    pub(crate) fn report(self) {
++        let id = self.identity;
++        let Some(submission) = self.submission.filter(|sequence| *sequence != u64::MAX) else {
++            tracing::warn!(
++                epoch = self.epoch,
++                shader = id.shader,
++                "RR transmission witness submission missing or replayed"
++            );
++            return;
++        };
++        let key = self
++            .background
++            .as_ref()
++            .filter(|background| background.submitted_once())
++            .map(|background| background.key);
++        let mut data = std::ptr::null_mut();
++        // SAFETY: host invokes only after the actual list fence retired.
++        unsafe {
++            if self
++                .readback
++                .Map(
++                    0,
++                    Some(&D3D12_RANGE {
++                        Begin: 0,
++                        End: SIZE as usize,
++                    }),
++                    Some(&mut data),
++                )
++                .is_err()
++            {
++                return;
++            }
++            if !data.is_null() {
++                let before = std::slice::from_raw_parts(data.cast::<u16>(), BYTES as usize / 2);
++                let after = std::slice::from_raw_parts(
++                    data.cast::<u8>().add(BYTES as usize).cast::<u16>(),
++                    before.len(),
++                );
++                let samples = data
++                    .cast::<u8>()
++                    .add((2 * BYTES) as usize)
++                    .cast::<u64>()
++                    .read();
++                let footprint = changed_color(before, after);
++                tracing::info!(
++                    ?key, submission, epoch = self.epoch, ordinal = self.ordinal,
++                    shader = id.shader, mesh = id.mesh, indirect = id.indirect,
++                    groups_or_commands = id.groups_or_commands, hdr = id.hdr, depth = id.opaque_depth,
++                    raster_depth = id.raster_depth, pyramid = id.pyramid, mip_count = id.mip_count,
++                    scissor = ?id.scissor, samples, changed = footprint.changed,
++                    bounds = ?footprint.bounds, nonfinite = footprint.nonfinite,
++                    "RR native transmission raster witness"
++                );
++                if let Some(key) = key
++                    && let Some(path) = mask_dir()
++                {
++                    let name = format!(
++                        "transmission-{}-{}-{}-{}-{}.pgm",
++                        key.begun, key.submission, self.epoch, self.ordinal, id.shader
++                    );
++                    let mut pgm = format!("P5\n{WIDTH} {HEIGHT}\n255\n").into_bytes();
++                    pgm.extend(footprint.mask);
++                    if let Err(error) = std::fs::write(path.join(name), pgm) {
++                        tracing::warn!(%error, "RR transmission mask export failed");
++                    }
++                }
++            }
++            self.readback
++                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
++        }
++    }
++}
++
++fn mask_dir() -> Option<&'static PathBuf> {
++    static OUTPUT: OnceLock<Option<PathBuf>> = OnceLock::new();
++    OUTPUT
++        .get_or_init(|| std::env::var_os("VICTORY_RR_TRANSMISSION_MASK_DIR").map(PathBuf::from))
++        .as_ref()
++}
++
++struct Footprint {
++    mask: Vec<u8>,
++    changed: u32,
++    nonfinite: u32,
++    bounds: Option<[u32; 4]>,
++}
++
++fn changed_color(before: &[u16], after: &[u16]) -> Footprint {
++    let mut footprint = Footprint {
++        mask: vec![0; before.len() / 4],
++        changed: 0,
++        nonfinite: 0,
++        bounds: None,
++    };
++    let canonical_zero = |value: u16| if value & 0x7fff == 0 { 0 } else { value };
++    for (pixel, (before, after)) in before
++        .chunks_exact(4)
++        .zip(after.chunks_exact(4))
++        .enumerate()
++    {
++        if before[..3]
++            .iter()
++            .chain(&after[..3])
++            .any(|&word| word & 0x7c00 == 0x7c00)
++        {
++            footprint.nonfinite += 1;
++            continue;
++        }
++        if before[..3]
++            .iter()
++            .zip(&after[..3])
++            .all(|(&a, &b)| canonical_zero(a) == canonical_zero(b))
++        {
++            continue;
++        }
++        let x = pixel as u32 % WIDTH;
++        let y = pixel as u32 / WIDTH;
++        let [left, top, right, bottom] = footprint.bounds.unwrap_or([x, y, x + 1, y + 1]);
++        footprint.bounds = Some([left.min(x), top.min(y), right.max(x + 1), bottom.max(y + 1)]);
++        footprint.mask[pixel] = 255;
++        footprint.changed += 1;
++    }
++    footprint
++}
++
++#[test]
++fn rgb_difference_excludes_alpha_signed_zero_and_nonfinite() {
++    let before = [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
++    let after = [0x8000, 0, 0, 1, 0, 2, 0, 0, 0, 0, 0x7c00, 0];
++    let result = changed_color(&before, &after);
++    assert_eq!(result.mask, [0, 255, 0]);
++    assert_eq!(result.changed, 1);
++    assert_eq!(result.nonfinite, 1);
++    assert_eq!(result.bounds, Some([1, 0, 2, 1]));
++}
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index aef7239505ab56130f8693c5a056dfba73ac1069..c1fefd94747b59c6e2a3b9ed8c399bf5fb0f1728 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -12,7 +12,7 @@ pub use crate::rr_history::{RrCameraFrame, RrHistory};
+ 
+ #[cfg(feature = "diagnostics")]
+ pub use crate::reflection_motion::{
+-    ReflectionFrame, ReflectionInputs, ReflectionOutput, ReflectionSnapshots,
++    ReflectionFrame, ReflectionInputs, ReflectionOutput, ReflectionSnapshots, RrNativeTransmissionOverlay,
+ };
+ 
+ #[cfg(feature = "diagnostics")]
+@@ -190,6 +190,22 @@ impl Recording<'_> {
+         crate::dof::produce(self.0, color)
+     }
+ 
++    /// Pack validated final native refraction for the SDK transparency overlay.
++    ///
++    /// # Safety
++    /// Provide exact ordered post-chain snapshots with and without transmission,
++    /// plus their certified final coverage and matching shader-readable state.
++    /// The result is eligible only after all rejection pixels are zero.
++    #[cfg(feature = "diagnostics")]
++    pub unsafe fn rr_native_transmission_overlay(
++        &self,
++        final_hdr: &ID3D12Resource,
++        without_transmission: &ID3D12Resource,
++        coverage: &ID3D12Resource,
++    ) -> Option<RrNativeTransmissionOverlay> {
++        unsafe { crate::reflection_motion::pack_native_transmission(self.0, final_hdr, without_transmission, coverage) }
++    }
++
+     /// Classify the checked before/after snapshots of the native opaque reflection occurrence.
+     ///
+     /// # Safety
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 0b8398f6f46b0c96b85a26752e45c45c511355cb..88f5bd7f823e5dd63dde42dfd9a4384dc67f4964 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2692,6 +2692,10 @@ struct Deferred {
+     #[cfg(feature = "diagnostics")]
+     background_snapshot_backs: Vec<crate::draw::background_snapshot::RrBackgroundSnapshot>,
+     #[cfg(feature = "diagnostics")]
++    transmission_witnesses: Vec<crate::draw::transmission_witness::Witness>,
++    #[cfg(feature = "diagnostics")]
++    transmission_overlay_rejected: bool,
++    #[cfg(feature = "diagnostics")]
+     reflection_backs: Vec<crate::draw::reflection_capture::Readback>,
+     #[cfg(feature = "diagnostics")]
+     reflection_dense_cameras: Vec<crate::draw::reflection_dense::Camera>,
+@@ -4471,6 +4475,10 @@ fn read_backs(list: &HostList) {
+         crate::draw::background_snapshot::retire(snapshot);
+     }
+     #[cfg(feature = "diagnostics")]
++    for witness in std::mem::take(&mut list.deferred().transmission_witnesses) {
++        witness.report();
++    }
++    #[cfg(feature = "diagnostics")]
+     for check in std::mem::take(&mut list.deferred().reflection_dense_backs) {
+         check.report();
+     }
+@@ -6417,8 +6425,9 @@ impl Host {
+         #[cfg(feature = "diagnostics")]
+         if let Some(last) = runs.last() {
+             let background = crate::draw::background_snapshot::submitted(runs, this_submission);
++            let transmission = crate::draw::transmission_witness::submitted(runs, this_submission, background.as_ref());
+             if let Some(check) = crate::draw::reflection_dense::submitted(
+-                self, runs, this_submission, background.as_ref(),
++                self, runs, this_submission, background.as_ref(), transmission.as_deref(),
+             ) && let Some(commands) = check.command()
+             {
+                 marks.push((lists.len(), crate::copystat::Timed::Other));
+@@ -8245,6 +8254,42 @@ impl HostList {
+         }
+         Some((mark, deferred.background_snapshot_events.clone()))
+     }
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn transmission_count(&self) -> usize {
++        self.deferred().transmission_witnesses.len()
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn transmission_witness(&self, witness: crate::draw::transmission_witness::Witness) {
++        self.deferred().transmission_witnesses.push(witness);
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn reject_transmission_overlay(&self) {
++        self.deferred().transmission_overlay_rejected = true;
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn transmission_overlay_images(
++        &self, images: &mut Vec<crate::draw::transmission_witness::Images>,
++    ) -> Option<()> {
++        let deferred = self.deferred();
++        if deferred.transmission_overlay_rejected { return None; }
++        for witness in &deferred.transmission_witnesses {
++            images.push(witness.overlay_images()?);
++        }
++        Some(())
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn mark_transmission(
++        &self, submission: u64, background: Option<&crate::draw::background_snapshot::RrBackgroundSnapshot>,
++    ) {
++        for witness in &mut self.deferred().transmission_witnesses {
++            witness.mark(submission, background);
++        }
++    }
++
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn reflection_dense_camera(&self, camera: crate::draw::reflection_dense::Camera) {
+         let mut deferred = self.deferred();
+diff --git a/crates/victory-gpu/src/rr/native_transmission_overlay.hlsl b/crates/victory-gpu/src/rr/native_transmission_overlay.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d458f60a8e1ef07979edb98e2b4a7352b3c5a02
+--- /dev/null
++++ b/crates/victory-gpu/src/rr/native_transmission_overlay.hlsl
+@@ -0,0 +1,43 @@
++Texture2D<float4> finalColor : register(t0);
++Texture2D<float4> colorWithoutTransmission : register(t1);
++Texture2D<uint> certifiedCoverage : register(t2);
++RWTexture2D<float4> baseColor : register(u0);
++RWTexture2D<float4> transparencyLayer : register(u1);
++RWTexture2D<uint> rejection : register(u2);
++
++cbuffer Render : register(b0)
++{
++    uint width;
++};
++
++[RootSignature("RootConstants(num32BitConstants=1, b0),DescriptorTable(SRV(t0,numDescriptors=3),UAV(u0,numDescriptors=3))")]
++[numthreads(8, 8, 1)]
++void main(uint3 thread : SV_DispatchThreadID)
++{
++    uint2 pixel = thread.xy;
++    if (pixel.x >= width)
++        return;
++    int3 at = int3(pixel, 0);
++    float4 native = finalColor.Load(at);
++    float4 clean = colorWithoutTransmission.Load(at);
++    uint coverage = certifiedCoverage.Load(at);
++    uint reason = 0;
++    if (!all(isfinite(native)) || !all(isfinite(clean)))
++        reason |= 1;
++    if (coverage > 1)
++        reason |= 2;
++    if (coverage == 0 && any(native.rgb != clean.rgb))
++        reason |= 4;
++    if (coverage == 1 && any(native.rgb < 0.0))
++        reason |= 8;
++
++    float4 overlay = 0;
++    if (reason == 0 && coverage == 1)
++        overlay = float4(native.rgb, 1.0);
++
++    // Each covered sample is baked with full opacity. This is a lossless
++    // representation of its final scene RGB, not the material's opacity.
++    baseColor[pixel] = (reason == 0 && coverage == 1) ? clean : native;
++    transparencyLayer[pixel] = overlay;
++    rejection[pixel] = reason;
++}
+diff --git a/crates/victory-gpu/src/rr/observed_transmission_overlay.hlsl b/crates/victory-gpu/src/rr/observed_transmission_overlay.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..7adc8ed595c636e5049d610865f59a9f31168ea8
+--- /dev/null
++++ b/crates/victory-gpu/src/rr/observed_transmission_overlay.hlsl
+@@ -0,0 +1,34 @@
++Texture2D<float4> finalColor : register(t0);
++Texture2D<float4> drawColors[16] : register(t1);
++RWTexture2D<float4> baseColor : register(u0);
++RWTexture2D<float4> transparency : register(u1);
++RWTexture2D<uint> status : register(u2);
++
++cbuffer Draws : register(b0)
++{
++    uint drawCount;
++};
++
++[RootSignature("RootConstants(num32BitConstants=1, b0),DescriptorTable(SRV(t0,numDescriptors=17),UAV(u0,numDescriptors=3))")]
++[numthreads(8, 8, 1)]
++void main(uint3 thread : SV_DispatchThreadID)
++{
++    uint2 pixel = thread.xy;
++    int3 at = int3(pixel, 0);
++    float4 native = finalColor.Load(at);
++    float4 background = drawColors[0].Load(at);
++    bool valid = all(isfinite(native)) && all(isfinite(background));
++    bool covered = false;
++    for (uint n = 0; n < drawCount; ++n)
++    {
++        float3 before = drawColors[2 * n].Load(at).rgb;
++        float3 after = drawColors[2 * n + 1].Load(at).rgb;
++        valid = valid && all(isfinite(before)) && all(isfinite(after));
++        covered = covered || any(before != after);
++    }
++    valid = valid && (!covered || all(native.rgb >= 0.0));
++    bool useOverlay = valid && covered;
++    baseColor[pixel] = useOverlay ? background : native;
++    transparency[pixel] = useOverlay ? float4(native.rgb, 1.0) : 0;
++    status[pixel] = valid ? (covered ? 1 : 0) : 2;
++}
+diff --git a/crates/victory-gpu/src/rr/reflection_motion.rs b/crates/victory-gpu/src/rr/reflection_motion.rs
+index 890c4eb829c634af810226fc3abafb249322c5a8..e88a83ba8d807beaf989152bd410145987875642 100644
+--- a/crates/victory-gpu/src/rr/reflection_motion.rs
++++ b/crates/victory-gpu/src/rr/reflection_motion.rs
+@@ -334,6 +334,96 @@ pub(crate) unsafe fn copy_shadow_depth(
+     Some(depth)
+ }
+ 
++/// A packed SDK transparency layer for the original native glass samples.
++#[derive(Clone)]
++pub struct RrNativeTransmissionOverlay {
++    pub base: ID3D12Resource,
++    pub overlay: ID3D12Resource,
++    /// Nonzero rejects the full candidate: invalid samples (1), invalid mask
++    /// (2), transmission-free reference differs outside the certified mask (4),
++    /// or negative premultiplied radiance inside it (8).
++    pub rejected: ID3D12Resource,
++}
++
++/// Pack the original native glass color without estimating a spatial warp.
++///
++/// # Safety
++/// Both HDR snapshots come from the same frame, camera, native geometry and
++/// complete post chain. `without_transmission` differs only by omitting the
++/// certified transmission contributors. `coverage` is 1 only where the
++/// caller permits baking their exact final sample. It must account for
++/// downstream glass dependencies in other alpha, heat haze and DOF work.
++/// All three immutable snapshots are in NON_PIXEL_SHADER_RESOURCE state.
++/// Before RR consumption, certify that every rejection pixel is zero.
++/// This routine does not change title resources or qualify geometric guides.
++pub(crate) unsafe fn pack_native_transmission(
++    list: &HostList,
++    final_hdr: &ID3D12Resource,
++    without_transmission: &ID3D12Resource,
++    coverage: &ID3D12Resource,
++) -> Option<RrNativeTransmissionOverlay> {
++    let device = &host()?.device;
++    let size = [WIDTH as u32, HEIGHT];
++    let hdr = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    let mask = DXGI_FORMAT_R32_UINT;
++    let views = [(final_hdr, hdr), (without_transmission, hdr), (coverage, mask)];
++    if final_hdr.as_raw() == without_transmission.as_raw() {
++        return None;
++    }
++    for &(texture, format) in &views {
++        // SAFETY: caller retains the resources through this submission.
++        let desc = unsafe { texture.GetDesc() };
++        if desc.Format != format || !valid_input(desc, size) || !same_device(texture, device) {
++            return None;
++        }
++    }
++    static PIPELINE: OnceLock<Option<Pipeline>> = OnceLock::new();
++    let pipeline = pipeline(device, include_str!("native_transmission_overlay.hlsl"), &[hdr, mask], &PIPELINE)?;
++    let base = output(device, size, hdr)?;
++    let overlay = output(device, size, hdr)?;
++    let rejected = output(device, size, mask)?;
++    let views = views.map(|(resource, format)| (Some(resource), format));
++    // SAFETY: same-view immutable snapshots, validated formats and states.
++    unsafe {
++        dispatch(list, device, pipeline, size, &[size[0]], &views, &[&base, &overlay, &rejected])?;
++    }
++    Some(RrNativeTransmissionOverlay { base, overlay, rejected })
++}
++
++/// Diagnostic only. This retains precisely the original final RGB inside a
++/// pre-haze color-change mask, using the actual pre-transmission scene there.
++/// This mask does not claim final influence through haze or DOF.
++pub(crate) unsafe fn pack_observed_transmission(
++    list: &HostList,
++    final_hdr: &ID3D12Resource,
++    draws: &[[ID3D12Resource; 2]],
++) -> Option<RrNativeTransmissionOverlay> {
++    if draws.is_empty() || draws.len() > 8 { return None; }
++    let device = &host()?.device;
++    let size = [WIDTH as u32, HEIGHT];
++    let hdr = DXGI_FORMAT_R16G16B16A16_FLOAT;
++    let mask = DXGI_FORMAT_R32_UINT;
++    let mut views = [(None, hdr); 17];
++    for (view, texture) in views.iter_mut().zip(std::iter::once(final_hdr).chain(draws.iter().flatten())) {
++        // SAFETY: caller keeps the immutable snapshots through submission.
++        let desc = unsafe { texture.GetDesc() };
++        if desc.Format != hdr || !valid_input(desc, size) || !same_device(texture, device) {
++            return None;
++        }
++        view.0 = Some(texture);
++    }
++    static PIPELINE: OnceLock<Option<Pipeline>> = OnceLock::new();
++    let pipeline = pipeline(device, include_str!("observed_transmission_overlay.hlsl"), &[hdr, mask], &PIPELINE)?;
++    let base = output(device, size, hdr)?;
++    let overlay = output(device, size, hdr)?;
++    let rejected = output(device, size, mask)?;
++    // SAFETY: caller established ordered original snapshots in readable state.
++    unsafe {
++        dispatch(list, device, pipeline, size, &[draws.len() as u32], &views, &[&base, &overlay, &rejected])?;
++    }
++    Some(RrNativeTransmissionOverlay { base, overlay, rejected })
++}
++
+ fn valid_input(desc: D3D12_RESOURCE_DESC, size: [u32; 2]) -> bool {
+     desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
+         && desc.Width == u64::from(size[0])
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+index 7e9b927d035c1851343da4f0ca72dea997d41e2c..3b1f8db3d98757a558520400f18a8fc553b00a6c 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr.rs
+@@ -21,6 +21,15 @@ pub(crate) enum Reflections<'a> {
+     },
+ }
+ 
++/// Native transparent color separated from the main HDR input. RGB is
++/// premultiplied by coverage; uncovered pixels are all zero.
++pub(crate) struct TransparencyOverlay<'a> {
++    pub resource: &'a ID3D12Resource,
++    pub subrect_base: [u32; 2],
++    /// State established by the producer on the ordered command list.
++    pub state: D3D12_RESOURCE_STATES,
++}
++
+ /// Current HDR and geometric guides from the same camera sample.
+ pub(crate) struct Guides<'a> {
+     pub color: &'a ID3D12Resource,
+@@ -33,6 +42,7 @@ pub(crate) struct Guides<'a> {
+     pub reflections: Reflections<'a>,
+     /// Same-camera 720p RGBA16F scene before transparent lighting (SDK preset F).
+     pub color_before_transparency: Option<&'a ID3D12Resource>,
++    pub transparency_overlay: Option<TransparencyOverlay<'a>>,
+     /// Luminance of aligned post-DOF minus pre-DOF HDR. Zero outside blurred pixels.
+     pub depth_of_field: Option<&'a ID3D12Resource>,
+     pub output: &'a ID3D12Resource,
+@@ -90,6 +100,15 @@ static GLASS_SHADOW_PROVIDER: Mutex<Provider> = Mutex::new(Provider {
+     failed: false,
+ });
+ 
++#[cfg(feature = "diagnostics")]
++static TRANSMISSION_SHADOW_PROVIDER: Mutex<Provider> = Mutex::new(Provider {
++    ngx: None,
++    depth_encoding: None,
++    has_history: false,
++    history_stream: None,
++    failed: false,
++});
++
+ #[cfg(feature = "diagnostics")]
+ pub(super) fn shadow_enabled() -> bool {
+     static ENABLED: OnceLock<bool> = OnceLock::new();
+@@ -104,7 +123,9 @@ pub(super) unsafe fn record_shadow(
+     guides: &Guides<'_>,
+     frame: &Frame,
+ ) -> Result<(), Error> {
+-    let provider = if guides.color_before_transparency.is_some() {
++    let provider = if guides.transparency_overlay.is_some() {
++        &TRANSMISSION_SHADOW_PROVIDER
++    } else if guides.color_before_transparency.is_some() {
+         &GLASS_SHADOW_PROVIDER
+     } else {
+         &SHADOW_PROVIDER
+@@ -210,6 +231,19 @@ unsafe fn record_on_stream(
+                 name!("DLSSD.ColorBeforeTransparency"),
+                 guides.color_before_transparency.map_or(std::ptr::null_mut(), Interface::as_raw),
+             );
++            // SDK 310.9.16 D3D12 DLSSD helper uses the DLSS namespace
++            // for its optional packed premultiplied layer and origin.
++            let overlay = guides.transparency_overlay.as_ref();
++            NVSDK_NGX_Parameter_SetD3d12Resource(
++                params, name!("DLSS.TransparencyLayer"),
++                overlay.map_or(std::ptr::null_mut(), |layer| layer.resource.as_raw()),
++            );
++            let [x, y] = overlay.map_or([0; 2], |layer| layer.subrect_base);
++            NVSDK_NGX_Parameter_SetUI(params, name!("DLSS.TransparencyLayer.Subrect.Base.X"), x);
++            NVSDK_NGX_Parameter_SetUI(params, name!("DLSS.TransparencyLayer.Subrect.Base.Y"), y);
++            for key in [name!("DLSS.TransparencyLayerOpacity"), name!("DLSS.TransparencyLayerMvecs")] {
++                NVSDK_NGX_Parameter_SetD3d12Resource(params, key, std::ptr::null_mut());
++            }
+             NVSDK_NGX_Parameter_SetD3d12Resource(
+                 params,
+                 name!("DLSSD.DepthOfFieldGuide"),
+@@ -478,6 +512,24 @@ fn validate(
+         }
+     };
+ 
++    if let Some(layer) = &guides.transparency_overlay {
++        // SAFETY: immutable descriptor of a caller-retained resource.
++        let desc = unsafe { layer.resource.GetDesc() };
++        let other_inputs = [
++            Some(guides.color), Some(guides.depth), Some(guides.motion),
++            Some(guides.diffuse_albedo), Some(guides.specular_albedo),
++            Some(guides.normals_roughness), Some(reflections), guides.depth_of_field,
++        ];
++        if layer.subrect_base != [0, 0]
++            || layer.state != D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
++            || desc.MipLevels != 1
++            || guides.color_before_transparency.is_some()
++            || other_inputs.into_iter().flatten().any(|input| input.as_raw() == layer.resource.as_raw())
++        {
++            return Err(Error::Invalid("RR transparency overlay must be a distinct full-input premultiplied layer in compute-read state"));
++        }
++    }
++
+     for (label, resource, formats) in [
+         ("RR HDR color", guides.color, rgba.as_slice()),
+         ("RR depth", guides.depth, &[DXGI_FORMAT_R32_FLOAT]),
+@@ -489,6 +541,7 @@ fn validate(
+     ]
+     .into_iter()
+     .chain(guides.color_before_transparency.map(|hdr| ("RR color before transparency", hdr, rgba.as_slice())))
++    .chain(guides.transparency_overlay.as_ref().map(|layer| ("RR RGBA16F transparency overlay", layer.resource, rgba.as_slice())))
+     .chain(
+         guides
+             .depth_of_field
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs
+index d2495e691044548c7ac9bedf7d5342ecca507eaa..e8bb798391f2ab109d47e0da02a2db979f651d40 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr/tests.rs
+@@ -353,6 +353,7 @@ fn renderer_rr_reads_back_reset_and_history() {
+                 normals_roughness: normals,
+                 reflections,
+                 color_before_transparency: None,
++                transparency_overlay: None,
+                 depth_of_field: experiment
+                     .is_some_and(|(arm, frame)| (arm == 1 || arm == 2) && frame < ARM_FRAMES - 1)
+                     .then_some(dof),
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+index 97b9bdd45d0e4b4fd82c8295ce299e6e325d14af..73c2bee5a317d4199d359a5cd8ce2edd1faf230c 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+@@ -67,6 +67,9 @@ fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(),
+     };
+     let mut last: Option<ShadowStamp> = None;
+     let mut guided_last: Option<ShadowStamp> = None;
++    let mut overlay_last: Option<ShadowStamp> = None;
++    let overlay_comparison = pair_folder().is_some()
++        && std::env::var_os("VICTORY_RR_GLASS_OVERLAY_TEST").is_some_and(|value| value == "1");
+     let mut evaluated = 0;
+     while evaluated < limit {
+         let Ok(inputs) = receive.recv_timeout(Duration::from_secs(15)) else {
+@@ -103,27 +106,43 @@ fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(),
+         };
+         let compare = pair_folder().is_some()
+             && std::env::var_os("VICTORY_RR_GLASS_COMPARE").is_some_and(|value| value == "1");
+-        if compare && inputs.color_before_transparency.is_some() {
+-            let guided_reset = !guided_last.is_some_and(|prior| {
+-                prior.matches_previous(inputs.present, inputs.stream, inputs.previous_camera)
+-            });
+-            evaluate(&device, &queue, inputs.clone(), reset, false)?;
+-            match evaluate(&device, &queue, inputs, guided_reset, true) {
+-                Ok(()) => guided_last = Some(current),
+-                Err(error) => {
+-                    guided_last = None;
+-                    tracing::warn!(%error, present = current.present, "RR before-transparency comparison unavailable");
+-                }
++        evaluate(&device, &queue, inputs.clone(), reset, Arm::Standard)?;
++        for (enabled, available, prior, arm) in [
++            (
++                compare,
++                inputs.color_before_transparency.is_some(),
++                &mut guided_last,
++                Arm::ColorGuide,
++            ),
++            (
++                overlay_comparison,
++                inputs.observed_transmission.is_some(),
++                &mut overlay_last,
++                Arm::ObservedOverlay,
++            ),
++        ] {
++            if !enabled {
++                continue;
+             }
+-        } else {
+-            if compare {
++            if !available {
++                *prior = None;
+                 tracing::warn!(
+                     present = inputs.present,
+-                    "RR before-transparency comparison has no exact native background snapshot"
++                    ?arm,
++                    "RR glass arm has no matching native proof"
+                 );
++                continue;
++            }
++            let arm_reset = !prior.is_some_and(|last| {
++                last.matches_previous(inputs.present, inputs.stream, inputs.previous_camera)
++            });
++            match evaluate(&device, &queue, inputs.clone(), arm_reset, arm) {
++                Ok(()) => *prior = Some(current),
++                Err(error) => {
++                    *prior = None;
++                    tracing::warn!(%error, present = current.present, ?arm, "RR glass comparison arm unavailable");
++                }
+             }
+-            guided_last = None;
+-            evaluate(&device, &queue, inputs, reset, false)?;
+         }
+         last = Some(current);
+         evaluated += 1;
+@@ -138,6 +157,13 @@ fn run(receive: Receiver<external::RrShadowInputs>, limit: usize) -> Result<(),
+     Ok(())
+ }
+ 
++#[derive(Clone, Copy, Debug, Eq, PartialEq)]
++enum Arm {
++    Standard,
++    ColorGuide,
++    ObservedOverlay,
++}
++
+ #[derive(Clone, Copy)]
+ struct ShadowStamp {
+     present: u64,
+@@ -209,7 +235,7 @@ fn evaluate(
+     queue: &ID3D12CommandQueue,
+     inputs: external::RrShadowInputs,
+     reset: bool,
+-    with_transparency_guide: bool,
++    arm: Arm,
+ ) -> Result<(), Error> {
+     // SAFETY: all inputs are immutable, fence-retired snapshots from this device.
+     unsafe {
+@@ -279,8 +305,15 @@ fn evaluate(
+             },
+             ..Default::default()
+         }]);
++        let observed = inputs
++            .observed_transmission
++            .as_ref()
++            .filter(|_| arm == Arm::ObservedOverlay);
++        if arm == Arm::ObservedOverlay && observed.is_none() {
++            return Err(Error::Invalid("missing exact native transmission split"));
++        }
+         let guides = rr::Guides {
+-            color: &inputs.hdr,
++            color: observed.map_or(&inputs.hdr, |(base, _, _)| base),
+             depth: &inputs.depth,
+             depth_encoding: rr::DepthEncoding::InvertedHardware,
+             motion: &inputs.motion,
+@@ -288,7 +321,7 @@ fn evaluate(
+             specular_albedo: &inputs.material.specular,
+             normals_roughness: &inputs.material.normal_roughness,
+             reflections: rr::Reflections::Motion(&inputs.reflection_motion),
+-            color_before_transparency: if with_transparency_guide {
++            color_before_transparency: if arm == Arm::ColorGuide {
+                 Some(
+                     inputs
+                         .color_before_transparency
+@@ -300,6 +333,11 @@ fn evaluate(
+             } else {
+                 None
+             },
++            transparency_overlay: observed.map(|(_, overlay, _)| rr::TransparencyOverlay {
++                resource: overlay,
++                subrect_base: [0, 0],
++                state: D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++            }),
+             depth_of_field: inputs.depth_of_field.as_ref(),
+             output: &output,
+         };
+@@ -367,13 +405,7 @@ fn evaluate(
+             Err(Error::Invalid("output readback pointer"))
+         } else {
+             let pixels = std::slice::from_raw_parts(ptr.cast::<u16>(), readback_bytes / 2);
+-            report(
+-                &inputs,
+-                &pixels[..PIXELS * 4],
+-                reset,
+-                with_transparency_guide,
+-            )
+-            .and_then(|rr_hash| {
++            report(&inputs, &pixels[..PIXELS * 4], reset, arm).and_then(|rr_hash| {
+                 if let Some((folder, serial, _)) = pair {
+                     let rr = &pixels[..PIXELS * 4];
+                     let sr = &pixels[PIXELS * 4..];
+@@ -392,7 +424,7 @@ fn evaluate(
+                         &inputs,
+                         serial,
+                         reset,
+-                        with_transparency_guide,
++                        arm,
+                         (rr, rr_hash),
+                         (sr, sr_hash),
+                     )
+@@ -411,7 +443,7 @@ fn report(
+     inputs: &external::RrShadowInputs,
+     output: &[u16],
+     reset: bool,
+-    with_transparency_guide: bool,
++    arm: Arm,
+ ) -> Result<u64, Error> {
+     let (finite, touched, nonzero, digest) = output_stats(output);
+     let complete = finite == PIXELS && touched == PIXELS && nonzero > 0;
+@@ -419,7 +451,8 @@ fn report(
+         feature = 13,
+         complete,
+         reset,
+-        color_before_transparency = with_transparency_guide,
++        color_before_transparency = arm == Arm::ColorGuide,
++        observed_transmission = arm == Arm::ObservedOverlay,
+         output = ?UHD.output,
+         present = inputs.present,
+         begun = inputs.begun,
+@@ -444,16 +477,22 @@ fn save_pair(
+     inputs: &external::RrShadowInputs,
+     sr_serial: u64,
+     reset: bool,
+-    with_transparency_guide: bool,
++    arm: Arm,
+     (rr, rr_hash): (&[u16], u64),
+     (sr, sr_hash): (&[u16], u64),
+ ) -> io::Result<()> {
+     std::fs::create_dir_all(folder)?;
+-    let suffix = if with_transparency_guide {
+-        "-before-transparency"
+-    } else {
+-        ""
++    let suffix = match arm {
++        Arm::Standard => "",
++        Arm::ColorGuide => "-before-transparency",
++        Arm::ObservedOverlay => "-native-transmission-overlay",
+     };
++    let with_transparency_guide = arm == Arm::ColorGuide;
++    let observed_transmission = inputs
++        .observed_transmission
++        .as_ref()
++        .filter(|_| arm == Arm::ObservedOverlay)
++        .map_or(0, |(_, _, pixels)| *pixels);
+     let stem = format!(
+         "frame-{}-submit-{}{suffix}",
+         inputs.present, inputs.submission
+@@ -470,7 +509,7 @@ fn save_pair(
+         std::fs::write(
+             staging.join("receipt.txt"),
+             format!(
+-                "tap=FFX upscaler output before title postprocessing\nreference=stock SR same dispatch\nfeature=13\nwidth={WIDTH}\nheight={HEIGHT}\nformat=RGBA16F native HDR\npresent={}\nbegun={}\nepoch={}\nsubmit={}\nsource_submit={}\nsr_serial={sr_serial}\nreset={reset}\ncolor_before_transparency={with_transparency_guide}\nprevious_camera_begun={}\nprevious_camera_epoch={}\nprevious_camera_submit={}\npre_exposure={}\nrr_fnv1a64={rr_hash:016x}\nsr_fnv1a64={sr_hash:016x}\n",
++                "tap=FFX upscaler output before title postprocessing\nreference=stock SR same dispatch\nfeature=13\nwidth={WIDTH}\nheight={HEIGHT}\nformat=RGBA16F native HDR\npresent={}\nbegun={}\nepoch={}\nsubmit={}\nsource_submit={}\nsr_serial={sr_serial}\nreset={reset}\ncolor_before_transparency={with_transparency_guide}\nobserved_pre_haze_transmission_pixels={observed_transmission}\nprevious_camera_begun={}\nprevious_camera_epoch={}\nprevious_camera_submit={}\npre_exposure={}\nrr_fnv1a64={rr_hash:016x}\nsr_fnv1a64={sr_hash:016x}\n",
+                 inputs.present,
+                 inputs.begun,
+                 inputs.epoch,
