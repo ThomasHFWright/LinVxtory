@@ -447,7 +447,7 @@ index 25b4803e4c46ba07080478e7b3fad52fe43866e8..f2a1a1eff6ecf17e7aa01de783663fa7
 @@ -39,6 +39,13 @@ impl Recording<'_> {
          Some(())
      }
- 
+
 +    /// Record a signed FP16 guide from the same-list stock DOF composite.
 +    /// Call before preparing the other FidelityFX inputs.
 +    #[cfg(feature = "diagnostics")]
@@ -587,7 +587,7 @@ index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..bcdac97ad6e3240161e0ff7939bbadc1
 @@ -8001,6 +8032,16 @@ impl HostList {
          self.deferred().indirect_readable = scratch.as_raw() as usize;
      }
- 
+
 +    #[cfg(feature = "diagnostics")]
 +    pub(crate) fn dof_before(&self) -> std::sync::MutexGuard<'_, Option<crate::dof::Before>> {
 +        self.dof_before.lock().unwrap_or_else(|e| e.into_inner())
