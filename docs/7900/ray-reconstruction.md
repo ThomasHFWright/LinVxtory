@@ -496,6 +496,35 @@ pair setup. Compare the original and `-before-transparency` EXR
 directories after matching their Present, camera, submission, reset,
 exposure and SR image bytes.
 
+#### Native 4K frames with two opaque filters bypassed
+
+An exact match to the closed future FidelityFX recording let the renderer
+select RR before the native opaque filters submitted. The renderer kept
+queue order and committed the filter bypass after it had recorded and
+closed the replacement. It ran once per frame in the native FFX slot,
+with zero Super Resolution evaluations in those slots.
+
+| Native 4K capture | Opaque source submit | RR fence | RR history |
+| ---: | ---: | ---: | --- |
+| 1933 | 12205 | 12210 | Reset |
+| 1934 | 12222 | 12227 | Reused |
+| 1935 | 12239 | 12244 | Reused |
+
+The opaque bilateral and history-update shaders each reported 32 compute
+invocations in their corresponding source submits. The calibrated
+vkd3d-proton indirect-argument clear accounts for all 32, leaving zero
+native workgroups for both shaders. The opaque temporal shader still
+recorded 88,576–89,856 invocations and the alpha temporal shader recorded
+326,656–327,936 in its matching submits. The AOC captures retained the
+rear ponytail and window mesh. The original glass waves were reduced in
+this build, which did not supply the optical layer.
+
+The renderer kept stock SR available. After the RR burst, source submit
+12256 restored both opaque filters at 51,936 invocations each. This build
+continued resetting native history on the alternating packed backing
+after fallback. The run measured dispatches and captured frames. It
+provides no matched median FPS or p95 comparison. [Replay instructions](dive-testing.md#verify-the-two-opaque-filter-bypasses)
+
 #### In-game optical overlay comparison
 
 A second stationary cell replay used the SDK’s transparency layer,

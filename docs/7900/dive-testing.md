@@ -248,3 +248,31 @@ number of submitted SR evaluations in the chosen slot, output serial,
 submission and fence. A candidate that declines reports the reason and
 keeps SR. The captured on-screen view, adopted FFX output and retired
 queue receipt answer different parts of the presentation check.
+
+## Verify the two opaque filter bypasses
+
+Build the 4K RR renderer in a separate directory as above. Apply the
+optional [opaque cut test overlay](rr-opaque-cut.patch.txt) to its
+diagnostics source and rebuild.
+
+```sh
+test "$(git write-tree)" = fdf5181bb2e3676e33e4e79f331cd953347d5fb7
+git apply --index "$kit/rr-opaque-cut.patch.txt"
+test "$(git write-tree)" = 422ada24652eb1444303ac1d8c91157d66a6a61e
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+export VICTORY_RR_EARLY_SOURCE=1 VICTORY_RR_ATOMIC_CUT=1
+```
+
+Use the same trigger, offline replay and capture settings. Keep
+`VICTORY_OPAQUE_CURRENT`, `VICTORY_OPAQUE_CUT` and
+`VICTORY_ALPHA_CURRENT` unset. Those switches select independent
+diagnostics. For each chosen frame, match the adopted cutoff's
+`sequence` to `source_submit` on the selected FFX record, and match
+the selected FFX fence to its retirement. Look for both shader hashes
+`dce085c07b9414b6` and `6fad2980c2774c90` in retired pass statistics
+for that exact source. With the pinned vkd3d-proton build, each query
+reports 32 compute invocations for the indirect clear alone when the
+target shader executes zero groups. The opaque and alpha temporal
+shaders still run in this test. After the burst, verify stock SR and
+both native post-filters resume. Use a separate replay for timing.
