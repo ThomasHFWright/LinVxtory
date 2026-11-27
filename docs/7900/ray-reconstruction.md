@@ -52,3 +52,49 @@ After the GPU fences signaled, both 4K readbacks had finite RGB at every
 pixel and zero remaining sentinel components. The [probe source, build
 instructions and measured outputs](rr-probe/README.md) are reproducible
 without game files. In-game guide validation is still underway.
+
+## What the title filters
+
+Joining pipeline identifiers to the published SR replay confirmed that the
+title selected opaque stochastic reflection tracing, spatial filtering,
+temporal resolve, bilateral filtering and history update. The title also
+selected a checkerboard shadow-mask denoiser and screen-probe filters.
+
+An older 2560×1440 frame with detailed bindings shows why the handoff
+requires changes earlier than the upscaler:
+
+- The reflection spatial filter reads half-resolution radiance and produces
+  two full-resolution textures. Temporal resolve consumes both. Later passes
+  pack radiance, apply a bilateral filter and update history. Replacing that
+  sequence must preserve the packed input expected by material lighting.
+- The shadow chain uses packed masks and a buffer. Hair and checkerboard
+  tracing, denoising, pruning and lighting share products from that chain.
+  The raw checkerboard mask needs coverage validation before lighting can
+  consume it directly.
+- The scene-color path includes fog and depth of field. Bloom and color
+  grading consume the resolved color, and a separate display-resolution
+  surface is blended during presentation. The 4K replay selected the same
+  depth-of-field and bloom families. Exact order at 720p needs a submitted
+  frame trace.
+
+The opaque reflection tracer stores ray distance in the X component of an
+RG16F target. A downstream screen-space resolve uses it to reconstruct the
+hit position along a normalized reflected ray. The title uses a negative
+value for an invalid sample. RR requires a primary-pixel-aligned scalar
+distance and distinguishes sky from other misses. Frame phase, coverage and
+world units matter when converting the title's sparse samples.
+
+For the standard opaque material, the producer and lighting consumer agree
+on packed octahedral normals, inverse roughness in the normal target's R
+channel, and an encoded Fresnel reflectance. Given an encoded channel
+`p`, the lighting consumer decodes reflectance as `p² × (2 − p²)`.
+RR takes view-dependent specular albedo, which also depends on roughness
+and the view direction. The hair resolve can write sRGB-encoded diffuse
+color and selects a specialized material class. Eye, hair and sheen
+lighting use additional material terms. Binding raw G-buffer textures
+would feed mismatched values to RR in these cases.
+
+These findings combine the 4K SR runtime's selected shader identities with
+static producer/consumer analysis and the older frame's resource bindings.
+Addresses, dimensions and pass order from that older capture are unsuitable
+as constants for the 720p renderer.
