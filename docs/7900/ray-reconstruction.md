@@ -458,8 +458,8 @@ Each RR output had 8,294,400 finite, written, nonzero pixels. Present 2252
 referenced the preceding camera at submission 17590. Its SR output hash
 was `d2ff0108d37ca6bd` and both EXRs recorded pre-exposure 1. Viewed with
 one exposure and tone curve, RR reduced speckle on the window and made
-the people outside easier to distinguish. The window also lost some fine
-texture. The ponytail and diamond wire remained visible. Lucia faced away
+the people outside easier to distinguish. RR also flattened the intentionally wavy glass. This is a visual
+regression. Preserving the native refraction is an acceptance criterion. The ponytail and diamond wire remained visible. Lucia faced away
 from the camera. Face detail and ghosting during turns still require
 their own views.
 
@@ -469,6 +469,22 @@ run from a single-provider performance comparison. The separate inkVI-dive
 bookmark returned within 0.003 game-world units, with identical heading
 and clock. The game's camera stayed independent of the saved position.
 [Reproduce the EXR pair](dive-testing.md#capture-native-4k-sr-and-rr-from-one-game-frame)
+
+## Native output and fallback
+
+The bounded display experiment selected RR in the actual 4K FFX slot
+for Presents 2453 and 2454. Both used output serial 32396. The title
+queue retired fences 19816 and 19833, with a history reset on the first
+frame and reused history on the second. Each selected slot submitted
+one RR evaluation and zero SR evaluations. The real AOC replay captured
+4K frames 2453–2460. The ponytail and room lighting were visible. The
+character faced away in the two RR captures.
+
+Presents 2455–2457 selected SR when the current opaque producer could
+not be matched. Both providers used the native denoisers throughout
+this test. Removing redundant native work and preserving the wavy glass
+are still open. A 55-second RR performance comparison awaits those
+changes. [Reproduce the native output test](dive-testing.md#test-the-native-4k-upscaler-slot-on-the-aoc)
 
 The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
 introduces a different NVIDIA renderer baseline. Its [DLSS implementation
