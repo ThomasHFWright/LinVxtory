@@ -130,8 +130,9 @@ returned three, Presents 2636–2638, in 1.631 seconds. Both came from the
 same AOC cell session. All eleven SHA-256 hashes were independently
 checked against the files. The first burst overlapped the GPU measurement
 window beginning at Present 2457. These times include command handling,
-capture, disk writes and receipt generation. They exclude boot and do not
-measure rendering FPS. [Upstream test result](https://github.com/OctoAlgo/inkVI-dive/pull/1#issuecomment-7222712410)
+capture, disk writes and receipt generation. They exclude boot. A later
+check found redundant X11 caption writes during these runs. The times
+record observed command latency and are unsuitable for performance comparisons. [Upstream test result](https://github.com/OctoAlgo/inkVI-dive/pull/1#issuecomment-7222712410)
 
 This run retired the in-game feature-13 creation fence at the requested
 resolutions. The revised indirect-command limit brought each targeted
