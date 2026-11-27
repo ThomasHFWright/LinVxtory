@@ -878,3 +878,22 @@ The 55-second visual capture contained 282 RR and 11 SR Presents.
 281 of the RR Presents used all paired replacements. These capture
 counts establish route and image evidence, and the timing run uses the
 same build without captures.
+
+### Capture-free timing after the lighting and camera changes
+
+A same-build pair used `df0553c`, the same isolated Series S cell pose,
+and the same 720p-to-4K AOC window. Both 55-second measurement windows
+started after loading and warmup. Capture, per-pass queries and camera
+diagnostics were disabled throughout the measurement.
+
+| Arm | Median FPS | p95 Present interval | Accepted FPS over 55 s | Exact RR / SR / unknown |
+| --- | ---: | ---: | ---: | ---: |
+| Stock SR | 9.01 | 184.08 ms | 8.38 | 0 / 461 / 0 |
+| Diffuse-history RR | 9.11 | 118.60 ms | 9.07 | 499 / 0 / 0 |
+
+Every accepted RR Present included the original glass input and 498 of
+499 used all verified replacements. Frame 2332 used late RR with the
+native filters retained because an optical producer was pending at the
+earlier cutoff. This one-pair result measured 8.2% higher accepted
+throughput and 35.6% lower p95. The late selection is being tightened
+so that a frame without the committed bypass uses stock SR.
