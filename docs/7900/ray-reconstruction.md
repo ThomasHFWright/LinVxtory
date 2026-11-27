@@ -919,6 +919,22 @@ The two replays reached different character and door poses, so this
 sample cannot estimate a matched disocclusion error. Pipeline first-use
 work overlapped the capture window. Timing comes from a separate run.
 
+The delayed replay put the stationary window capture ahead of the first
+movement. In the same-view comparison, stock Present 2295 and full RR
+Present 2103 retain the tower and roof distortion. At those sites RR
+retained 96–97% of SR’s mid-scale display contrast. The wire mesh was
+softer. Exact native output lineage identifies all eight stationary RR
+images. Across the full delayed camera replay, 206 Presents used the
+complete RR route, 11 used stock SR and zero were unknown.
+
+During the first turn, full RR Presents 2254–2256 show the eye, nose,
+lips and ear in profile, with the ponytail and flyaways intact. A
+locally aligned door and wall crop showed no obvious duplicate edge or
+persistent silhouette trail in the sampled RR frames. The character
+angles differed from the stock run, and full-frame registration failed
+across the turn. The review uses locally aligned crops and adjacent
+frames from the same replay.
+
 ### Capture-free timing with the stock fallback guard
 
 The same executable ran both arms on the physical AOC with the same
