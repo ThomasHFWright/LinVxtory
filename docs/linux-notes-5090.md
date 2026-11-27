@@ -119,4 +119,4 @@ Their build also included full [#854/#993 shader pairing](https://github.com/fxc
 [#1002](https://github.com/fxceless/victory-fork/pull/1002) and
 [#927](https://github.com/fxceless/victory-fork/pull/927). Face recovery was
 observed with the combined renderer. The contributor did not bisect it.
-[Original test report](https://github.com/ThomasHFWright/LinVxtory/pull/1)
+[Original test report](https://github.com/TomTomAIbot/LinVxtory/pull/1)

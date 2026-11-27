@@ -2,8 +2,18 @@
 # Reconstruct the pinned renderer and build the tested Linux configuration.
 set -eu
 root=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+rr=0
+control=0
+while [ "$#" -gt 1 ]; do
+    case "$1" in
+        --rr) rr=1 ;;
+        --control) control=1 ;;
+        *) break ;;
+    esac
+    shift
+done
 if [ "$#" -ne 1 ] || [ -z "$1" ]; then
-    echo 'Usage: sh build.sh /path/to/renderer-source' >&2
+    echo 'Usage: sh build.sh [--rr] [--control] /path/to/renderer-source' >&2
     exit 1
 fi
 
@@ -11,9 +21,8 @@ src=$1
 base=014d52dedf837d1ac660a0bd256c4704be9eeb40
 base_tree=0b2726fef1258f1d7817afdf0af8b251870e408b
 linux_tree=0ab430bbecb29f450d2d9e837673ad10aa1210b4
-dlss_tree=3d033cbd633757d2fd15f97a4323d566e8a043ba
-locked_tree=50209641c8326c2eb877be361d0797f906c50995
-base_url=https://github.com/avatarmanz/VIctory-7900XTX.git
+tested_tree=3d033cbd633757d2fd15f97a4323d566e8a043ba
+base_url=https://github.com/TheInfamous404/VIctory-7900XTX.git
 kit="$root/docs/7900"
 
 if [ -z "${VICTORY_DLSS_SDK:-}" ] ||
@@ -47,19 +56,50 @@ fi
 if [ "$(git -C "$src" write-tree)" = "$linux_tree" ] && git -C "$src" diff --quiet; then
     git -C "$src" apply --index "$kit/dlss-4k.patch.txt"
 fi
-if [ "$(git -C "$src" write-tree)" = "$dlss_tree" ] && git -C "$src" diff --quiet; then
-    git -C "$src" apply --index "$kit/texture-copy-rows.patch.txt"
-fi
-if [ "$(git -C "$src" write-tree)" != "$locked_tree" ] ||
-   ! git -C "$src" diff --quiet; then
-    echo 'Renderer changes differ from the locked source tree.' >&2
+cd "$src"
+if ! git diff --quiet; then
+    echo 'Renderer has unstaged changes. Use a separate output path.' >&2
     exit 1
 fi
-if [ -n "$(git -C "$src" ls-files --others -- apps crates .cargo Cargo.lock Cargo.toml rust-toolchain.toml)" ]; then
+if [ -n "$(git ls-files --others -- apps crates .cargo Cargo.lock Cargo.toml rust-toolchain.toml)" ]; then
     echo 'Unexpected files in the renderer build inputs.' >&2
     exit 1
 fi
-cd "$src"
-sha256sum --check --quiet "$kit/build-inputs.sha256.txt"
+tree=$(git write-tree)
+if [ "$tree" = "$tested_tree" ]; then
+    sha256sum --check --quiet "$kit/build-inputs.sha256.txt"
+fi
+expected=$tested_tree
+apply_locked_patch() {
+    next=$1
+    patch=$2
+    if [ "$tree" = "$expected" ]; then
+        git apply --index "$kit/$patch"
+        tree=$(git write-tree)
+        if [ "$tree" != "$next" ]; then
+            echo "Unexpected renderer tree after $patch" >&2
+            exit 1
+        fi
+    fi
+    expected=$next
+}
+if [ "$rr" -eq 1 ]; then
+    while read -r next patch; do
+        apply_locked_patch "$next" "$patch"
+    done < "$kit/rr-build-trees.txt"
+fi
+if [ "$control" -eq 0 ]; then
+    while read -r sr_tree rr_tree patch; do
+        if [ "$rr" -eq 1 ]; then
+            apply_locked_patch "$rr_tree" "$patch"
+        else
+            apply_locked_patch "$sr_tree" "$patch"
+        fi
+    done < "$kit/perf-build-trees.txt"
+fi
+if [ "$tree" != "$expected" ]; then
+    echo 'Renderer changes differ from the selected source tree.' >&2
+    exit 1
+fi
 printf '%s\n' 'Verified the locked renderer tree and build inputs.'
 exec cargo build --locked --offline --profile diag --features dlss -p victory --target x86_64-pc-windows-msvc

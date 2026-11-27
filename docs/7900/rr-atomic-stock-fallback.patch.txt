@@ -1,0 +1,14 @@
+diff --git a/crates/victory-gpu/src/draw/rr_display.rs b/crates/victory-gpu/src/draw/rr_display.rs
+index f8937ab..10a76cc 100644
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -580,6 +580,9 @@ pub(crate) fn select(
+         return None;
+     }
+     let try_record = || {
++        if super::opaque_current::atomic_enabled() {
++            return Err("closed RR slot was not committed before the native filter cutoff");
++        }
+         if !ordered {
+             return Err("FFX prefix, stock SR and title continuation are not uniquely ordered");
+         }

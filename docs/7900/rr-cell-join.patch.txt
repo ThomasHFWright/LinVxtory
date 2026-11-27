@@ -1,0 +1,615 @@
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index 48105ec27f56a7643db988aaccffbbf282cf1366..0c5341664edb80804125441aceefdcdf5179f61b 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -145,9 +145,13 @@ pub(crate) fn frame_drew(frame: u64, drawn: u64) {
+     {
+         #[cfg(feature = "diagnostics")]
+         crate::capture_control::world_started();
+-        tracing::info!(frame, "the first frame of 500 draws or more");
++        if world_on() {
++            tracing::info!(frame, "the first frame of 500 draws or more: frames {} and {} are captured", frame + 2, frame + 6);
++        } else {
++            tracing::info!(frame, "capture world marker: first frame of 500 draws or more");
++        }
+         #[cfg(feature = "diagnostics")]
+-        if let Some(folder) = folder() {
++        if world_on() && let Some(folder) = folder() {
+             let lines: Vec<String> = std::mem::take(&mut *RING.lock().unwrap_or_else(|e| e.into_inner())).into();
+             let _ = std::fs::write(folder.join("before-world-ops.txt"), lines.join("
+ "));
+diff --git a/crates/victory-gpu/src/capture_control.rs b/crates/victory-gpu/src/capture_control.rs
+index 0ae8d7207e2e73a80e0d50ad8bdd8beced9f862d..a6a57316a42e337547b0c4502752e71e452adc82 100644
+--- a/crates/victory-gpu/src/capture_control.rs
++++ b/crates/victory-gpu/src/capture_control.rs
+@@ -87,6 +87,7 @@ pub(crate) fn present(frame: u64, world: Option<u64>, enabled: bool) {
+         },
+     };
+     drop(requests);
++    tracing::info!(frame, "capture control: {reply}");
+     let world_offset = world
+         .and_then(|first| frame.checked_sub(first))
+         .map_or_else(|| "-".to_owned(), |n| n.to_string());
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 04ab405195894760d56c68db920d568ffed6257d..5d4de58dafea57645bec3516adc137c840ef6f7f 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -3054,9 +3054,9 @@ impl State {
+             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+         }
+         #[cfg(feature = "diagnostics")]
+-        let _ = reflection_capture::after(list, reflection);
++        let material_witness = reflection_capture::after(list, reflection);
+         #[cfg(feature = "diagnostics")]
+-        material_guides::after(self, list, p);
++        material_guides::after(self, list, p, material_witness);
+         #[cfg(feature = "diagnostics")]
+         let _ = background_snapshot::after_apply(self, list, p);
+         self.buffers_written();
+@@ -4523,9 +4523,9 @@ impl State {
+         }
+         if kind == DISPATCH {
+             #[cfg(feature = "diagnostics")]
+-            let _ = reflection_capture::after(list, reflection);
++            let material_witness = reflection_capture::after(list, reflection);
+             #[cfg(feature = "diagnostics")]
+-            material_guides::after(self, list, p);
++            material_guides::after(self, list, p, material_witness);
+             self.buffers_written();
+         } else {
+             self.drew(list, Some(p));
+diff --git a/crates/victory-gpu/src/draw/material_guides.rs b/crates/victory-gpu/src/draw/material_guides.rs
+index 730812c7a2a207bc7a608c5b7592d83bc5e17500..d13a67382fa5617a8e1a69596d7511cd4a26aef0 100644
+--- a/crates/victory-gpu/src/draw/material_guides.rs
++++ b/crates/victory-gpu/src/draw/material_guides.rs
+@@ -482,7 +482,12 @@ pub(crate) fn qualify_background(
+     })
+ }
+
+-pub(super) fn after(state: &mut State, list: &HostList, p: &HostPipeline) {
++pub(super) fn after(
++    state: &mut State,
++    list: &HostList,
++    p: &HostPipeline,
++    reflection: Option<super::reflection_capture::MaterialWitness>,
++) {
+     static REQUESTED: OnceLock<Option<u64>> = OnceLock::new();
+     static LIVE: OnceLock<bool> = OnceLock::new();
+     let frame = crate::queue::presented() + 1;
+@@ -495,10 +500,10 @@ pub(super) fn after(state: &mut State, list: &HostList, p: &HostPipeline) {
+     let sample = requested.is_some() && crate::rr_window::selected(frame, requested) && crate::capture::folder().is_some();
+     let live = *LIVE
+         .get_or_init(|| std::env::var_os("VICTORY_RR_MATERIAL_GUIDES").is_some_and(|v| v == "1"));
+-    if !(sample || live) || !p.compute {
++    if !(sample || live || reflection.is_some()) || !p.compute {
+         return;
+     }
+-    let begun = crate::frames_begun();
++    let begun = reflection.as_ref().map_or_else(crate::frames_begun, |v| v.begun);
+     let Some(stage) = p.stages.iter().find(|stage| stage.shader.hash == PREPASS) else {
+         return;
+     };
+@@ -542,12 +547,21 @@ pub(super) fn after(state: &mut State, list: &HostList, p: &HostPipeline) {
+         );
+         return;
+     };
+-    let Some(occurrence) = frames().reserve(begun) else {
+-        return;
++    let (occurrence, epoch) = if let Some(witness) = &reflection {
++        if witness.depth != inputs[3].1 || witness.camera != relative_view_projection {
++            tracing::warn!(begun, epoch = witness.epoch, "RR reflected material witness changed");
++            return;
++        }
++        // This event already owns a bounded native capture slot. Its producer
++        // identity comes from that command, independent of the frame counter.
++        (0, witness.epoch)
++    } else {
++        let Some(occurrence) = frames().reserve(begun) else { return };
++        (occurrence, list.epoch())
+     };
+     let key = RrMaterialKey {
+         begun,
+-        prepass_epoch: list.epoch(),
++        prepass_epoch: epoch,
+         occurrence,
+         opaque_depth_serial: inputs[3].1,
+         relative_view_projection,
+@@ -577,7 +591,7 @@ pub(super) fn after(state: &mut State, list: &HostList, p: &HostPipeline) {
+     if sample {
+         capture_output(list, &host.device, &outputs, frame, key);
+     }
+-    if live && crate::frames_begun() == begun {
++    if reflection.is_some() || (live && crate::frames_begun() == begun) {
+         list.keep_material(Arc::new(Produced {
+             key,
+             textures: outputs,
+@@ -590,6 +604,7 @@ pub(super) fn after(state: &mut State, list: &HostList, p: &HostPipeline) {
+         begun,
+         epoch = key.prepass_epoch,
+         occurrence,
++        reflection_witness = reflection.is_some(),
+         opaque_depth_serial = key.opaque_depth_serial,
+         "RR candidate material pass recorded"
+     );
+diff --git a/crates/victory-gpu/src/draw/reflection_capture.rs b/crates/victory-gpu/src/draw/reflection_capture.rs
+index 3b87fb92b3c15ef6da1dfbcfbb405035b4cb0a70..94d41c6422d9071e9b6fdbdb2316ca81098b9a2f 100644
+--- a/crates/victory-gpu/src/draw/reflection_capture.rs
++++ b/crates/victory-gpu/src/draw/reflection_capture.rs
+@@ -407,7 +407,14 @@ pub(super) fn before(state: &State, list: &HostList, pipeline: &HostPipeline) ->
+     }
+ }
+
+-pub(super) fn after(list: &HostList, pending: Option<Pending>) -> Option<()> {
++pub(super) struct MaterialWitness {
++    pub(super) begun: u64,
++    pub(super) epoch: u64,
++    pub(super) depth: u64,
++    pub(super) camera: [u32; 16],
++}
++
++pub(super) fn after(list: &HostList, pending: Option<Pending>) -> Option<MaterialWitness> {
+     let event = match pending? {
+         Pending::Prepass {
+             serial,
+@@ -450,8 +457,22 @@ pub(super) fn after(list: &HostList, pending: Option<Pending>) -> Option<()> {
+             after: snapshot(list, &radiance)?,
+         },
+     };
++    let witness = match &event {
++        Event::Prepass {
++            primary: Some(primary),
++            depth,
++            group,
++            ..
++        } => Some(MaterialWitness {
++            begun: primary.begun,
++            epoch: primary.epoch,
++            depth: *depth,
++            camera: group.camera,
++        }),
++        _ => None,
++    };
+     list.reflection_capture_event(event);
+-    Some(())
++    witness
+ }
+
+ pub(crate) struct Readback {
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index 40a28914e7b20ec38c7d6256d60ae3f0707e78d1..204cf238befa761f2ed3401169b8f22adb960494 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -29,7 +29,9 @@ pub(crate) struct Camera {
+     jittered: [f32; 16],
+     inverse: [f32; 16],
+     current: [f32; 16],
+-    previous: [f32; 16],
++    native: crate::external::RrCamera,
++    stream: u64,
++    reset_requested: bool,
+     motion_scale: [f32; 2],
+ }
+
+@@ -37,6 +39,7 @@ pub(crate) fn camera_proof(
+     list: &HostList,
+     camera: &RrCameraFrame<'_>,
+     motion_scale: [f32; 2],
++    reset_requested: bool,
+ ) -> Option<Camera> {
+     if !enabled()
+         || camera.current().epoch != list.epoch()
+@@ -52,7 +55,9 @@ pub(crate) fn camera_proof(
+         jittered: camera.current_relative_world_to_jittered_clip(),
+         inverse: camera.clip_to_current_relative_world()?,
+         current: camera.current_relative_world_to_clip(),
+-        previous: camera.current_relative_world_to_previous_clip()?,
++        native: *camera.current(),
++        stream: camera.stream(),
++        reset_requested,
+         motion_scale,
+     })
+ }
+@@ -92,8 +97,22 @@ pub(super) fn source(
+                 && key.opaque_depth_serial == depth_serial
+                 && key.relative_view_projection == camera
+         });
+-    let material = materials.next()?;
++    let Some(material) = materials.next() else {
++        tracing::warn!(
++            begun = primary.begun,
++            epoch = primary.epoch,
++            submission,
++            "RR dense source has no exact opaque material witness"
++        );
++        return None;
++    };
+     if materials.next().is_some() {
++        tracing::warn!(
++            begun = primary.begun,
++            epoch = primary.epoch,
++            submission,
++            "RR dense source has ambiguous opaque material witnesses"
++        );
+         return None;
+     }
+     Some(Source {
+@@ -135,20 +154,62 @@ fn matching_projection(native: [u32; 16], expected: [f32; 16]) -> bool {
+         .all(|(a, b)| a.is_finite() && b.is_finite() && (a - b).abs() <= 1e-5 * a.abs().max(1.0))
+ }
+
++// The title records ahead of its submission worker. Pair current/previous
++// successful SR commands where the host serializes their actual submissions.
++fn accept_camera(current: &Camera, sequence: u64) -> Option<[f32; 16]> {
++    static ACCEPTED: Mutex<Option<(Camera, u64)>> = Mutex::new(None);
++    let mut accepted = ACCEPTED.lock().unwrap_or_else(|e| e.into_inner());
++    let previous = accepted.take();
++    let adjacent = previous.filter(|(camera, submitted)| {
++        !current.reset_requested
++            && *submitted < sequence
++            && camera.stream == current.stream
++            && camera.begun.checked_add(1) == Some(current.begun)
++            && camera.epoch < current.epoch
++    });
++    *accepted = Some((current.clone(), sequence));
++    crate::rr_history::previous_clip(&adjacent?.0.native, current.native.origin)
++}
++
+ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Option<Readback> {
+     if !enabled() {
+         return None;
+     }
++    let mut snapshots = runs.iter().flat_map(|list| list.rr_shadow_snapshots());
++    let snapshot = snapshots.next();
++    let warn = |reason: &'static str| {
++        if let Some(snapshot) = &snapshot {
++            tracing::warn!(
++                begun = snapshot.begun,
++                epoch = snapshot.epoch,
++                sequence,
++                reason,
++                "RR title shadow guide join rejected"
++            );
++        }
++    };
+     let mut cameras = runs.iter().flat_map(|list| list.reflection_dense_cameras());
+-    let camera = cameras.next()?;
++    let Some(camera) = cameras.next() else {
++        warn("missing submitted current camera witness");
++        return None;
++    };
+     if cameras.next().is_some() {
++        warn("ambiguous current camera witness");
+         return None;
+     }
++    let Some(previous) = accept_camera(&camera, sequence) else {
++        warn("no adjacent previously submitted camera witness");
++        return None;
++    };
+     let source = {
+         let mut stored = SOURCE.lock().unwrap_or_else(|e| e.into_inner());
+-        let source = stored.as_ref()?;
++        let Some(source) = stored.as_ref() else {
++            warn("no earlier opaque material and reflection producer group");
++            return None;
++        };
+         if source.primary.begun < camera.begun {
+             *stored = None;
++            warn("older opaque material and reflection producer group");
+             return None;
+         }
+         if source.primary.begun != camera.begun
+@@ -156,6 +217,7 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+             || source.submission >= sequence
+             || !matching_projection(source.camera, camera.jittered)
+         {
++            warn("opaque producer frame, order, or camera projection mismatch");
+             return None;
+         }
+         stored.take()?
+@@ -173,7 +235,7 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+     let frame = ReflectionFrame {
+         clip_to_current_relative_world: camera.inverse,
+         current_relative_world_to_clip: camera.current,
+-        current_relative_world_to_previous_clip: camera.previous,
++        current_relative_world_to_previous_clip: previous,
+         sample_origin: [0, 0],
+         phase_seed: source.phase,
+         primary_motion_to_pixels: camera.motion_scale,
+@@ -189,24 +251,39 @@ pub(crate) fn submitted(host: &Host, runs: &[&HostList], sequence: u64) -> Optio
+         &source.primary.motion,
+         DXGI_FORMAT_R16G16_FLOAT,
+     )?;
+-    let mut snapshots = runs.iter().flat_map(|list| list.rr_shadow_snapshots());
+-    let shadow = if let Some(snapshot) = snapshots.next() {
++    let shadow = if let Some(snapshot) = snapshot {
+         let shadow = (|| {
+             if snapshots.next().is_some()
+                 || snapshot.begun != camera.begun
+                 || snapshot.epoch != camera.epoch
+                 || snapshot.frame.motion_scale != camera.motion_scale
+                 || snapshot.serials[1] != source.depth_serial
++                || snapshot.serials[2] != source.primary.motion_serial
+             {
+                 return None;
+             }
+             // SAFETY: immutable FFX copy, earlier in this exact batch before this list.
+-            let depth = unsafe { reflection_motion::copy_shadow_depth(&list, &snapshot.copies[1])? };
+-            let material = readback(host, &list, &source.material.coverage_status, DXGI_FORMAT_R32_UINT)?;
+-            Some(Shadow { snapshot, depth, motion: output.motion, material })
++            let depth =
++                unsafe { reflection_motion::copy_shadow_depth(&list, &snapshot.copies[1])? };
++            let material = readback(
++                host,
++                &list,
++                &source.material.coverage_status,
++                DXGI_FORMAT_R32_UINT,
++            )?;
++            Some(Shadow {
++                snapshot,
++                depth,
++                motion: output.motion,
++                material,
++            })
+         })();
+         if shadow.is_none() {
+-            tracing::warn!(begun = camera.begun, sequence, "RR title shadow guides could not be joined to FFX");
++            tracing::warn!(
++                begun = camera.begun,
++                sequence,
++                "RR title shadow guides could not be joined to FFX"
++            );
+         }
+         shadow
+     } else {
+@@ -383,7 +460,9 @@ impl Readback {
+                 counts[status.min(6) as usize] += 1;
+             }
+             counts
+-        }) else { return };
++        }) else {
++            return;
++        };
+         if nonfinite != 0 || counts[8] == 0 || material_counts[5] == 0 {
+             tracing::warn!(
+                 begun = self.camera.begun,
+diff --git a/crates/victory-gpu/src/draw/rr_shadow.rs b/crates/victory-gpu/src/draw/rr_shadow.rs
+index 3e8f0458a23909edbf067e6cd2e0a917bd74ecca..dcecc82d2a0d8402afd962062de4d5a8e841a41b 100644
+--- a/crates/victory-gpu/src/draw/rr_shadow.rs
++++ b/crates/victory-gpu/src/draw/rr_shadow.rs
+@@ -68,9 +68,11 @@ pub(crate) fn capture(
+     depth_of_field: Option<&ID3D12Resource>,
+ ) {
+     static REQUESTED: OnceLock<Option<u64>> = OnceLock::new();
+-    let requested = *REQUESTED.get_or_init(|| std::env::var("VICTORY_RR_SHADOW_FRAME").ok()?.parse().ok());
++    let requested =
++        *REQUESTED.get_or_init(|| std::env::var("VICTORY_RR_SHADOW_FRAME").ok()?.parse().ok());
+     let present = crate::queue::presented() + 1;
+-    if CONSUMER.get().is_none() || requested.is_none()
++    if CONSUMER.get().is_none()
++        || requested.is_none()
+         || !crate::rr_window::selected(present, requested)
+         || camera.current().epoch != list.epoch()
+     {
+@@ -86,8 +88,10 @@ pub(crate) fn capture(
+             let (title, exact) = textures[i];
+             let source = background_snapshot::rendered(list, title as usize, formats[i])?;
+             (source.0.texture.as_raw() == exact.as_raw()
+-                && source.1.contains(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
+-                .then_some(source)
++                && source
++                    .1
++                    .contains(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE))
++            .then_some(source)
+         };
+         let sources = [checked(0)?, checked(1)?, checked(2)?];
+         let [(a, hdr), (b, depth), (c, motion)] = [
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index b1a50e6d28686306e72923c5b988327c4ab52c29..2d02f6d8415618da03fb1a11c994bcecbea4b3ee 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -149,9 +149,9 @@ impl Recording<'_> {
+     }
+
+     /// Record successful SR for camera history and the optional dense reflection proof.
+-    pub fn rr_recorded_sr(&self, camera: RrCameraFrame<'_>, _motion_scale: [f32; 2]) -> bool {
++    pub fn rr_recorded_sr(&self, camera: RrCameraFrame<'_>, _motion_scale: [f32; 2], _reset_requested: bool) -> bool {
+         #[cfg(feature = "diagnostics")]
+-        let proof = crate::draw::reflection_dense::camera_proof(self.0, &camera, _motion_scale);
++        let proof = crate::draw::reflection_dense::camera_proof(self.0, &camera, _motion_scale, _reset_requested);
+         let accepted = camera.recorded_sr();
+         #[cfg(feature = "diagnostics")]
+         if accepted && let Some(proof) = proof {
+diff --git a/crates/victory-gpu/src/rr_history.rs b/crates/victory-gpu/src/rr_history.rs
+index b941a338b591c71d4a90f0e598a33157440d5ed3..d6a7b09e08878e64fc2546adcdac6afe7ef1743f 100644
+--- a/crates/victory-gpu/src/rr_history.rs
++++ b/crates/victory-gpu/src/rr_history.rs
+@@ -260,7 +260,7 @@ fn multiply(a: Matrix, b: Matrix) -> Matrix {
+     std::array::from_fn(|i| (0..4).map(|k| a[i / 4 * 4 + k] * b[k * 4 + i % 4]).sum())
+ }
+
+-fn previous_clip(previous: &RrCamera, current_origin: [f32; 3]) -> Option<Matrix> {
++pub(crate) fn previous_clip(previous: &RrCamera, current_origin: [f32; 3]) -> Option<Matrix> {
+     let delta = std::array::from_fn::<_, 3, _>(|i| current_origin[i] - previous.origin[i]);
+     let mut view = rotation(previous);
+     for column in 0..3 {
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index b29c64608f12557a8fb0d9f141fdabda5bd73319..70cd247e81ec492700940289a9bf2d6a6f166f60 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -559,7 +559,7 @@ fn record(
+                 dof_guide.as_ref(),
+             );
+         }
+-        list.rr_recorded_sr(camera, info.motion_scale);
++        list.rr_recorded_sr(camera, info.motion_scale, info.settings[4] & 0xff != 0);
+     }
+     external::output_written(output);
+     Ok(())
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+index 5421b668ffb2da2c425c99c8b41527c260980bb4..ca2408905fc01ed48d34ed440f27b39a39bab998 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx/rr_shadow.rs
+@@ -35,7 +35,7 @@ pub(super) fn start(inputs: external::RrShadowInputs) {
+                 "RR title shadow starting with diagnostic opaque guides"
+             );
+             if let Err(error) = evaluate(inputs) {
+-                tracing::warn!(?error, presented = "SR", "RR title shadow failed");
++                tracing::warn!(%error, presented = "SR", "RR title shadow failed");
+             }
+         })
+     {
+@@ -50,6 +50,16 @@ enum Error {
+     Invalid(&'static str),
+ }
+
++impl std::fmt::Display for Error {
++    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
++        match self {
++            Self::Driver(error) => write!(formatter, "D3D12: {error}"),
++            Self::Ngx(error) => write!(formatter, "NGX: {error:?}"),
++            Self::Invalid(reason) => formatter.write_str(reason),
++        }
++    }
++}
++
+ impl From<windows::core::Error> for Error {
+     fn from(value: windows::core::Error) -> Self {
+         Self::Driver(value)
+@@ -80,7 +90,10 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+                 DepthOrArraySize: 1,
+                 MipLevels: 1,
+                 Format: FORMAT,
+-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                SampleDesc: DXGI_SAMPLE_DESC {
++                    Count: 1,
++                    Quality: 0,
++                },
+                 Flags: D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                 ..Default::default()
+             },
+@@ -95,19 +108,22 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+                 Height: 1,
+                 DepthOrArraySize: 1,
+                 MipLevels: 1,
+-                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                SampleDesc: DXGI_SAMPLE_DESC {
++                    Count: 1,
++                    Quality: 0,
++                },
+                 Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+                 ..Default::default()
+             },
+         )?;
+-        let heap = |flags| device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(
+-            &D3D12_DESCRIPTOR_HEAP_DESC {
++        let heap = |flags| {
++            device.CreateDescriptorHeap::<ID3D12DescriptorHeap>(&D3D12_DESCRIPTOR_HEAP_DESC {
+                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
+                 NumDescriptors: 1,
+                 Flags: flags,
+                 NodeMask: 0,
+-            },
+-        );
++            })
++        };
+         let cpu = heap(D3D12_DESCRIPTOR_HEAP_FLAG_NONE)?;
+         let gpu = heap(D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE)?;
+         let cpu_handle = cpu.GetCPUDescriptorHandleForHeapStart();
+@@ -145,33 +161,51 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+             output: &output,
+         };
+         let frame = inputs.frame;
+-        rr::record_shadow(&commands, &guides, &rr::Frame {
+-            jitter: frame.jitter,
+-            motion_scale: frame.motion_scale,
+-            frame_time_ms: frame.frame_time_ms,
+-            pre_exposure: frame.pre_exposure,
+-            reset: true,
+-        }).map_err(Error::Ngx)?;
++        rr::record_shadow(
++            &commands,
++            &guides,
++            &rr::Frame {
++                jitter: frame.jitter,
++                motion_scale: frame.motion_scale,
++                frame_time_ms: frame.frame_time_ms,
++                pre_exposure: frame.pre_exposure,
++                reset: true,
++            },
++        )
++        .map_err(Error::Ngx)?;
+         copy_for_readback(&commands, &output, &readback);
+         commands.Close()?;
+         queue.ExecuteCommandLists(&[Some(commands.cast::<ID3D12CommandList>()?)]);
+-        let retired = queue.Signal(&fence, 1).map_err(Error::from)
++        let retired = queue
++            .Signal(&fence, 1)
++            .map_err(Error::from)
+             .and_then(|()| wait_for(&device, &fence));
+         if let Err(error) = retired {
+             // The GPU can still reference these allocations after a failed signal or wait.
+-            std::mem::forget((queue, allocator, commands, fence, inputs, output, readback, cpu, gpu));
++            std::mem::forget((
++                queue, allocator, commands, fence, inputs, output, readback, cpu, gpu,
++            ));
+             return Err(error);
+         }
+
+         let mut ptr = std::ptr::null_mut();
+-        readback.Map(0, Some(&D3D12_RANGE { Begin: 0, End: BYTES }), Some(&mut ptr))?;
+-        let stats = (!ptr.is_null()).then(|| {
+-            output_stats(std::slice::from_raw_parts(ptr.cast::<u16>(), PIXELS * 4))
+-        });
++        readback.Map(
++            0,
++            Some(&D3D12_RANGE {
++                Begin: 0,
++                End: BYTES,
++            }),
++            Some(&mut ptr),
++        )?;
++        let stats = (!ptr.is_null())
++            .then(|| output_stats(std::slice::from_raw_parts(ptr.cast::<u16>(), PIXELS * 4)));
+         readback.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
+-        let (finite, touched, nonzero, digest) = stats.ok_or(Error::Invalid("output readback pointer"))?;
++        let (finite, touched, nonzero, digest) =
++            stats.ok_or(Error::Invalid("output readback pointer"))?;
++        let complete = finite == PIXELS && touched == PIXELS && nonzero > 0;
+         tracing::info!(
+             feature = 13,
++            complete,
+             output = ?UHD.output,
+             present = inputs.present,
+             begun = inputs.begun,
+@@ -185,7 +219,7 @@ fn evaluate(inputs: external::RrShadowInputs) -> Result<(), Error> {
+             presented = "SR",
+             "RR title shadow output retired"
+         );
+-        if finite != PIXELS || touched != PIXELS || nonzero == 0 {
++        if !complete {
+             return Err(Error::Invalid("incomplete or nonfinite 4K output"));
+         }
+     }
+@@ -202,7 +236,10 @@ fn resource(
+     // SAFETY: conventional single-node committed texture or readback allocation.
+     unsafe {
+         device.CreateCommittedResource(
+-            &D3D12_HEAP_PROPERTIES { Type: heap, ..Default::default() },
++            &D3D12_HEAP_PROPERTIES {
++                Type: heap,
++                ..Default::default()
++            },
+             D3D12_HEAP_FLAG_NONE,
+             &desc,
+             state,
+@@ -235,7 +272,9 @@ unsafe fn copy_for_readback(
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+             pResource: std::mem::transmute_copy(output),
+             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: 0,
++            },
+         };
+         let to = D3D12_TEXTURE_COPY_LOCATION {
+             pResource: std::mem::transmute_copy(readback),

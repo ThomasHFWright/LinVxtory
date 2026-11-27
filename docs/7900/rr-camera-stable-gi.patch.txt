@@ -1,0 +1,1444 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 1b66f89..5ac4070 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -49,6 +49,8 @@ pub(crate) mod alpha_current;
+ mod opaque_recovery;
+ #[cfg(feature = "diagnostics")]
+ pub(crate) mod probe_current;
++#[cfg(feature = "diagnostics")]
++pub(crate) mod lighting_taps;
+
+ #[derive(Clone, Copy)]
+ pub(crate) enum HistoryOverride<'a> {
+@@ -3090,6 +3092,8 @@ impl State {
+         }
+         #[cfg(feature = "diagnostics")]
+         let reflection = reflection_capture::before(self, list, p);
++        #[cfg(feature = "diagnostics")]
++        let tap_begun = lighting_taps::probe(self, list, p, [x, y, z], None);
+         if !probe_bound {
+             #[cfg(feature = "diagnostics")]
+             let stats = crate::host::pass_stats::before(list, p.stages.first().map(|s| s.shader.hash.as_str()), 1);
+@@ -3103,6 +3107,10 @@ impl State {
+             probe.dispatch(list, p);
+         }
+         #[cfg(feature = "diagnostics")]
++        if tap_begun.is_some() {
++            let _ = lighting_taps::probe(self, list, p, [x, y, z], tap_begun);
++        }
++        #[cfg(feature = "diagnostics")]
+         if stamp.is_some() {
+             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+         }
+diff --git a/crates/victory-gpu/src/draw/background_snapshot.rs b/crates/victory-gpu/src/draw/background_snapshot.rs
+index 9cc0773..5715c68 100644
+--- a/crates/victory-gpu/src/draw/background_snapshot.rs
++++ b/crates/victory-gpu/src/draw/background_snapshot.rs
+@@ -349,6 +349,7 @@ fn same_view(
+ pub(crate) fn peek_producer_epochs(
+     runs: &[&HostList],
+     packet: super::rr_display::Packet,
++    velocity_candidate: bool,
+ ) -> Result<[u64; 2], &'static str> {
+     let mut events = Vec::new();
+     for list in runs {
+@@ -399,7 +400,7 @@ pub(crate) fn peek_producer_epochs(
+             Event::Anchor {
+                 begun,
+                 serials,
+-                camera: Some(_),
++                camera,
+                 ..
+             },
+         ),
+@@ -407,7 +408,8 @@ pub(crate) fn peek_producer_epochs(
+     else {
+         return Err("background cohort order or FFX camera role rejected");
+     };
+-    (*prefix == packet.prefix_epoch
++    ((camera.is_some() || velocity_candidate)
++        && *prefix == packet.prefix_epoch
+         && *begun == packet.begun
+         && *serials == packet.serials
+         && same_view(
+diff --git a/crates/victory-gpu/src/draw/display_transmission.rs b/crates/victory-gpu/src/draw/display_transmission.rs
+index b25654b..ca182f2 100644
+--- a/crates/victory-gpu/src/draw/display_transmission.rs
++++ b/crates/victory-gpu/src/draw/display_transmission.rs
+@@ -210,8 +210,9 @@ pub(super) fn after(list: &HostList, pending: Option<Pending>) {
+ pub(crate) fn closed_future(
+     runs: &[&HostList],
+     packet: rr_display::Packet,
++    velocity_candidate: bool,
+ ) -> Result<Proof, &'static str> {
+-    collect_exact(runs, packet, background_snapshot::peek_producer_epochs(runs, packet)?)
++    collect_exact(runs, packet, background_snapshot::peek_producer_epochs(runs, packet, velocity_candidate)?)
+ }
+
+ /// Structural proof only. The GPU computes the mask from the original native
+diff --git a/crates/victory-gpu/src/draw/lighting_taps.rs b/crates/victory-gpu/src/draw/lighting_taps.rs
+new file mode 100644
+index 0000000..f33bc3b
+--- /dev/null
++++ b/crates/victory-gpu/src/draw/lighting_taps.rs
+@@ -0,0 +1,224 @@
++//! Bounded native lighting taps on the exact GI dispatch and isolated FFX input.
++use super::{HostList, HostPipeline, Root, State, View, background_snapshot::rendered_at};
++use crate::{host::transition, object::This};
++use std::path::PathBuf;
++use std::sync::{OnceLock, atomic::{AtomicUsize, Ordering}};
++use windows::{
++    Win32::Graphics::{Direct3D12::*, Dxgi::Common::*},
++    core::Interface,
++};
++
++const PROBE: &str = "34fb51b8a0312e82";
++const VIEW: [u32; 2] = [1280, 720];
++const BOX: u32 = 16;
++// Top-left coordinates in the native 720p view.
++const SITES: [[u32; 2]; 4] = [[104, 276], [990, 118], [1156, 438], [645, 284]];
++const ROW_BYTES: u32 = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
++const REGION_BYTES: u64 = (BOX * ROW_BYTES) as u64;
++const BYTES: u64 = SITES.len() as u64 * REGION_BYTES;
++const MAX_TAPS: usize = 48;
++static TAPS: AtomicUsize = AtomicUsize::new(0);
++
++fn folder() -> Option<&'static PathBuf> {
++    static FOLDER: OnceLock<Option<PathBuf>> = OnceLock::new();
++    FOLDER.get_or_init(|| {
++        std::env::var_os("VICTORY_RR_STAGE_TRIGGER")?;
++        let folder = PathBuf::from(std::env::var_os("VICTORY_RR_LIGHT_TAPS")?);
++        (folder.is_dir() && super::present_lineage::enabled() && !crate::rr_perf::configured())
++            .then_some(folder)
++    }).as_ref()
++}
++
++fn selected() -> bool {
++    folder().is_some() && crate::rr_window::selected(crate::queue::presented() + 1, None)
++}
++
++#[derive(Clone, Copy)]
++enum Kind {
++    GiInput,
++    GiOutput,
++    FfxHdr,
++}
++
++impl Kind {
++    fn layout(self) -> (&'static str, DXGI_FORMAT, usize) {
++        match self {
++            Self::GiInput => ("gi-input", DXGI_FORMAT_R9G9B9E5_SHAREDEXP, 4),
++            Self::GiOutput => ("gi-packed", DXGI_FORMAT_R32_UINT, 4),
++            Self::FfxHdr => ("ffx-hdr", DXGI_FORMAT_R16G16B16A16_FLOAT, 8),
++        }
++    }
++}
++
++pub(crate) struct Accepted {
++    pub(crate) submit: u64,
++    pub(crate) index: usize,
++    pub(crate) epoch: u64,
++    pub(crate) fence: u64,
++    pub(crate) queue_fence: ID3D12Fence,
++}
++
++pub(crate) struct Tap {
++    kind: Kind,
++    begun: u64,
++    source_serial: u64,
++    ffx_output_serial: u64,
++    pre_exposure: Option<f32>,
++    buffer: ID3D12Resource,
++    pub(crate) accepted: Option<Accepted>,
++}
++
++impl Tap {
++    pub(crate) fn report(self) {
++        let Some(accepted) = self.accepted else { return };
++        let Some(folder) = folder() else { return };
++        // SAFETY: the retained interface belongs to the real title queue.
++        let completed = unsafe { accepted.queue_fence.GetCompletedValue() };
++        if completed == u64::MAX || completed < accepted.fence {
++            return;
++        }
++        let (kind, format, bpp) = self.kind.layout();
++        let mut ptr = std::ptr::null_mut();
++        // SAFETY: on the host's retirement path for this exact accepted fence.
++        let bytes = unsafe {
++            if self.buffer.Map(0, Some(&D3D12_RANGE { Begin: 0, End: BYTES as usize }), Some(&mut ptr)).is_err()
++                || ptr.is_null()
++            {
++                return;
++            }
++            let rows = std::slice::from_raw_parts(ptr.cast::<u8>(), BYTES as usize);
++            let packed = rows.chunks_exact(ROW_BYTES as usize)
++                .flat_map(|line| line[..BOX as usize * bpp].iter().copied())
++                .collect::<Vec<_>>();
++            self.buffer.Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
++            packed
++        };
++        let path = folder.join(format!("{}-{}-{}-{kind}.bin", self.begun, accepted.submit, accepted.index));
++        use std::io::Write as _;
++        let saved = std::fs::OpenOptions::new().write(true).create_new(true).open(&path)
++            .and_then(|mut file| file.write_all(&bytes));
++        if let Err(error) = saved {
++            tracing::warn!(?path, %error, "RR lighting tap could not save");
++            return;
++        }
++        tracing::info!(begun = self.begun, %kind, source_serial = self.source_serial,
++            ffx_output_serial = self.ffx_output_serial, ?self.pre_exposure,
++            submission = accepted.submit, list_index = accepted.index, list_epoch = accepted.epoch,
++            fence = accepted.fence, format = format.0, edge = BOX, sites = ?SITES, ?path,
++            "RR lighting tap fence-retired");
++    }
++}
++
++fn record(
++    list: &HostList,
++    backing: &crate::resource::HostTexture,
++    state: D3D12_RESOURCE_STATES,
++    kind: Kind,
++    ffx_output_serial: u64,
++    pre_exposure: Option<f32>,
++    begun: u64,
++) -> Option<()> {
++    if TAPS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| (n < MAX_TAPS).then_some(n + 1)).is_err() {
++        return None;
++    }
++    let (_, format, _) = kind.layout();
++    let buffer = crate::host::host()?.read_back_buffer(BYTES)?;
++    let texture = &backing.texture;
++    let copy = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    // SAFETY: the exact tracked source is a single native subresource of
++    // the expected typed format. The four distinct footprints obey D3D12
++    // offset/row alignment and lie inside this fenced readback buffer.
++    unsafe {
++        list.list.barriers(&[transition(texture, state, copy)]);
++        let src = D3D12_TEXTURE_COPY_LOCATION {
++            pResource: std::mem::transmute_copy(texture),
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++        };
++        for (i, [left, top]) in SITES.into_iter().enumerate() {
++            let dst = D3D12_TEXTURE_COPY_LOCATION {
++                pResource: std::mem::transmute_copy(&buffer),
++                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                        Offset: i as u64 * REGION_BYTES,
++                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                            Format: format, Width: BOX, Height: BOX, Depth: 1, RowPitch: ROW_BYTES,
++                        },
++                    },
++                },
++            };
++            let region = D3D12_BOX { left, top, front: 0, right: left + BOX, bottom: top + BOX, back: 1 };
++            list.list.CopyTextureRegion(&dst, 0, 0, 0, &src, Some(&region));
++        }
++        list.list.barriers(&[transition(texture, copy, state)]);
++    }
++    list.keep(texture);
++    list.keep(&buffer);
++    list.add_lighting_tap(Tap {
++        kind, begun, source_serial: backing.serial,
++        ffx_output_serial, pre_exposure, buffer, accepted: None,
++    });
++    Some(())
++}
++
++fn probe_view(state: &State, offset: u32) -> Option<View> {
++    let Root::Table(base) = state.roots_ref(true).get(1)? else { return None };
++    crate::descriptor::diagnostic_view(state.heaps[0], *base, offset)
++}
++
++pub(super) fn probe(
++    state: &State, list: &HostList, pipeline: &HostPipeline, groups: [u32; 3], before: Option<u64>,
++) -> Option<u64> {
++    if groups != [160, 180, 1] || pipeline.stages.first()?.shader.hash != PROBE || (before.is_none() && !selected()) {
++        return None;
++    }
++    let (title, kind) = if before.is_some() {
++        let View::Unordered(title, 0, _) = probe_view(state, 176)? else { return None };
++        if !matches!(probe_view(state, 184), Some(View::Unordered(alias, 0, _)) if alias == title) {
++            return None;
++        }
++        (title, Kind::GiOutput)
++    } else {
++        let view = probe_view(state, 120)?;
++        let view = if matches!(view, View::Placed(false, _, _)) {
++            crate::descriptor::host::placed_texture(&view)?
++        } else {
++            view
++        };
++        let View::Shader(title, _) = view else { return None };
++        (title, Kind::GiInput)
++    };
++    let (_, format, _) = kind.layout();
++    let (resource, states) = rendered_at(list, title, format, VIEW)?;
++    let required = if before.is_some() { D3D12_RESOURCE_STATE_UNORDERED_ACCESS } else { D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE };
++    if !states.contains(required) {
++        return None;
++    }
++    let begun = before.unwrap_or_else(crate::frames_begun);
++    record(list, &resource, states, kind, 0, None, begun)?;
++    Some(begun)
++}
++
++pub(crate) fn ffx(
++    prefix: &HostList,
++    section: &HostList,
++    color: (This, &ID3D12Resource),
++    output: (This, &ID3D12Resource),
++    pre_exposure: f32,
++) -> Option<()> {
++    let begun = crate::frames_begun();
++    if !selected() || section.fidelityfx_sr_stamp() != Some((begun, prefix.epoch()))
++        || !pre_exposure.is_finite() || pre_exposure <= 0.
++    {
++        return None;
++    }
++    let (hdr, state) = rendered_at(prefix, color.0 as usize, DXGI_FORMAT_R16G16B16A16_FLOAT, VIEW)?;
++    let (out, _) = rendered_at(section, output.0 as usize, DXGI_FORMAT_R16G16B16A16_FLOAT, [3840, 2160])?;
++    if hdr.texture.as_raw() != color.1.as_raw() || out.texture.as_raw() != output.1.as_raw()
++        || !state.contains(D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE)
++    {
++        return None;
++    }
++    record(prefix, &hdr, state, Kind::FfxHdr, out.serial, Some(pre_exposure), begun)
++}
+diff --git a/crates/victory-gpu/src/draw/probe_current.rs b/crates/victory-gpu/src/draw/probe_current.rs
+index 0b5f9a8..08556d4 100644
+--- a/crates/victory-gpu/src/draw/probe_current.rs
++++ b/crates/victory-gpu/src/draw/probe_current.rs
+@@ -24,6 +24,13 @@ pub(crate) fn enabled() -> bool {
+     *ON.get_or_init(|| std::env::var_os("VICTORY_RR_PROBE_CURRENT").is_some_and(|v| v == "1"))
+ }
+
++pub(crate) fn retain_diffuse_history() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| {
++        std::env::var_os("VICTORY_RR_PROBE_DIFFUSE_HISTORY").is_some_and(|v| v == "1")
++    })
++}
++
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+ struct Key {
+     begun: u64,
+@@ -319,7 +326,11 @@ impl DispatchPair {
+             unsafe { (counts as *mut [u32; 2]).write(dispatch_counts(selected)) };
+             current.store(selected, Ordering::Release);
+             if selected {
+-                tracing::info!(?request.key, "screen probe current-only kernel selected");
++                if retain_diffuse_history() {
++                    tracing::info!(?request.key, "screen probe diffuse and caustic history kernel selected");
++                } else {
++                    tracing::info!(?request.key, "screen probe current-only kernel selected");
++                }
+             }
+         });
+     }
+@@ -330,6 +341,7 @@ impl DispatchPair {
+             let stats = pass_stats::before_variant(list, Some(SHADER), 1, || Variant::ProbeKernel {
+                 selected: self.current.clone(),
+                 current,
++                diffuse_history: retain_diffuse_history(),
+             });
+             // SAFETY: both PSOs use the bound title root and descriptors. The
+             // upload buffer remains in GENERIC_READ and only one count is 1.
+diff --git a/crates/victory-gpu/src/draw/reflection_dense.rs b/crates/victory-gpu/src/draw/reflection_dense.rs
+index c3fc2c3..e1788f1 100644
+--- a/crates/victory-gpu/src/draw/reflection_dense.rs
++++ b/crates/victory-gpu/src/draw/reflection_dense.rs
+@@ -63,6 +63,79 @@ pub(crate) fn camera_proof(
+     })
+ }
+
++#[derive(Clone)]
++pub(crate) struct NativeVelocityCandidate(Camera, u64);
++
++pub(crate) enum DisplayCamera {
++    Strict(Camera),
++    Velocity(NativeVelocityCandidate),
++}
++
++impl DisplayCamera {
++    pub(super) fn for_source(self, source: &Source, packet: super::rr_display::Packet) -> Option<Camera> {
++        match self {
++            Self::Strict(camera) => Some(camera),
++            Self::Velocity(candidate) => candidate.for_source(source, packet),
++        }
++    }
++}
++
++impl NativeVelocityCandidate {
++    pub(crate) fn new(native: crate::external::RrCamera, motion: u64, stream: u64, motion_scale: [f32; 2], reset_requested: bool) -> Option<Self> {
++        use crate::rr_history::{inverse_perspective, multiply, rotation};
++        if !enabled() || motion_scale.iter().any(|value| !value.is_finite() || value.abs() < 1e-8) {
++            return None;
++        }
++        let rotation = rotation(&native);
++        let inverse = inverse_perspective(native.jittered_projection)?;
++        Some(Self(Camera {
++            begun: native.begun, epoch: native.epoch,
++            jittered: multiply(rotation, native.jittered_projection),
++            inverse: multiply(inverse, std::array::from_fn(|i| rotation[i % 4 * 4 + i / 4])),
++            current: multiply(rotation, native.view_to_clip),
++            native, stream, reset_requested, motion_scale,
++        }, motion))
++    }
++
++    pub(crate) fn packet_camera(&self) -> (u64, u64, [f32; 16]) {
++        (self.0.begun, self.0.epoch, self.0.jittered)
++    }
++
++    pub(crate) fn for_source(&self, source: &Source, packet: super::rr_display::Packet) -> Option<Camera> {
++        let camera = &self.0;
++        (camera.begun == packet.begun
++            && camera.epoch == packet.prefix_epoch
++            && self.1 == packet.serials[2]
++            && camera.jittered.map(f32::to_bits) == packet.projection
++            && source.matches_closed_future(packet))
++            .then(|| camera.clone())
++    }
++
++    pub(super) fn confirm(&self, packet: super::rr_display::Packet, sequence: u64) -> Option<NativeCamera> {
++        let source = SOURCE.lock().unwrap_or_else(|error| error.into_inner());
++        let source = source.as_ref().filter(|source| source.signaled && source.submission < sequence)?;
++        let camera = self.for_source(source, packet)?;
++        tracing::info!(
++            begun = packet.begun, prefix_epoch = packet.prefix_epoch, slot_epoch = packet.slot_epoch,
++            source_submit = source.submission, submit = sequence,
++            depth = packet.serials[1], motion = packet.serials[2],
++            "RR native velocity matched the signaled opaque source"
++        );
++        Some(early_camera(camera, sequence))
++    }
++}
++
++pub(crate) fn publish_native_camera(camera: &Camera, begun: u64, epoch: u64, sequence: u64) {
++    if (camera.begun, camera.epoch) != (begun, epoch) {
++        return;
++    }
++    let mut accepted = ACCEPTED.lock().unwrap_or_else(|error| error.into_inner());
++    if accepted.as_ref().is_none_or(|(prior, submit)| prior.begun < begun && *submit < sequence) {
++        *accepted = Some((camera.clone(), sequence));
++        tracing::info!(begun, epoch, sequence, "RR confirmed native velocity camera at FidelityFX signal");
++    }
++}
++
+ pub(crate) struct Source {
+     primary: Primary,
+     depth_serial: u64,
+@@ -71,6 +144,7 @@ pub(crate) struct Source {
+     camera: [u32; 16],
+     phase: [u32; 2],
+     submission: u64,
++    signaled: bool,
+     kinds: ID3D12Resource,
+     distance: ID3D12Resource,
+     material: RrMaterialCandidates,
+@@ -144,6 +218,7 @@ pub(super) fn source(
+         camera,
+         phase,
+         submission,
++        signaled: false,
+         kinds: kinds.clone(),
+         distance: distance.clone(),
+         material: material.candidates(),
+@@ -167,6 +242,14 @@ pub(crate) fn queued(next: Source) {
+     }
+ }
+
++pub(crate) fn source_signaled(sequence: u64) {
++    if !super::rr_camera::deferred_enabled() { return; }
++    let mut source = SOURCE.lock().unwrap_or_else(|error| error.into_inner());
++    if let Some(source) = source.as_mut().filter(|source| source.submission == sequence) {
++        source.signaled = true;
++    }
++}
++
+ fn matching_projection(native: [u32; 16], expected: [f32; 16]) -> bool {
+     native
+         .map(f32::from_bits)
+@@ -229,7 +312,7 @@ fn ordered_source(camera: &Camera, sequence: u64) -> Result<Source, &'static str
+ }
+
+ pub(super) struct NativeCamera {
+-    camera: Camera,
++    pub(super) camera: Camera,
+     previous: Option<([f32; 16], RrShadowCameraStamp)>,
+ }
+
+diff --git a/crates/victory-gpu/src/draw/rr_camera.rs b/crates/victory-gpu/src/draw/rr_camera.rs
+index c54eb92..0b730d0 100644
+--- a/crates/victory-gpu/src/draw/rr_camera.rs
++++ b/crates/victory-gpu/src/draw/rr_camera.rs
+@@ -157,6 +157,7 @@ struct Sample<T> {
+     epoch: u64,
+     source: Source,
+     value: T,
++    motion: Option<u64>,
+ }
+
+ #[derive(Default)]
+@@ -186,7 +187,12 @@ impl Samples {
+     }
+
+     fn record<T: PartialEq>(samples: &mut Vec<Sample<T>>, sample: Sample<T>) -> bool {
+-        if samples.contains(&sample) {
++        if let Some(entry) = samples.iter_mut().find(|entry|
++            entry.epoch == sample.epoch && entry.source == sample.source && entry.value == sample.value
++        ) {
++            if entry.motion != sample.motion {
++                entry.motion = None;
++            }
+             return true;
+         }
+         if samples.len() == MAX_SAMPLES {
+@@ -202,19 +208,33 @@ impl Samples {
+         epoch: u64,
+         render: [u32; 2],
+         jitter: [f32; 2],
+-    ) -> Option<Velocity> {
+-        if begun != self.begun || self.overflow || render.contains(&0) {
+-            return None;
++    ) -> Result<Velocity, &'static str> {
++        if begun != self.begun {
++            return Err("camera sample bucket belongs to a different begun frame");
++        }
++        if self.overflow {
++            return Err("camera sample bucket overflowed");
++        }
++        if render.contains(&0) {
++            return Err("camera render extent is empty");
+         }
+         let mut velocities = self
+             .velocities
+             .iter()
+             .filter(|sample| sample.epoch <= epoch && sample.value.fits(render, jitter));
+-        let first = velocities.next()?.value;
+-        if velocities.any(|sample| sample.value != first) {
+-            return None;
++        let Some(first) = velocities.next() else {
++            return Err(if self.velocities.is_empty() {
++                "velocity camera candidate unavailable"
++            } else if self.velocities.iter().any(|sample| sample.value.fits(render, jitter)) {
++                "matching velocity was stamped after the FFX prefix"
++            } else {
++                "velocity geometry or jitter does not match FFX"
++            });
++        };
++        if velocities.any(|sample| sample.value != first.value) {
++            return Err("multiple different velocity cameras match FFX jitter");
+         }
+-        Some(first)
++        Ok(first.value)
+     }
+
+     fn qualify(
+@@ -223,16 +243,24 @@ impl Samples {
+         epoch: u64,
+         render: [u32; 2],
+         jitter: [f32; 2],
+-        velocity_is_current: impl Fn(Sample<Velocity>) -> bool,
+-        projection_is_current: impl Fn(Sample<[f32; 16]>) -> bool,
+-    ) -> Option<RrCamera> {
++        velocity_is_current: impl Fn(Sample<Velocity>) -> Result<(), &'static str>,
++        projection_is_current: impl Fn(Sample<[f32; 16]>) -> Result<(), &'static str>,
++        allow_deferred: bool,
++    ) -> Result<(RrCamera, Option<u64>), &'static str> {
+         let velocity = self.matching(begun, epoch, render, jitter)?;
+-        if !self.velocities.iter().copied().any(|sample| {
+-            sample.epoch <= epoch && sample.value == velocity && velocity_is_current(sample)
+-        }) {
+-            return None;
++        let mut native_motion = None;
++        let mut velocity_error = "velocity source unavailable at FFX";
++        let verified = self.velocities.iter().copied().filter(|sample| {
++            sample.epoch <= epoch && sample.value == velocity
++        }).any(|sample| match velocity_is_current(sample) {
++            Ok(()) => { native_motion = sample.motion; true }
++            Err(reason) => { velocity_error = reason; false }
++        });
++        if !verified {
++            return Err(velocity_error);
+         }
+         let mut verified = false;
++        let mut projection_error = "independent reflection projection unavailable";
+         for sample in self
+             .projections
+             .iter()
+@@ -240,25 +268,44 @@ impl Samples {
+             .filter(|sample| sample.epoch <= epoch && sample.epoch != 0)
+         {
+             if !velocity.verifies(sample.value) {
+-                return None;
++                return Err("velocity and reflection camera matrices disagree");
++            }
++            match projection_is_current(sample) {
++                Ok(()) => verified = true,
++                Err(reason) => projection_error = reason,
+             }
+-            verified |= projection_is_current(sample);
+         }
+-        if !verified {
+-            return None;
++        let deferred = !verified && allow_deferred && self.projections.is_empty();
++        if !verified && !deferred {
++            if projection_error == "independent reflection projection unavailable"
++                && self.projections.iter().any(|sample| sample.epoch > epoch && velocity.verifies(sample.value))
++            {
++                return Err("matching reflection projection was stamped after the FFX prefix");
++            }
++            return Err(projection_error);
+         }
+-        let world_to_view = velocity.world_to_view()?;
++        let world_to_view = velocity.world_to_view().ok_or("velocity camera pose or perspective is invalid")?;
+         let mut view_to_clip = velocity.projection;
+         view_to_clip[8..10].fill(0.0);
+-        Some(RrCamera {
++        let motion = if deferred {
++            let motion = native_motion.ok_or("missing exact native VelocityFill motion target")?;
++            if self.velocities.iter().any(|sample| sample.epoch <= epoch
++                && sample.value == velocity && sample.motion != Some(motion))
++            {
++                return Err("matching VelocityFill samples have ambiguous native motion targets");
++            }
++            Some(motion)
++        } else { None };
++        Ok((RrCamera {
+             world_to_view,
+             view_to_clip,
+             jittered_projection: velocity.projection,
+             origin: [velocity.position[0], velocity.position[1], velocity.position[2]],
+             begun,
+             epoch,
+-        })
++        }, motion))
+     }
++
+ }
+
+ pub(super) fn velocity(state: &State, list: &HostList, pipeline: &HostPipeline) {
+@@ -273,31 +320,38 @@ pub(super) fn velocity(state: &State, list: &HostList, pipeline: &HostPipeline)
+         return;
+     };
+     let [viewport] = state.viewports.as_slice() else {
++        report_gap("velocity", crate::frames_begun(), list.epoch(), "one native velocity viewport required", None);
+         return;
+     };
+     if viewport.TopLeftX != 0.0 || viewport.TopLeftY != 0.0 {
++        report_gap("velocity", crate::frames_begun(), list.epoch(), "native velocity viewport offset does not match FFX", None);
+         return;
+     }
+     let begun = crate::frames_begun();
+     let epoch = list.epoch();
+     let Some(source) = Source::bound(state, &stage.translated().used, false, 8) else {
++        report_gap("velocity", begun, epoch, "velocity camera constant slot is unbound", None);
+         return;
+     };
+     let Some(value) = Velocity::read(source, [viewport.Width, viewport.Height]) else {
++        report_gap("velocity", begun, epoch, "velocity camera constant layout or bytes unreadable or unstable", None);
+         return;
+     };
++    #[cfg(feature = "diagnostics")]
++    let motion = if deferred_enabled() {
++        match state.targets.as_slice() {
++            [target] => list.guide_texture(*target).map(|(texture, _)| texture.serial).filter(|&serial| serial != 0),
++            _ => None,
++        }
++    } else { None };
++    #[cfg(not(feature = "diagnostics"))]
++    let motion = None;
+     let mut samples = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+-    if crate::frames_begun() == begun
+-        && samples.advance(begun)
+-        && !Samples::record(
+-            &mut samples.velocities,
+-            Sample {
+-                epoch,
+-                source,
+-                value,
+-            },
+-        )
+-    {
++    if crate::frames_begun() != begun {
++        report_gap("velocity", begun, epoch, "title begun advanced while recording velocity", None);
++    } else if !samples.advance(begun) {
++        report_gap("velocity", begun, epoch, "velocity begun bucket superseded or full", None);
++    } else if !Samples::record(&mut samples.velocities, Sample { epoch, source, value, motion }) {
+         samples.overflow = true;
+     }
+ }
+@@ -313,52 +367,126 @@ pub(super) fn reflection(state: &State, list: &HostList, pipeline: &HostPipeline
+     let begun = crate::frames_begun();
+     let epoch = list.epoch();
+     let Some(source) = Source::bound(state, &stage.translated().used, true, 168) else {
++        report_gap("reflection", begun, epoch, "reflection camera constant slot is unbound", None);
+         return;
+     };
+     let Some(value) = source.words::<16, 64>(0x160) else {
++        report_gap("reflection", begun, epoch, "reflection projection bytes unreadable or unstable", None);
+         return;
+     };
+     let mut samples = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
+-    if crate::frames_begun() == begun
+-        && samples.advance(begun)
+-        && !Samples::record(
+-            &mut samples.projections,
+-            Sample {
+-                epoch,
+-                source,
+-                value,
+-            },
+-        )
+-    {
++    if crate::frames_begun() != begun {
++        report_gap("reflection", begun, epoch, "title begun advanced while recording reflection", None);
++    } else if !samples.advance(begun) {
++        report_gap("reflection", begun, epoch, "reflection begun bucket superseded or full", None);
++    } else if !Samples::record(&mut samples.projections, Sample { epoch, source, value, motion: None }) {
+         samples.overflow = true;
+     }
+ }
+
+-pub(crate) fn qualified(list: &HostList, render: [u32; 2], jitter: [f32; 2]) -> Option<RrCamera> {
++#[cfg(feature = "diagnostics")]
++fn report_gap(
++    stage: &'static str,
++    begun: u64,
++    epoch: u64,
++    reason: &'static str,
++    samples: Option<(&Samples, [u32; 2], [f32; 2])>,
++) {
++    static ON: OnceLock<bool> = OnceLock::new();
++    if !*ON.get_or_init(|| std::env::var_os("VICTORY_RR_CAMERA_DIAGNOSTICS").is_some_and(|v| v == "1"))
++        || !super::rr_display::selected()
++    {
++        return;
++    }
++    static COUNTS: Mutex<Option<std::collections::HashMap<(&'static str, &'static str), u64>>> =
++        Mutex::new(None);
++    let mut counters = COUNTS.lock().unwrap_or_else(|error| error.into_inner());
++    let count = counters.get_or_insert_with(std::collections::HashMap::new)
++        .entry((stage, reason)).or_default();
++    *count += 1;
++    if *count > 16 && !count.is_power_of_two() {
++        return;
++    }
++    if let Some((samples, render, jitter)) = samples {
++        let velocity_epochs: Vec<_> = samples.velocities.iter().map(|sample| sample.epoch).collect();
++        let projection_epochs: Vec<_> = samples.projections.iter().map(|sample| sample.epoch).collect();
++        let matching_velocity_epochs: Vec<_> = samples.velocities.iter()
++            .filter(|sample| sample.value.fits(render, jitter))
++            .map(|sample| sample.epoch).collect();
++        tracing::info!(stage, begun, epoch, bucket = samples.begun, reason, count = *count,
++            ?render, ?jitter, ?velocity_epochs, ?projection_epochs, ?matching_velocity_epochs,
++            "RR camera qualification rejected");
++    } else {
++        tracing::info!(stage, begun, epoch, reason, count = *count, "RR camera qualification rejected");
++    }
++}
++
++#[cfg(not(feature = "diagnostics"))]
++fn report_gap(
++    _: &'static str,
++    _: u64,
++    _: u64,
++    _: &'static str,
++    _: Option<(&Samples, [u32; 2], [f32; 2])>,
++) {
++}
++
++#[cfg(feature = "diagnostics")]
++pub(crate) fn deferred_enabled() -> bool {
++    static ENABLED: OnceLock<bool> = OnceLock::new();
++    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_RR_DEFER_CAMERA_PROJECTION").is_some_and(|value| value == "1"))
++        && super::rr_display::enabled()
++}
++
++pub(crate) fn qualified(list: &HostList, render: [u32; 2], jitter: [f32; 2], allow_deferred: bool) -> Option<(RrCamera, Option<u64>)> {
+     if !enabled() {
+         return None;
+     }
+     let begun = crate::frames_begun();
+     let mut samples = SAMPLES.lock().unwrap_or_else(|e| e.into_inner());
++    let epoch = list.epoch();
+     let result = samples.qualify(
+         begun,
+-        list.epoch(),
++        epoch,
+         render,
+         jitter,
+         |sample| {
+-            sample.source.current()
+-                && Velocity::read(sample.source, sample.value.extent) == Some(sample.value)
++            if !sample.source.current() {
++                return Err("velocity camera descriptor slot changed before FFX");
++            }
++            match Velocity::read(sample.source, sample.value.extent) {
++                Some(read) if read == sample.value => Ok(()),
++                Some(_) => Err("velocity camera constants changed before FFX"),
++                None => Err("velocity camera constants unreadable or unstable at FFX"),
++            }
+         },
+         |sample| {
+-            sample.source.current() && sample.source.words::<16, 64>(0x160) == Some(sample.value)
++            if !sample.source.current() {
++                return Err("reflection camera descriptor slot changed before FFX");
++            }
++            match sample.source.words::<16, 64>(0x160) {
++                Some(read) if read == sample.value => Ok(()),
++                Some(_) => Err("reflection camera constants changed before FFX"),
++                None => Err("reflection camera constants unreadable or unstable at FFX"),
++            }
+         },
++        allow_deferred,
+     );
++    if let Err(reason) = result {
++        report_gap("FFX", begun, epoch, reason, Some((&samples, render, jitter)));
++    }
+     if samples.begun == begun {
+         // A second SR view in this recording needs its own independent camera evidence.
+         samples.velocities.clear();
+         samples.projections.clear();
+     }
+-    result.filter(|_| crate::frames_begun() == begun)
++    result.ok().filter(|_| {
++        let same_frame = crate::frames_begun() == begun;
++        if !same_frame {
++            report_gap("FFX", begun, epoch, "title begun advanced during FFX qualification", None);
++        }
++        same_frame
++    })
+ }
+
+ #[cfg(test)]
+@@ -407,11 +535,27 @@ mod tests {
+             epoch,
+             source: SOURCE,
+             value,
++            motion: Some(9),
+         }
+     }
+
+     fn camera(batch: &Samples, begun: u64, epoch: u64, jitter: [f32; 2]) -> Option<RrCamera> {
+-        batch.qualify(begun, epoch, RENDER, jitter, |_| true, |_| true)
++        batch.qualify(begun, epoch, RENDER, jitter, |_| Ok(()), |_| Ok(()), false).ok().map(|(camera, _)| camera)
++    }
++
++    #[test]
++    fn deferred_camera_requires_one_fresh_motion_target_and_no_projection_samples() {
++        let jitter = [-0.25, 0.125];
++        let velocity = pose(jitter, 20.);
++        let mut batch = Samples { begun: 1779, velocities: vec![sample(10, velocity)], ..Default::default() };
++        assert!(camera(&batch, 1779, 13, jitter).is_none());
++        assert_eq!(batch.qualify(1779, 13, RENDER, jitter, |_| Ok(()), |_| Ok(()), true).unwrap().1, Some(9));
++        assert!(batch.qualify(1779, 13, RENDER, jitter, |_| Err("stale"), |_| Ok(()), true).is_err());
++        batch.velocities.push(Sample { motion: Some(10), ..sample(11, velocity) });
++        assert!(batch.qualify(1779, 13, RENDER, jitter, |_| Ok(()), |_| Ok(()), true).is_err());
++        batch.velocities.pop();
++        batch.projections.push(sample(12, [0.; 16]));
++        assert!(batch.qualify(1779, 13, RENDER, jitter, |_| Ok(()), |_| Ok(()), true).is_err());
+     }
+
+     #[test]
+@@ -450,18 +594,18 @@ mod tests {
+         assert!(camera(&batch, 1779, 13, [0.25, 0.125]).is_none());
+         assert!(
+             batch
+-                .qualify(1779, 13, [640, 360], jitter, |_| true, |_| true)
+-                .is_none()
++                .qualify(1779, 13, [640, 360], jitter, |_| Ok(()), |_| Ok(()), false)
++                .is_err()
+         );
+         assert!(
+             batch
+-                .qualify(1779, 13, RENDER, jitter, |_| false, |_| true)
+-                .is_none()
++                .qualify(1779, 13, RENDER, jitter, |_| Err("slot replaced"), |_| Ok(()), false)
++                .err() == Some("slot replaced")
+         );
+         assert!(
+             batch
+-                .qualify(1779, 13, RENDER, jitter, |_| true, |_| false)
+-                .is_none()
++                .qualify(1779, 13, RENDER, jitter, |_| Ok(()), |_| Err("bytes changed"), false)
++                .err() == Some("bytes changed")
+         );
+         batch.velocities.push(sample(12, pose(jitter, 90.)));
+         assert!(camera(&batch, 1779, 13, jitter).is_none());
+diff --git a/crates/victory-gpu/src/draw/rr_display.rs b/crates/victory-gpu/src/draw/rr_display.rs
+index 9e0fab7..f8937ab 100644
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -2,7 +2,7 @@
+
+ use super::{HostList, background_snapshot, display_transmission, reflection_dense, rr_shadow};
+ use crate::{
+-    external::{RrCameraFrame, RrShadowCameraStamp, RrShadowFrame},
++    external::{RrShadowCameraStamp, RrShadowFrame},
+     host::Host,
+     object::This,
+     reflection_motion,
+@@ -237,7 +237,7 @@ fn closed_packet_requires_exact_prefix_sr_and_continuation() {
+ pub(crate) fn capture(
+     prefix: &HostList,
+     section: &HostList,
+-    camera: &RrCameraFrame<'_>,
++    camera: (u64, u64, [f32; 16]),
+     inputs: [(This, &ID3D12Resource); 3],
+     output: (This, &ID3D12Resource),
+     dof: Option<&ID3D12Resource>,
+@@ -247,8 +247,7 @@ pub(crate) fn capture(
+     if !selected() {
+         return;
+     }
+-    let begun = camera.current().begun;
+-    let epoch = camera.current().epoch;
++    let (begun, epoch, projection) = camera;
+     let prepare = || {
+         if epoch != prefix.epoch() || section.fidelityfx_sr_stamp() != Some((begun, epoch)) {
+             return Err("stock SR is not in a verified isolated slot");
+@@ -280,9 +279,7 @@ pub(crate) fn capture(
+             dof: dof.clone(),
+             frame,
+             record,
+-            projection: camera
+-                .current_relative_world_to_jittered_clip()
+-                .map(f32::to_bits),
++            projection: projection.map(f32::to_bits),
+             prepared: Arc::default(),
+         });
+         if !crate::rr_perf::configured() || crate::rr_perf::quality_capture() {
+@@ -400,7 +397,7 @@ pub(crate) fn prepare_early(
+     host: &Host,
+     request: &Request,
+     packet: Packet,
+-    camera: reflection_dense::Camera,
++    camera: reflection_dense::DisplayCamera,
+     source: &reflection_dense::Source,
+     source_submit: u64,
+     optical: Option<&display_transmission::Proof>,
+@@ -415,6 +412,8 @@ pub(crate) fn prepare_early(
+         host.new_list()
+             .map_err(|_| "private native RR list allocation failed")?,
+     );
++    let camera = camera.for_source(source, packet)
++        .ok_or("native VelocityFill motion or projection disagrees with the exact opaque producer")?;
+     let native = reflection_dense::early_camera(camera, source_submit).record_early(
+         &list,
+         source,
+@@ -557,6 +556,17 @@ pub(crate) fn select(
+         runs[index].fidelityfx_sr_stamp(),
+         actual,
+     );
++    let confirmed = if camera.is_none() && ordered {
++        match runs[index - 1].rr_display_camera() {
++            Some(reflection_dense::DisplayCamera::Velocity(velocity)) => velocity.confirm(actual, sequence),
++            _ => None,
++        }
++    } else { None };
++    if let Some(camera) = &confirmed {
++        runs[index].rr_verified_velocity(camera.camera.clone());
++    }
++    let certified = confirmed.is_some();
++    let camera = camera.or(confirmed);
+     if let Some(Prepared { packet, mut chosen }) = request.take_prepared() {
+         // The lane may commit only when this exact closed command slot is permanently in its custody.
+         assert!(
+@@ -576,7 +586,7 @@ pub(crate) fn select(
+         let optical = if display_transmission::enabled() {
+             let background = background
+                 .filter(|background| {
+-                    background.camera.is_some()
++                    (background.camera.is_some() || certified)
+                         && background.key
+                             == (background_snapshot::RrBackgroundKey {
+                                 submission: sequence,
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 24ad3d0..9775533 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -54,6 +54,9 @@ pub struct Recording<'a>(
+     #[cfg(feature = "diagnostics")] Option<&'a crate::host::HostList>,
+ );
+
++#[cfg(feature = "diagnostics")]
++pub struct RrNativeVelocity(crate::draw::reflection_dense::NativeVelocityCandidate);
++
+ /// Validated same-frame right-handed camera transforms, in row-major order.
+ #[derive(Clone, Copy)]
+ pub struct RrCamera {
+@@ -104,12 +107,47 @@ impl Recording<'_> {
+     /// Consume camera evidence from checked CBVs recorded before this SR call.
+     /// shortcut: verifies record-time inputs, qualify producer submission order separately.
+     pub fn rr_camera(&self, render: [u32; 2], jitter: [f32; 2]) -> Option<RrCamera> {
+-        let camera = crate::draw::rr_camera::qualified(self.0, render, jitter);
++        let camera = crate::draw::rr_camera::qualified(self.0, render, jitter, false).map(|(camera, _)| camera);
+         #[cfg(feature = "diagnostics")]
+         crate::host::rr_order::handoff(self.0, camera.is_some());
+         camera
+     }
+
++    #[cfg(feature = "diagnostics")]
++    pub fn rr_can_defer_camera(&self) -> bool {
++        self.1.is_some() && crate::draw::rr_camera::deferred_enabled() && crate::draw::rr_display::selected()
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub fn rr_native_camera(
++        &self, render: [u32; 2], jitter: [f32; 2], history: &RrHistory,
++        motion_scale: [f32; 2], reset: bool,
++    ) -> (Option<RrCamera>, Option<RrNativeVelocity>) {
++        use crate::draw::{reflection_dense::NativeVelocityCandidate, rr_camera};
++        let allow = self.rr_can_defer_camera();
++        let result = rr_camera::qualified(self.0, render, jitter, allow);
++        crate::host::rr_order::handoff(self.0, matches!(result, Some((_, None))));
++        match result {
++            Some((camera, Some(motion))) => (None, NativeVelocityCandidate::new(
++                camera, motion, history.stream(), motion_scale, reset,
++            ).map(RrNativeVelocity)),
++            Some((camera, None)) => (Some(camera), None),
++            None => (None, None),
++        }
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub fn rr_display_velocity_candidate(
++        &self, camera: RrNativeVelocity,
++        inputs: [(This, &ID3D12Resource); 3], output: (This, &ID3D12Resource),
++        dof: Option<&ID3D12Resource>, frame: RrShadowFrame, record: RrDisplayRecord,
++    ) {
++        if let Some(section) = self.1 {
++            crate::draw::rr_display::capture(self.0, section, camera.0.packet_camera(), inputs, output, dof, frame, record);
++            self.0.rr_native_velocity(camera.0);
++        }
++    }
++
+     /// Producer keys this list can safely read. Match depth, camera and
+     /// occurrence to the view before requesting its textures.
+     #[cfg(feature = "diagnostics")]
+@@ -194,7 +232,8 @@ impl Recording<'_> {
+         record: RrDisplayRecord,
+     ) {
+         if let Some(section) = self.1 {
+-            crate::draw::rr_display::capture(self.0, section, camera, inputs, output, dof, frame, record);
++            crate::draw::rr_display::capture(self.0, section, (camera.current().begun, camera.current().epoch,
++                camera.current_relative_world_to_jittered_clip()), inputs, output, dof, frame, record);
+         }
+     }
+
+@@ -277,6 +316,19 @@ impl Recording<'_> {
+         crate::draw::present_lineage::seed(commands, title, output);
+     }
+
++    /// Optional bounded sample of the exact native FFX input before evaluation.
++    #[cfg(feature = "diagnostics")]
++    pub fn rr_lighting_input(
++        &self,
++        color: (This, &ID3D12Resource),
++        output: (This, &ID3D12Resource),
++        pre_exposure: f32,
++    ) {
++        if let Some(section) = self.1 {
++            let _ = crate::draw::lighting_taps::ffx(self.0, section, color, output, pre_exposure);
++        }
++    }
++
+     /// FidelityFX input preparation stays on the title prefix. Only feature
+     /// creation and the SR evaluation use the optional closed section.
+     pub fn fidelityfx_commands(&self, _resources: [&ID3D12Resource; 4]) -> &ID3D12GraphicsCommandList {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 2cc1923..fd1ef1f 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2702,6 +2702,10 @@ struct Deferred {
+     #[cfg(feature = "diagnostics")]
+     reflection_dense_cameras: Vec<crate::draw::reflection_dense::Camera>,
+     #[cfg(feature = "diagnostics")]
++    rr_native_velocity: Vec<crate::draw::reflection_dense::NativeVelocityCandidate>,
++    #[cfg(feature = "diagnostics")]
++    rr_verified_velocity: Option<crate::draw::reflection_dense::Camera>,
++    #[cfg(feature = "diagnostics")]
+     rr_shadow: Vec<crate::draw::rr_shadow::Snapshot>,
+     #[cfg(feature = "diagnostics")]
+     fidelityfx_sr: Option<(u64, u64)>,
+@@ -2726,6 +2730,10 @@ struct Deferred {
+     #[cfg(feature = "diagnostics")]
+     probe_current_ambiguous: bool,
+     #[cfg(feature = "diagnostics")]
++    lighting_taps: Vec<crate::draw::lighting_taps::Tap>,
++    #[cfg(feature = "diagnostics")]
++    lighting_taps_submitted: bool,
++    #[cfg(feature = "diagnostics")]
+     reflection_dense_backs: Vec<crate::draw::reflection_dense::Readback>,
+     #[cfg(feature = "diagnostics")]
+     material_outputs: Vec<std::sync::Arc<crate::draw::material_guides::Produced>>,
+@@ -4505,6 +4513,10 @@ fn read_backs(list: &HostList) {
+         crate::draw::background_snapshot::retire(snapshot);
+     }
+     #[cfg(feature = "diagnostics")]
++    for tap in std::mem::take(&mut list.deferred().lighting_taps) {
++        tap.report();
++    }
++    #[cfg(feature = "diagnostics")]
+     for check in std::mem::take(&mut list.deferred().reflection_dense_backs) {
+         check.report();
+     }
+@@ -6244,16 +6256,22 @@ impl Host {
+     #[cfg(feature = "diagnostics")]
+     fn fidelityfx_sr_submitted(&self, runs: &[&HostList], submit: u64, fence: u64) {
+         static SENT: AtomicU64 = AtomicU64::new(0);
++        crate::draw::reflection_dense::source_signaled(submit);
+         for (index, list) in runs.iter().enumerate() {
+             let mut deferred = list.deferred();
+             let Some((begun, prefix_epoch)) = deferred.fidelityfx_sr.take() else { continue };
++            let follows_prefix = index > 0 && runs[index - 1].epoch() == prefix_epoch;
++            if follows_prefix && fence != 0
++                && let Some(confirmed) = deferred.rr_verified_velocity.take()
++            {
++                crate::draw::reflection_dense::publish_native_camera(&confirmed, begun, prefix_epoch, submit);
++            }
+             if let Some(chosen) = deferred.rr_display_chosen.as_mut() {
+                 crate::rr_perf::submitted(crate::rr_perf::Provider::Rr);
+                 chosen.submitted(fence);
+                 continue;
+             }
+             let count = SENT.fetch_add(1, Ordering::Relaxed) + 1;
+-            let follows_prefix = index > 0 && runs[index - 1].epoch() == prefix_epoch;
+             if follows_prefix {
+                 crate::rr_perf::submitted(crate::rr_perf::Provider::Sr);
+             }
+@@ -6268,8 +6286,18 @@ impl Host {
+     #[cfg(feature = "diagnostics")]
+     fn present_lineage_submitted(&self, runs: &[&HostList], submit: u64, fence: u64, valid: bool) {
+         if !crate::draw::present_lineage::enabled() { return }
+-        for list in runs {
++        for (index, list) in runs.iter().enumerate() {
+             let mut deferred = list.deferred();
++            if !deferred.lighting_taps.is_empty() {
++                let accepted = valid && !deferred.lighting_taps_submitted;
++                deferred.lighting_taps_submitted = true;
++                for tap in &mut deferred.lighting_taps {
++                    tap.accepted = accepted.then(|| crate::draw::lighting_taps::Accepted {
++                        submit, index, epoch: list.epoch(), fence,
++                        queue_fence: self.fence.clone(),
++                    });
++                }
++            }
+             let events = std::mem::take(&mut deferred.present_lineage);
+             let overflow = std::mem::take(&mut deferred.present_lineage_overflow);
+             let replay = deferred.present_lineage_sent;
+@@ -8430,6 +8458,30 @@ impl HostList {
+         self.deferred().reflection_dense_cameras.clone()
+     }
+
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_native_velocity(&self, camera: crate::draw::reflection_dense::NativeVelocityCandidate) {
++        let mut deferred = self.deferred();
++        if deferred.rr_native_velocity.len() < 2 {
++            deferred.rr_native_velocity.push(camera);
++        }
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_display_camera(&self) -> Option<crate::draw::reflection_dense::DisplayCamera> {
++        use crate::draw::reflection_dense::DisplayCamera;
++        let deferred = self.deferred();
++        match (deferred.reflection_dense_cameras.as_slice(), deferred.rr_native_velocity.as_slice()) {
++            ([strict], []) => Some(DisplayCamera::Strict(strict.clone())),
++            ([], [candidate]) => Some(DisplayCamera::Velocity(candidate.clone())),
++            _ => None,
++        }
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn rr_verified_velocity(&self, camera: crate::draw::reflection_dense::Camera) {
++        self.deferred().rr_verified_velocity = Some(camera);
++    }
++
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn rr_shadow_capture(&self, snapshot: crate::draw::rr_shadow::Snapshot) {
+         let mut deferred = self.deferred();
+@@ -8583,6 +8635,11 @@ impl HostList {
+         }
+     }
+
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn add_lighting_tap(&self, tap: crate::draw::lighting_taps::Tap) {
++        self.deferred().lighting_taps.push(tap);
++    }
++
+     /// Ambiguous matching dispatches disqualify the source cohort.
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn probe_current(&self) -> Option<Option<std::sync::Arc<crate::draw::probe_current::Request>>> {
+diff --git a/crates/victory-gpu/src/host/pass_stats.rs b/crates/victory-gpu/src/host/pass_stats.rs
+index 3cd90b4..e6a8276 100644
+--- a/crates/victory-gpu/src/host/pass_stats.rs
++++ b/crates/victory-gpu/src/host/pass_stats.rs
+@@ -49,7 +49,7 @@ pub(crate) enum Variant {
+     Fixed(&'static str),
+     CurrentOnly(Arc<AtomicBool>),
+     CountGated(Arc<AtomicU32>),
+-    ProbeKernel { selected: Arc<AtomicBool>, current: bool },
++    ProbeKernel { selected: Arc<AtomicBool>, current: bool, diffuse_history: bool },
+     ReflectionKernel { mode: Arc<AtomicU32>, current: bool },
+ }
+
+@@ -65,7 +65,8 @@ impl Variant {
+                 1 => "native_counted",
+                 _ => "unpublished_count",
+             },
+-            Self::ProbeKernel { selected, current } => match (selected.load(Acquire), current) {
++            Self::ProbeKernel { selected, current, diffuse_history } => match (selected.load(Acquire), current) {
++                (true, true) if *diffuse_history => "probe_diffuse_history_kernel",
+                 (true, true) => "current_probe_kernel",
+                 (true, false) => "native_kernel_skipped",
+                 (false, false) => "native",
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index acd5d5f..5a44e9c 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -401,7 +401,7 @@ pub(crate) unsafe fn recorded_rr_ffx_owner(this: This) -> Option<thin::RecordedF
+         return None;
+     }
+     let request = section.host.rr_display_owned()?;
+-    if prefix.host.reflection_dense_cameras().len() != 1 {
++    if prefix.host.rr_display_camera().is_none() {
+         return None;
+     }
+     let (slot_owner, bindings) = request.immutable_bindings();
+diff --git a/crates/victory-gpu/src/pipeline.rs b/crates/victory-gpu/src/pipeline.rs
+index 65beea4..69466b1 100644
+--- a/crates/victory-gpu/src/pipeline.rs
++++ b/crates/victory-gpu/src/pipeline.rs
+@@ -154,7 +154,9 @@ pub(crate) struct Translated {
+ impl Shader {
+     #[cfg(feature = "diagnostics")]
+     pub(crate) fn current_lighting(&self) -> Option<victory_shader::emit::HostShader> {
+-        use victory_shader::emit::{translate_current_probe, translate_current_reflection};
++        use victory_shader::emit::{
++            translate_current_probe, translate_current_reflection, translate_probe_diffuse_history,
++        };
+         let (expected, translate): (_, fn(&[u8]) -> _) = match self.hash.as_str() {
+             "71883e40620a567a" => (
+                 "71883e40620a567a9ba40b4ec2a4442a485a5f8d86b28845e47bf2aeb077face",
+@@ -166,7 +168,11 @@ impl Shader {
+             ),
+             "34fb51b8a0312e82" => (
+                 "34fb51b8a0312e82127cfd2c2d8ac550b324e493dfacd4fa16514030488175f5",
+-                translate_current_probe,
++                if crate::draw::probe_current::retain_diffuse_history() {
++                    translate_probe_diffuse_history
++                } else {
++                    translate_current_probe
++                },
+             ),
+             _ => return None,
+         };
+diff --git a/crates/victory-gpu/src/queue/behind.rs b/crates/victory-gpu/src/queue/behind.rs
+index 2ab37ef..ed5b809 100644
+--- a/crates/victory-gpu/src/queue/behind.rs
++++ b/crates/victory-gpu/src/queue/behind.rs
+@@ -893,7 +893,7 @@ impl Drop for FutureScope {
+ pub(crate) struct ClosedFuture {
+     pub packet: crate::draw::rr_display::Packet,
+     pub request: crate::draw::rr_display::Request,
+-    pub camera: crate::draw::reflection_dense::Camera,
++    pub camera: crate::draw::reflection_dense::DisplayCamera,
+     pub optical: Option<crate::draw::display_transmission::Proof>,
+     pub alpha: Option<crate::draw::alpha_current::AlphaLease>,
+ }
+@@ -930,14 +930,15 @@ impl ClosedFuture {
+         for list in [prefix, section, continuation] {
+             list.list.cast::<ID3D12CommandList>().ok()?;
+         }
+-        let [camera] = prefix.reflection_dense_cameras().try_into().ok()?;
++        let camera = prefix.rr_display_camera()?;
+         let request = section.rr_display_owned()?;
+         (request.packet(section.epoch()) == packet && !request.is_adopted())
+             .then_some(Self { packet, request, camera, optical: None, alpha: None })
+     }
+
+     fn attach_cohort(&mut self, runs: &[&crate::host::HostList]) -> Result<Vec<u64>, &'static str> {
+-        let proof = crate::draw::display_transmission::closed_future(runs, self.packet)?;
++        let velocity_candidate = matches!(self.camera, crate::draw::reflection_dense::DisplayCamera::Velocity(_));
++        let proof = crate::draw::display_transmission::closed_future(runs, self.packet, velocity_candidate)?;
+         let mut epochs = proof.epochs().to_vec();
+         if crate::draw::alpha_current::enabled() {
+             let alpha = crate::draw::alpha_current::future(runs, self.packet)?;
+diff --git a/crates/victory-gpu/src/rr_history.rs b/crates/victory-gpu/src/rr_history.rs
+index d6a7b09..97868ab 100644
+--- a/crates/victory-gpu/src/rr_history.rs
++++ b/crates/victory-gpu/src/rr_history.rs
+@@ -107,6 +107,9 @@ impl Default for RrHistory {
+ }
+
+ impl RrHistory {
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn stream(&self) -> u64 { self.stream }
++
+     /// Invalidate committed and unsubmitted frames on fallback, cuts or stream changes.
+     pub fn invalidate(&self) {
+         self.state.lock().unwrap_or_else(|e| e.into_inner()).reset();
+@@ -250,13 +253,13 @@ pub(crate) fn begin<'a>(
+     })
+ }
+
+-fn rotation(camera: &RrCamera) -> Matrix {
++pub(crate) fn rotation(camera: &RrCamera) -> Matrix {
+     let mut result = camera.world_to_view;
+     result[12..15].fill(0.0);
+     result
+ }
+
+-fn multiply(a: Matrix, b: Matrix) -> Matrix {
++pub(crate) fn multiply(a: Matrix, b: Matrix) -> Matrix {
+     std::array::from_fn(|i| (0..4).map(|k| a[i / 4 * 4 + k] * b[k * 4 + i % 4]).sum())
+ }
+
+@@ -270,7 +273,7 @@ pub(crate) fn previous_clip(previous: &RrCamera, current_origin: [f32; 3]) -> Op
+     transform.iter().all(|v| v.is_finite()).then_some(transform)
+ }
+
+-fn inverse_perspective(p: Matrix) -> Option<Matrix> {
++pub(crate) fn inverse_perspective(p: Matrix) -> Option<Matrix> {
+     if p[0] <= 0.0
+         || p[5] <= 0.0
+         || p[14] <= 0.0
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index 6264c8a..59c3356 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -491,9 +491,16 @@ fn record(
+             .ok_or("NGX Ultra Performance feature creation failed")?;
+     }
+     let p = ngx.params;
+-    let camera = (preset.output == UHD.output)
+-        .then(|| list.rr_camera(info.render_size, info.jitter))
+-        .flatten();
++    #[cfg(feature = "diagnostics")]
++    let (camera, velocity_candidate) = if preset.output == UHD.output && is_owned(active.context) && list.rr_can_defer_camera() {
++        list.rr_native_camera(info.render_size, info.jitter,
++            active.rr_history.get_or_insert_with(external::RrHistory::default),
++            info.motion_scale, info.settings[4] & 0xff != 0)
++    } else {
++        ((preset.output == UHD.output).then(|| list.rr_camera(info.render_size, info.jitter)).flatten(), None)
++    };
++    #[cfg(not(feature = "diagnostics"))]
++    let camera = (preset.output == UHD.output).then(|| list.rr_camera(info.render_size, info.jitter)).flatten();
+     #[cfg(feature = "diagnostics")]
+     if is_owned(active.context) {
+         list.note_rr_background(
+@@ -592,6 +599,27 @@ fn record(
+     #[cfg(feature = "diagnostics")]
+     if is_owned(active.context) {
+         list.fidelityfx_output_lineage(output.cast_const(), &output_host);
++        list.rr_lighting_input(
++            (info.resources[0].resource.cast::<Object>().cast_const(), &color),
++            (output.cast_const(), &output_host),
++            f32::from_bits(info.settings[3]),
++        );
++    }
++    #[cfg(feature = "diagnostics")]
++    if display_selected && let Some(velocity) = velocity_candidate {
++        let inputs = [&color, &depth, &motion];
++        list.rr_display_velocity_candidate(
++            velocity,
++            std::array::from_fn(|i| (
++                info.resources[i].resource.cast::<Object>().cast_const(), inputs[i],
++            )),
++            (output.cast_const(), &output_host), dof_guide.as_ref(),
++            external::RrShadowFrame {
++                jitter: info.jitter, motion_scale: info.motion_scale,
++                frame_time_ms: f32::from_bits(info.settings[2]),
++                pre_exposure: f32::from_bits(info.settings[3]),
++            }, rr::record_display,
++        );
+     }
+     if let Some(camera) = camera {
+         #[cfg(feature = "diagnostics")]
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index 598e34e..0c48ea2 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -454,6 +454,34 @@ pub fn translate_current_probe(container: &[u8]) -> Result<HostShader, ShaderErr
+     translate_with_retries(|| translate_native(container, specialize_current_probe))
+ }
+
++/// Preserve native diffuse and caustic accumulation. The two secondary
++/// reflection outputs use their existing current-frame color and packing.
++pub fn translate_probe_diffuse_history(container: &[u8]) -> Result<HostShader, ShaderError> {
++    translate_with_retries(|| translate_native(container, specialize_probe_diffuse_history))
++}
++
++fn specialize_probe_diffuse_history(native: &mut NativeProgram) -> Result<(), ShaderError> {
++    let instructions = crate::gfx10::decode(&native.code)?;
++    let exact = |at, word, name| {
++        instructions.iter().any(|inst| inst.offset == at && inst.words == [word] && inst.name() == Some(name))
++    };
++    if !exact(0x14d8, 0x7c22_4480, "v_cmpx_lt_f32")
++        || !exact(0x14dc, 0xbf88_0054, "s_cbranch_execz")
++        || !exact(0x1630, 0xbefe_0315, "s_mov_b32")
++        || !exact(0x1848, 0x7c22_4480, "v_cmpx_lt_f32")
++        || !exact(0x184c, 0xbf88_0094, "s_cbranch_execz")
++        || !exact(0x1aa0, 0xbefe_0315, "s_mov_b32")
++    {
++        return Err(ShaderError::Malformed("probe diffuse history branch layout does not match"));
++    }
++    // Both original successors immediately restore exec_lo. Take the
++    // current-color successor without touching the diffuse blend, its
++    // rejection/age state, or the weight still used by native caustics.
++    native.code[0x14dc..0x14e0].copy_from_slice(&0xbf82_0054u32.to_le_bytes());
++    native.code[0x184c..0x1850].copy_from_slice(&0xbf82_0094u32.to_le_bytes());
++    Ok(())
++}
++
+ fn specialize_current_probe(native: &mut NativeProgram) -> Result<(), ShaderError> {
+     let instructions = crate::gfx10::decode(&native.code)?;
+     let exact = |at, word, name| {
+@@ -508,6 +536,42 @@ mod probe_current_tests {
+         assert!(current.dxil.len() < original.dxil.len());
+     }
+
++    #[test]
++    #[ignore = "requires the local title shader fixture and no GPU"]
++    fn diffuse_probe_history_preserves_diffuse_gathers_and_every_native_store() {
++        let path = std::env::var_os("VICTORY_RR_PROBE_FIXTURE").expect("local title shader fixture");
++        let bytes = std::fs::read(path).unwrap();
++        let container = Container::parse(&bytes).unwrap();
++        let part = container.part(FourCC::DXIL).or(container.part(FourCC::ACCC)).unwrap();
++        let mut native = crate::native_programs(part.data).unwrap().pop().unwrap();
++        let stock = crate::gfx10::decode(&native.code).unwrap();
++        specialize_probe_diffuse_history(&mut native).unwrap();
++        let specialized = crate::gfx10::decode(&native.code).unwrap();
++        let stores = |ops: &[crate::gfx10::Instruction]| ops.iter()
++            .filter_map(|inst| (inst.name() == Some("image_store")).then_some(inst.offset))
++            .collect::<Vec<_>>();
++        assert_eq!(stores(&stock), stores(&specialized));
++        for at in [0x57c, 0x584, 0x58c, 0x594, 0xdec, 0xdf4, 0xdfc, 0xe04, 0xf9c] {
++            assert!(specialized.iter().any(|inst| inst.offset == at && inst.name() == Some("image_gather4_lz")));
++        }
++        assert!(specialized.iter().any(|inst| inst.offset == 0x1c28 && inst.name() == Some("image_load")));
++        for at in [0x1508, 0x1510, 0x1518, 0x1874, 0x187c, 0x1884] {
++            assert!(stock.iter().any(|inst| inst.offset == at));
++            assert!(!specialized.iter().any(|inst| inst.offset == at));
++        }
++        let original = translate(&bytes).unwrap();
++        let current = translate_probe_diffuse_history(&bytes).unwrap();
++        assert_eq!(current.stage, original.stage);
++        assert_eq!(current.user_data, original.user_data);
++        assert_eq!(current.root_cbvs, original.root_cbvs);
++        assert_eq!(current.root_srvs, original.root_srvs);
++        assert_eq!(current.root_uavs, original.root_uavs);
++        assert_eq!(current.root_indexed_views, original.root_indexed_views);
++        assert_eq!(current.half_views, original.half_views);
++        assert!(original.static_samplers.starts_with(&current.static_samplers));
++        assert!(current.dxil.len() < original.dxil.len());
++    }
++
+     #[test]
+     fn current_probe_zero_caustic_weight_preserves_each_quantized_channel() {
+         for (maximum, reciprocal) in [(63u32, f32::from_bits(0x3c82_0821)), (31, f32::from_bits(0x3d04_2108))] {
