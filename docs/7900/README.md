@@ -8,10 +8,11 @@ readback capture, and direct 4K DLSS. The patches are
 GPL-3.0-or-later like the renderer. The kit provides source, settings, and
 input hashes. Use your own game files and build the runtime locally.
 
-## Candidate default Ray Reconstruction preset
+## Default Ray Reconstruction preset
 
-The Series S profile requests DLSS Ray Reconstruction from startup in
-Ultra Performance mode with **1280×720** input and **3840×2160** output.
+The Series S profile enables DLSS Ray Reconstruction automatically on
+qualifying frames in Ultra Performance mode with **1280×720** input and
+**3840×2160** output.
 The game’s native global illumination (GI) remains active. The renderer
 supplies the scene, depth, motion, material and reflection guides and
 preserves the original wavy glass. The title applies its later
@@ -20,8 +21,8 @@ postprocessing and composites the UI at presentation.
 For eligible frames, the renderer commits RR before the native filter
 cutoff and replaces four reflection filter passes. When the guides or
 glass data fail to qualify in time, the renderer keeps stock Super
-Resolution and the native filters for that frame. This also covers
-the first intro upscales observed in the hardware replay.
+Resolution and the native filters for that frame. Startup can use
+Super Resolution until the required frame data qualifies.
 [Native GI and glass verification](ray-reconstruction.md#native-gi-with-original-glass) ·
 [Startup investigation](ray-reconstruction.md#continuous-startup-investigation)
 
@@ -109,9 +110,11 @@ and that patch at the source checkout and patch steps in the
 are built and installed locally. See also the
 [indexed wineserver setup](../runtime/indexed-server/README.md).
 
-Set `PROTON_WINE`, `TITLE_EXE`, `WINEPREFIX`, `VICTORY_DXC`,
-`VICTORY_DXIL`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` to your own
-paths. Use a separate shader cache and save directory for the new renderer.
+Set `PROTON_WINE` to your Proton Wine executable and `TITLE_EXE` to your
+title executable. Export `WINEPREFIX` as a Linux path. Export
+`VICTORY_DXC`, `VICTORY_DXIL`, `VICTORY_CACHE_DIR` and
+`VICTORY_DATA_DIR` as paths visible to the Windows process. Use a separate
+shader cache and save directory for the new renderer.
 The replay used a read-only game mount, an isolated offline runtime, and a
 fixed stop time. The settings disable the renderer watchdog, so use a time
 limit for unattended tests.
@@ -150,8 +153,9 @@ export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
   run "$TITLE_EXE" --execute --console series-s
 ```
 
-This launches the candidate default 720p-to-4K Ray Reconstruction preset with
-ray tracing and native GI active. It needs no timed benchmark or frame capture trigger.
+This launches the default 720p-to-4K Ray Reconstruction preset with
+ray tracing and native GI active. Ordinary play needs no benchmark or
+frame capture trigger.
 For an explicit Super Resolution launch, start in a fresh shell,
 `export VICTORY_RR_AUTO=0` before sourcing `rt-speed.env.sh`, and
 point `src` at the desired renderer directory in the command above. The

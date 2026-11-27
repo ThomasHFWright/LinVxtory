@@ -4,17 +4,18 @@ LinVxtory develops VIctory for **NVIDIA GPUs on Linux through Wine and
 Proton**. It provides a source-locked renderer build, runtime setup and
 repeatable gameplay checks.
 
-## Candidate default 4K preset
+## Default 4K preset
 
-The Series S preset requests **NVIDIA DLSS Ray Reconstruction** from
-startup, with **1280×720** input and **3840×2160** output in Ultra
-Performance mode. Ray tracing and the game’s native global illumination
-(GI) run, and the renderer composites the title’s UI at presentation.
+The Series S preset enables **NVIDIA DLSS Ray Reconstruction**
+automatically on qualifying frames, with **1280×720** input and
+**3840×2160** output in Ultra Performance mode. Ray tracing and the game’s
+native global illumination (GI) run, and the renderer composites the
+title’s UI at presentation.
 
 On eligible frames, RR replaces four native reflection filter passes
 and preserves the game’s original wavy glass. Frames that miss the
-filter cutoff use stock Super Resolution with the native filters. The
-first intro upscales in the hardware replay still used this fallback.
+filter cutoff, including during startup, use stock Super Resolution
+with the native filters.
 [Native lighting and glass verification](docs/7900/ray-reconstruction.md#native-gi-with-original-glass) ·
 [Startup investigation](docs/7900/ray-reconstruction.md#continuous-startup-investigation)
 
