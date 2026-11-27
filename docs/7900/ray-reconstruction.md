@@ -13,10 +13,10 @@ and composites the UI. SR remains the control and the fallback.
 On the RTX 5090, accepted 4K RR frames preserved the game’s wavy glass
 and bypassed five original filter bodies. A paired GI shader retained
 the diffuse and caustic accumulation that feeds scene lighting. The
-stock-vs-RR timing pair after this lighting fix measured 9.01 vs 9.11
-median FPS and 184.08 vs 118.60 ms p95. The follow-up build verifies
-stock SR recovery when the early replacement cannot commit.
-[GPU filter evidence](#diffuse-history-replacement) · [Same-build timing](#capture-free-timing-after-the-lighting-and-camera-changes) · [Stock fallback](#stock-fallback-at-the-native-cutoff)
+stock-vs-RR timing pair with the cutoff guard measured 8.54 vs 8.75
+median FPS and 271.46 vs 202.39 ms p95. Stock SR recovered on every
+accepted frame where the early replacement could not commit.
+[GPU filter evidence](#diffuse-history-replacement) · [Same-build timing](#capture-free-timing-with-the-stock-fallback-guard) · [Stock fallback](#stock-fallback-at-the-native-cutoff)
 
 ## Graph investigation
 
@@ -918,3 +918,29 @@ shelf. Nearby frames around the shelf showed no large duplicate edges.
 The two replays reached different character and door poses, so this
 sample cannot estimate a matched disocclusion error. Pipeline first-use
 work overlapped the capture window. Timing comes from a separate run.
+
+### Capture-free timing with the stock fallback guard
+
+The same executable ran both arms on the physical AOC with the same
+Series S checkpoint, stationary cell pose, save/cache seed and 720p-to-4K
+profile. Each run excluded loading and the three-second guide warmup
+from its 55-second measurement. Capture, motion and pass diagnostics
+stayed outside the measurement. Before each measured arm in the timing
+pair, the GPU reported P0 at 2,977 MHz and about 152 W.
+
+| Arm | Median FPS | p95 Present interval | Accepted FPS over 55 s | Exact full RR / SR / unknown |
+| --- | ---: | ---: | ---: | ---: |
+| Stock SR repeat | 8.54 | 271.46 ms | 7.02 | 0 / 386 / 0 |
+| RR enabled | 8.75 | 202.39 ms | 7.93 | 434 / 2 / 0 |
+
+All 434 RR Presents used all five filter replacements and the original
+optical layer. At 2651 the exact closed packet was unavailable, and at
+2652 the previous camera was unavailable. Both frames presented stock
+SR. This pair measured 2.4% higher median FPS and a 25.4% lower p95 in
+the opt-in arm. The counts include its two fallback frames.
+
+The first SR-only control on the same pin measured 4.57 median FPS and
+361.15 ms p95. The RR launch already presented stock frames faster
+before the trigger was armed. The size and cause of this run-to-run
+variation remain unresolved. The table uses the repeated SR control
+and describes this tested cell and pair.
