@@ -217,3 +217,38 @@ UAV bindings are potential writes. The trace does not establish per-pixel
 execution, subresource coverage, all GPU-dependent bindless reads, or GPU
 completion. Stop following a producer chain at a truncation or unknown
 version. Run timing comparisons with tracing disabled.
+
+### Guide bindings in that frame
+
+The opaque reflection prepass (`7168dd781ca7efb9`) read the following
+resources after the tiled weathering/decal pass. Offsets are dwords from
+the bound descriptor table for this shader. The typed view matters when
+decoding color and when selecting the depth plane.
+
+| Candidate | Table slot + offset | Backing and typed SRV |
+| --- | --- | --- |
+| Base color and material selector | 0 + 568 | RGBA8 typeless, sRGB view, 1280×720 |
+| Packed normal and roughness | 0 + 920 | RGBA8 UNORM, 1280×720 |
+| Encoded specular material | 0 + 664 | RGBA8 UNORM, 1280×720 |
+| Opaque motion | 0 + 528 | RG16F, 1280×720 |
+| Opaque depth | 0 + 752 | R32G8X24 typeless, R32_FLOAT_X8X24_TYPELESS view, 1280×720 |
+
+Opaque reflection distance uses a **640×360 RG16F** texture. The prepass
+binds it at UAV 1 + 120, the ray tracer (`6d7fe7745ab9c6d8`) at UAV
+1 + 144, and screen-space resolve at SRV 1 + 64. A second, separate
+allocation serves the alpha path. Both the primary depth and motion
+resources receive later updates before the final upscale.
+
+The opaque temporal and bilateral chain updates a packed R32_UINT
+resource. An alias copy supplies an RGB9E5 view to standard tiled PBR
+at SRV 0 + 456. A separate alpha temporal resolve supplies a packed
+product to a later alpha draw. Both feed the backing that eventually
+reaches the upscaler. A global dispatch skip would leave missing lighting
+inputs as well as stale history.
+
+The SDK also supports retaining aligned pre-upscale depth of field by
+supplying a signed, single-channel FP16 luminance difference between the
+blurred and pre-blur colors. The 720p graph identifies a pre-blur source
+and the immediate post-blur SR input. This path still requires checked
+same-frame captures and validation on the active model.
+[NVIDIA RR guide, §3.4.13](https://github.com/NVIDIA/DLSS/blob/v310.9.16/doc/DLSS-RR%20Integration%20Guide.pdf)
