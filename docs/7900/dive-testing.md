@@ -73,10 +73,10 @@ and whether SR fallback occurred during the interval. A feature creation
 or an offscreen evaluation alone only verifies that stage.
 
 Enable `VICTORY_FRAME_LOG=1` for timing arms. Supply UTC boundaries for
-the visually verified playable segment to the [Present timing tool](present-window.py).
+the visually verified playable segment to the [Present timing tool](present-window.py.txt).
 
 ```sh
-python3 docs/7900/present-window.py title.log "$PLAY_START_UTC" "$PLAY_END_UTC"
+python3 docs/7900/present-window.py.txt title.log "$PLAY_START_UTC" "$PLAY_END_UTC"
 ```
 
 The tool selects intervals by their end timestamp, including both
