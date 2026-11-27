@@ -206,7 +206,12 @@ game images local.
 
 ## Test the native 4K upscaler slot on the AOC
 
-On the source tree from the HDR pair build, apply the optional [native
+From the LinVxtory research branch, `sh build.sh --rr ../linvxtory-rr`
+reconstructs and builds the native output test in its own directory.
+The default `sh build.sh ../linvxtory-sr` builds the published SR control.
+Each mode checks the resulting renderer tree before compiling.
+
+For a manual build on the source tree from the HDR pair build, apply the optional [native
 display overlay](rr-native-display.patch.txt). The diagnostics build can
 select a single 4K provider on the title queue before the output's later
 consumers. It requires a precreated RR feature, a matching opaque
