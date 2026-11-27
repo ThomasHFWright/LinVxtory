@@ -685,3 +685,4 @@ retired both native opaque post-filters with 104,352 compute invocations
 each. Sequence 16753 accepted the refreshed packed history from that
 same backing. The replay used capture and scripted camera motion, so
 its frame times are unsuitable for comparison against the SR control.
+[Combined reproduction](dive-testing.md#reproduce-optical-rr-with-the-opaque-post-filters-bypassed)

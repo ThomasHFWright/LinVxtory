@@ -276,3 +276,47 @@ reports 32 compute invocations for the indirect clear alone when the
 target shader executes zero groups. The opaque and alpha temporal
 shaders still run in this test. After the burst, verify stock SR and
 both native post-filters resume. Use a separate replay for timing.
+
+## Reproduce optical RR with the opaque post-filters bypassed
+
+Start from the opaque-cut tree above in a separate checkout. Apply the
+[combined optical overlay](rr-optical-cut.patch.txt) and rebuild. The public
+build supplies the `cap N` channel used by the inkVI-dive receipt helper.
+
+```sh
+test "$(git write-tree)" = 422ada24652eb1444303ac1d8c91157d66a6a61e
+git apply --index "$kit/rr-optical-cut.patch.txt"
+test "$(git write-tree)" = 775e0c7d5be42de4df8d63944f0f062cb9e9bf24
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Use the same offline title, pinned SDK and windowed 4K profile. In a fresh
+launch environment, use the capture paths and provider setup above. Replace
+the five-Present trigger with the continuous window and enable the optical
+layer and opaque current-frame path. Leave the experimental alpha and GI
+variants off for this replay.
+
+```sh
+unset VICTORY_RR_STAGE_TRIGGER VICTORY_RR_DISPLAY_FRAME VICTORY_PASS_STATS_FRAME
+unset VICTORY_RR_EXPERIMENTAL_ALPHA_KERNEL VICTORY_RR_PROBE_CURRENT
+export VICTORY_RR_EARLY_SOURCE=1 VICTORY_RR_ATOMIC_CUT=1
+export VICTORY_RR_REFLECTION_CURRENT_KERNELS=1 VICTORY_RR_NATIVE_TRANSMISSION_DISPLAY=1
+export VICTORY_RR_PRESENT_LINEAGE=1 VICTORY_RR_PRESENT_LINEAGE_DIAGNOSTICS=1
+export VICTORY_RR_PERF_TRIGGER='Z:\path\to\run\rr-optical-trigger'
+```
+
+Leave the trigger file absent at startup. Request two stock frames and wait
+for their receipts when the cell is playable. From the host, create
+`rr-optical-trigger` while facing the pane. After the three-second warmup,
+request a new `cap 8` burst. The window stays active for 55 seconds after
+warmup. A replay with capture or scripted motion only supplies quality and
+provider evidence.
+
+Match the cutoff's `sequence` and `begun` to the chosen slot's
+`source_submit` and `begun`. Require feature 13, zero SR GPU evaluations,
+`opaque_postfilters_cut=true`, and `native_transmission_overlay=true`.
+Match the chosen submission, output serial and fence to its retirement.
+Check exact DXGI attribution separately before assigning a provider to a
+captured frame. Keep the PNGs and title logs local.
+[Combined hardware results](ray-reconstruction.md#optical-input-and-opaque-bypass-on-the-same-frames)
