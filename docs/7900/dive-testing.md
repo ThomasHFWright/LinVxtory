@@ -364,3 +364,33 @@ collect the next 55 seconds after the three-second warmup. Report
 median FPS, p95 Present interval, and RR, SR, unknown and replacement
 route counts. A mixed window measures the enabled configuration
 including its fallback costs. Report it as mixed.
+
+## Check the deferred camera and diffuse-history GI replacement
+
+Apply the [camera and GI overlay](rr-camera-stable-gi.patch.txt) on the
+verified full-native source tree above.
+
+```sh
+test "$(git write-tree)" = 8cabc54072e7ff76e4487e33021b3f778c878bd7
+git apply --index "$kit/rr-camera-stable-gi.patch.txt"
+test "$(git write-tree)" = 55bb577c0a2fb158ecdc6edd38e2df1b10390b78
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+export VICTORY_RR_DEFER_CAMERA_PROJECTION=1
+export VICTORY_RR_PROBE_CURRENT=1 VICTORY_RR_PROBE_DIFFUSE_HISTORY=1
+```
+
+Use the earlier five-Present request-only capture procedure. Join each
+accepted RR Present to its original native counters and the retired
+`probe_diffuse_history_kernel` query. The original probe kernel must
+show the calibrated floor. The other replacement and optical receipts
+still apply. `VICTORY_RR_LIGHT_TAPS` optionally points at an existing
+private Windows directory for rail-matched GI and 720p pre-NGX HDR
+samples during this bounded stage. Keep all samples and captures local.
+
+Both probe switches select the replacement that retains the diffuse
+and caustic accumulation. The older current-only experiment uses
+`VICTORY_RR_PROBE_CURRENT` alone. For capture-free timing clear all
+capture, tap, per-pass query, camera diagnostics and stage flags.
+Retain the new switches in the RR arm, then follow the same-source SR
+control and matched 55-second procedure above.

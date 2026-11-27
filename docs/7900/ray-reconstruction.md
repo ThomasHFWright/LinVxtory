@@ -842,3 +842,26 @@ matched all 59 deferred camera confirmations to their actual opaque
 source, FFX submission, and accepted RR Present. This camera audit
 used native GI to isolate continuity. Lighting and timing for the
 combined build require their own replays.
+
+### Diffuse-history replacement
+
+The new paired GI shader keeps the primary diffuse and caustic
+accumulation that feeds title lighting. It removes six previous-frame
+reflection gathers, preserves the original store sites, and bypasses
+the original full GI shader on qualifying RR frames.
+
+In the bounded stationary hardware replay, four consecutive accepted
+RR Presents (2013–2016) used the optical layer and all paired
+replacements. The original GI kernel returned the calibrated 32 raw
+invocations per frame. The paired diffuse-history kernel returned
+921,632. The original opaque temporal, bilateral, history-update
+and alpha temporal bodies were also at the calibrated floor.
+
+At the sampled left wall, far wall and bunk, the median adjacent
+packed GI luma change was 0.91%, 0.66% and 0.92%. The earlier
+current-only replay measured 20.76%, 12.54% and 5.98% in those patches.
+The hybrid source input still varied by up to 21.94% across the
+indoor sites, while the packed result stayed within 1.86%. These
+short bounded samples show that the retained accumulation works.
+The longer visual check and capture-free matched timing are separate.
+[Reproduction](dive-testing.md#check-the-deferred-camera-and-diffuse-history-gi-replacement)
