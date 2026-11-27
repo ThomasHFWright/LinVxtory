@@ -695,3 +695,32 @@ The late optical evaluation still ran for request 1881 with the native
 filters enabled. The proposed alpha dispatch uses the renderer's
 existing deferred constant-buffer fill, shared with the original
 shader. Its GPU dispatch and timing are still under test.
+
+### Presented RR with the opaque and alpha reflection filters bypassed
+
+The next build bound both alpha PSOs to the same native deferred
+constant buffer. Four consecutive 4K frames on the AOC used one RR
+evaluation with the original glass data and zero SR evaluations in the
+selected slots. The receipt follows the exact HDR output through native
+compositing and dithering to an accepted DXGI Present.
+
+| Present | Opaque source fence | Alpha shader fence | RR fence | Present fence |
+| ---: | ---: | ---: | ---: | ---: |
+| 1861 | 11214 | 11218 | 11219 | 11221 |
+| 1862 | 11231 | 11235 | 11236 | 11238 |
+| 1863 | 11248 | 11252 | 11253 | 11255 |
+| 1864 | 11265 | 11269 | 11270 | 11272 |
+
+All four original shaders reported 32 compute invocations apiece in
+each paired frame. The calibrated indirect-argument clear accounted
+for those counts, so the stock opaque temporal, bilateral,
+history-update and alpha temporal shaders executed zero workgroups.
+Current-frame packing still ran. Its counters read 91,936–95,008 for
+opaque and 326,176–327,712 for alpha, including the indirect overhead.
+The first RR frame reset history, and the next three reused it.
+
+At Present 1865 the required alpha background witness was unavailable
+and the title presented stock SR. Both original opaque post-filters
+ran during recovery, and their exact packed history became reusable.
+GI was stock for this test. The fixed-count replay used GPU queries
+and capture, so the timing comparison needs separate matched runs.
