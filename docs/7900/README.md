@@ -116,6 +116,23 @@ Narrower enhanced-barrier scopes also gave similar or slower timings
 in the fixture. The preset leaves ordered batching disabled.
 [Ordered batching implementation](https://github.com/avatarmanz/VIctory-7900XTX/pull/438)
 
+### DLSS Super Resolution on Proton
+
+A private trial adapted the DLSS replacement to the Series S upscaler call.
+Both replays used the same executable, cache seed, driver, 720p render at
+1080p output, 53 ray-tracing builder pipelines, and ambient substitute off.
+DLSS recorded at least 512 replacements with no stock fallback. The face
+rendered in the intro and the cell window and ponytail were visible in the
+sampled frames.
+
+The +240 to +295 second window measured **7.28 FPS with FidelityFX and
+7.39 FPS with DLSS**, over 379 and 388 Present intervals respectively.
+The +260 to +295 second window measured **7.37 and 7.28 FPS**. In the
+later +300 to +350 second window, 95th-percentile frame time increased
+from **335 to 744 ms**. This single pair shows that Super Resolution can
+run on this Linux setup. A repeatable speedup remains unverified, so the
+published build keeps FidelityFX. [Donor DLSS experiment](https://github.com/avatarmanz/VIctory-7900XTX/pull/203)
+
 ## Earlier ray-traced measurements
 
 The highest observed median in the same +240 to +295 second cell window
