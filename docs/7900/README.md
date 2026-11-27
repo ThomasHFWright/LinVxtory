@@ -97,6 +97,25 @@ A 50 MiB transfer to VRAM took about 0.98 ms. These results favor VRAM for
 repeated dense shader reads. Sparse read and direct-write experiments
 remain separate from the default memory path.
 
+### Other performance trials
+
+Lowering the minimum GPU buffer copy size from 1 MiB to 64 KiB reached
+9.50 median FPS in an exploratory run. The repeat used a fixed 7,373 MiB
+cap in both arms. The median improved from **7.62 to 9.19 FPS**, while
+the same 55-second window contained **411 versus 367 Presents**. The
+95th-percentile frame time rose from **188 to 361 ms**. Both runs
+completed. The control was mirrored to a desktop window during part of
+the timed interval using the replay's existing captures. The published
+preset retains the 1 MiB minimum.
+
+Ordered indirect batching reduced clamp passes from about **1,440 to 133
+per frame**, while the replay median fell from **8.83 to 5.19 FPS**. In
+a separate 3,200-draw RTX 5090 fixture, equal-sized batches took
+2.06 ms with the legacy path and 2.41 ms with the ordered kernel.
+Narrower enhanced-barrier scopes also gave similar or slower timings
+in the fixture. The preset leaves ordered batching disabled.
+[Ordered batching implementation](https://github.com/avatarmanz/VIctory-7900XTX/pull/438)
+
 ## Earlier ray-traced measurements
 
 The highest observed median in the same +240 to +295 second cell window
