@@ -9,20 +9,17 @@ where we integrated compatibility fixes and tested them on Linux hardware.
 
 ## Current status
 
-**8.89 median FPS on `main`** in the warm offline Series S cell replay on
-CachyOS and RTX 5090. The preset uses **1080p with ray tracing active** and
-the ambient substitute off. Facial skin, the ponytail, the wire window and
-room lighting were visible in both arms. The **20 FPS** target remains open.
-[Current replay and build](docs/7900/README.md#findings)
-
-**9.36 median FPS** is the highest comparable result, from one earlier warm
-ray-traced control using the same timed cell window. The published preset
-uses the capture improvement that held up in two matched comparisons.
-[Best recorded run and comparison details](docs/7900/README.md#earlier-ray-traced-measurements)
+The current build runs **Series S at 720p internally and reconstructs
+directly to 4K with NVIDIA DLSS Super Resolution**. The offline cell replay
+on CachyOS and an RTX 5090 measured **10.77 median FPS** with ray tracing
+active and the ambient substitute off. The face, ponytail, wire window and
+room lighting were visible. This is the new baseline for 4K tests. The
+**20 FPS** target remains open.
+[4K replay](docs/7900/README.md#current-4k-baseline) · [Build and launch](docs/7900/README.md#build-and-launch)
 
 ### Biggest measured improvements
 
-- **GPU readback capture.** The current build started at 8.14 FPS with
+- **GPU readback capture.** The earlier 1080p build ran at 8.14 FPS with
   capture off. Four 8 MiB slots reduced copyback from **19.35 to 16.70 ms
   per frame** and fetch wait from **10.30 to 8.80 ms**. [Capture results](docs/7900/README.md#findings)
 - **More outstanding command lists.** Increasing the limit from 256 to
@@ -43,24 +40,29 @@ the inputs, crashes and remaining rendering defects alongside the results.
 
 The build uses the pinned 7900XTX renderer with LinVxtory's Linux changes,
 the inkVI-derived face and hair fixes, and the tested 8 MiB GPU readback
-capture. The current preset runs the Series S profile at 1080p with ray
-tracing active. [Build, launch and source credits](docs/7900/README.md)
+capture. The preset selects Series S with DLSS Super Resolution at 4K and
+ray tracing active. [Build, launch and source credits](docs/7900/README.md)
 
 ## Build the renderer
 
-With the Rust toolchain, cached Cargo dependencies and MSVC SDK configured,
-run this from the LinVxtory checkout.
+Set up the Rust toolchain, cached Cargo dependencies, the MSVC SDK and the
+local NVIDIA DLSS SDK. Run this from the LinVxtory checkout.
 
 ```sh
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
 Use a new output path when upgrading. The wrapper fetches the pinned
-renderer, applies the Linux overlay and builds the same diagnostic
-configuration used in the replay. Supply your own game files at runtime.
+renderer, applies the Linux and 4K DLSS patches, and builds the same
+diagnostic configuration used in the replay. Supply your own game files
+and runtime libraries.
 [Launch instructions](docs/7900/README.md#build-and-launch) · [Proton runtime setup](docs/linux-runtime.md)
 
 ## Results history
+
+- **1080p ray-traced baseline.** The prior published preset reached **8.89 median FPS**
+  in the fixed offline cell replay, up from **8.14 FPS** with its GPU readback capture disabled.
+  A separate warm control reached **9.36 FPS**. [1080p results](docs/7900/README.md#findings)
 
 - **Ray-tracing bring-up and preview.** An early RTX 5090 build peaked at **1.3 FPS**
   after entering the world and then stalled. The first stable warm preview reached

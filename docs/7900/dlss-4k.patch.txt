@@ -1,0 +1,2107 @@
+diff --git a/README.md b/README.md
+index 178d9b36e2565271946ec85c2be97490b57da1de..df1e426c85ff374f74a375f8a7bb59eddb218f2f 100644
+--- a/README.md
++++ b/README.md
+@@ -130,6 +130,11 @@ The log reports the provider at context creation and the actual input and
+ output sizes at the first successful temporal dispatch. The title profile
+ and PC FidelityFX bridge were ported from [DexNom/VIctory](https://github.com/DexNom/VIctory/commit/ab34a8b21477c94da2a6cf07249138e8bc84602e).
+
++For Series S, `VICTORY_PRESENT_4K=1` makes the host composite the 1080p scene
++and UI planes into a 3840×2160 swap chain. With the stock Series S profile,
++FidelityFX still reconstructs 720p into 1080p. The final composite uses
++bilinear sampling. Single-plane frames use their source size.
++
+ On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
+ high-performance adapter with Shader Model 6.6. The runtime logs its adapter
+ name, PCI vendor and device IDs, and dedicated VRAM. Set
+diff --git a/apps/victory/Cargo.toml b/apps/victory/Cargo.toml
+index 8e28e7ccb1c7fc875222d4c7eb28871b483280c2..269c2d2249a03ae4ed76da6eb1c5e467674440b7 100644
+--- a/apps/victory/Cargo.toml
++++ b/apps/victory/Cargo.toml
+@@ -25,6 +25,7 @@ tracing.workspace = true
+ tempfile.workspace = true
+
+ [features]
++dlss = ["victory-hle/dlss", "diagnostics"]
+ # Debug-level logs and the debugging switches (frame capture, stack dumps,
+ # the host debug layer, scripted keys). Off in a plain release build.
+ diagnostics = [
+diff --git a/apps/victory/src/run.rs b/apps/victory/src/run.rs
+index e4d55bf2fbaa4b1f3645f00f4870847abf1612d6..41b1b4bd50ffdedd0d2f72c1ecc5ec7055c00751 100644
+--- a/apps/victory/src/run.rs
++++ b/apps/victory/src/run.rs
+@@ -58,6 +58,14 @@ pub fn run(
+     victory_hle::modules::lifecycle::wait_for_previous();
+     let cfg = victory_core::Config::load()?;
+     let fsr = fsr_4k::FsrPreset::requested()?;
++    let direct_dlss_4k = cfg!(feature = "dlss") && execute
++        && std::env::var_os("VICTORY_FFX_DLSS").is_some_and(|v| v == "4k");
++    if direct_dlss_4k {
++        anyhow::ensure!(
++            matches!(console, Console::SeriesS) && fsr.is_none(),
++            "DLSS 4K requires Series S and its console FidelityFX import ABI"
++        );
++    }
+     let original = std::fs::read(exe).with_context(|| format!("reading {}", exe.display()))?;
+     let mut prepared = victory_loader::prepare(&original)?;
+     let hash = prepared.original_hash.to_hex();
+@@ -168,6 +176,10 @@ pub fn run(
+         inner: &resolver,
+         dlls: &dlls,
+     };
++    #[cfg(feature = "diagnostics")]
++    let with_dlls = victory_hle::modules::fidelityfx::Observer::new(
++        &with_dlls, execute && matches!(console, Console::SeriesS) && fsr.is_none(),
++    );
+     let show = |name: &str, report: BindReport| {
+         println!(
+             "bound          {name}: {} hle, {} host, {} title, {} missing",
+@@ -185,6 +197,13 @@ pub fn run(
+     }
+     let exe_name = exe.file_name().unwrap_or_default().to_string_lossy();
+     show(&exe_name, image.bind_imports(&with_dlls, policy)?);
++    #[cfg(feature = "dlss")]
++    if direct_dlss_4k {
++        anyhow::ensure!(
++            with_dlls.bound_stock_upscaler(),
++            "DLSS 4K requires the title's named FidelityFX upscaler and jitter imports"
++        );
++    }
+     if execute {
+         let size = image.info().size_of_image as usize;
+         // SAFETY: the image stays mapped, and nothing of it has run yet.
+@@ -244,7 +263,12 @@ pub fn run(
+     if execute && fsr.is_none() {
+         let size = image.info().size_of_image as usize;
+         // SAFETY: the image stays mapped and nothing of it has run yet.
+-        unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
++        if direct_dlss_4k {
++            unsafe { victory_loader::resolution::apply_series_s_4k(image.base(), size) }
++                .map_err(|(site, state)| anyhow::anyhow!("DLSS 4K display profile failed at {site}: {state:?}"))?;
++        } else {
++            unsafe { victory_loader::resolution::apply_asked(image.base(), size) };
++        }
+     }
+     if !execute {
+         println!("not executing (pass --execute to start the title)");
+@@ -476,6 +500,11 @@ impl LateDlls {
+                     inner: &old,
+                     dlls: &new,
+                 };
++                #[cfg(feature = "dlss")]
++                let resolver = victory_hle::modules::fidelityfx::Observer::new(
++                    &resolver,
++                    victory_hle::modules::fidelityfx::Observer::bound_uhd(),
++                );
+                 for (name, dll) in &new {
+                     println!(
+                         "title dll      {name} at {:#x} (loaded by the title)",
+diff --git a/crates/victory-gpu/src/compose.rs b/crates/victory-gpu/src/compose.rs
+index 6673488a232272ad7882ee5637f1a4b2f9f78817..6a70273f84578f57d34d4b6b42b4a219ed2e864c 100644
+--- a/crates/victory-gpu/src/compose.rs
++++ b/crates/victory-gpu/src/compose.rs
+@@ -40,6 +40,16 @@ pub(crate) fn on() -> bool {
+     *ON.get_or_init(|| std::env::var_os("VICTORY_PLANES").is_none_or(|v| v != "0"))
+ }
+
++/// Only the compositor can scale. The single-plane fallback copies the source
++/// directly into the back buffer and needs a matching extent.
++pub(crate) fn output_extent(source: (u32, u32), compositing: bool, present_4k: bool) -> (u32, u32) {
++    if present_4k && compositing && source == (1920, 1080) {
++        (3840, 2160)
++    } else {
++        source
++    }
++}
++
+ pub(crate) struct Composer {
+     root: ID3D12RootSignature,
+     pso: ID3D12PipelineState,
+@@ -196,6 +206,16 @@ pub(crate) fn view(d: &D3D12_RESOURCE_DESC) -> Option<DXGI_FORMAT> {
+ mod tests {
+     use super::*;
+
++    #[test]
++    fn opt_in_4k_scales_only_the_1080p_two_plane_composite() {
++        let hd = (1920, 1080);
++        assert_eq!(output_extent(hd, true, true), (3840, 2160));
++        assert_eq!(output_extent(hd, true, false), hd);
++        assert_eq!(output_extent(hd, false, true), hd);
++        assert_eq!(output_extent((1280, 720), true, true), (1280, 720));
++        assert_eq!(output_extent((3840, 2160), true, true), (3840, 2160));
++    }
++
+     #[test]
+     fn composes_scaled_premultiplied_plane_on_gpu() {
+         let Some(host) = crate::host::host() else {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index b4fcf304c5c9ee3387ddb672891635a82e995d66..83c3c091a38d38fffd6fe765ceaf49704b1f4da5 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -10134,7 +10134,15 @@ impl Host {
+             };
+             format
+         };
+-        let (width, height) = (desc.Width as u32, desc.Height);
++        // VICTORY_PRESENT_4K scales the final 1080p composite into 4K swap-chain buffers.
++        static PRESENT_4K: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let present_4k = *PRESENT_4K
++            .get_or_init(|| std::env::var_os("VICTORY_PRESENT_4K").is_some_and(|v| v == "1"));
++        let (width, height) = crate::compose::output_extent(
++            (desc.Width as u32, desc.Height),
++            planes.is_some(),
++            present_4k,
++        );
+         let mut presenter = self.presenter.lock().unwrap_or_else(|e| e.into_inner());
+         if presenter.is_none() {
+             *presenter = match self.presenter(width, height, format) {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index d306875daeab54e21510ecd5e58915ca07f1c722..89d5fe86bd3a1c8a902ce7acbe42579107f01c48 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2901,8 +2901,13 @@ pub(crate) extern "system" fn create_committed(
+     };
+     tracing::debug!(
+         dimension = desc.dimension,
++        width = desc.width,
++        height = desc.height,
++        format = desc.format,
+         size = info.size,
++        alignment = info.alignment,
+         heap = heap.kind,
++        heap_flags = format_args!("{heap_flags:#x}"),
+         "committed resource"
+     );
+     let memory = match Memory::for_resource(info, heap.kind) {
+diff --git a/crates/victory-hle/Cargo.toml b/crates/victory-hle/Cargo.toml
+index 65873ca804c3b8f60e285305ea1fe7afed0eeaad..83677d2eedf39465d29241acd22997ae0e22ec79 100644
+--- a/crates/victory-hle/Cargo.toml
++++ b/crates/victory-hle/Cargo.toml
+@@ -46,6 +46,7 @@ windows-core = { workspace = true, optional = true }
+ tempfile.workspace = true
+
+ [features]
++dlss = []
+ # Debugging switches (scripted keys and the like).
+ diagnostics = [
+     "victory-gpu/diagnostics", "victory-loader/diagnostics", "dep:windows-core",
+diff --git a/crates/victory-hle/build.rs b/crates/victory-hle/build.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..42cb6c5f717ce7a27f2b66e2ead7890d88160dc6
+--- /dev/null
++++ b/crates/victory-hle/build.rs
+@@ -0,0 +1,18 @@
++fn main() {
++    if std::env::var_os("CARGO_FEATURE_DLSS").is_none()
++        || std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
++    {
++        return;
++    }
++    println!("cargo:rerun-if-env-changed=VICTORY_DLSS_SDK");
++    let sdk = std::path::PathBuf::from(
++        std::env::var_os("VICTORY_DLSS_SDK")
++            .expect("point VICTORY_DLSS_SDK at the NVIDIA DLSS SDK"),
++    );
++    let lib = sdk.join("lib/Windows_x86_64");
++    assert!(
++        lib.join("nvsdk_ngx_d.lib").is_file(),
++        "missing NVIDIA NGX SDK library"
++    );
++    println!("cargo:rustc-link-search=native={}", lib.display());
++}
+diff --git a/crates/victory-hle/src/modules/fidelityfx.rs b/crates/victory-hle/src/modules/fidelityfx.rs
+index 3c0f11cbf79198df9a93d686a6b3ccbdeebb9cdb..65d65fcbae90bdc8827fa4dd632fd9108a5c99a0 100644
+--- a/crates/victory-hle/src/modules/fidelityfx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx.rs
+@@ -835,3 +835,13 @@ mod tests {
+         assert_eq!(host_state(0x14), None);
+     }
+ }
++
++#[cfg(feature = "diagnostics")]
++mod observe;
++#[cfg(feature = "diagnostics")]
++pub use observe::Observer;
++#[cfg(all(feature = "diagnostics", feature = "dlss"))]
++pub(crate) use observe::redirect_uhd_export;
++
++#[cfg(all(feature = "diagnostics", feature = "dlss"))]
++mod ngx;
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1a740bad974029bcdbc6d72c24ce6a01426ecca
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -0,0 +1,811 @@
++//! Opt-in NGX super resolution for the observed Series S preset.
++//! Adapted from avatarmanz/VIctory-7900XTX#203 (CuteBooty and contributors).
++
++use super::{CREATE_UPSCALE, CreateUpscale, DispatchUpscale, dispatch_output};
++use std::ffi::{c_char, c_int, c_uint, c_void};
++use std::sync::atomic::{AtomicUsize, Ordering};
++use std::sync::{Mutex, OnceLock};
++use victory_gpu::external;
++use victory_gpu::object::Object;
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::core::Interface;
++
++type NgxResult = c_int;
++const SUCCESS: NgxResult = 1;
++const FEATURE_SUPER_SAMPLING: c_int = 1;
++const ENGINE_CUSTOM: c_int = 0;
++const VERSION_API: c_int = 0x15;
++
++const FLAG_HDR: c_int = 1 << 0;
++const FLAG_MV_LOW_RES: c_int = 1 << 1;
++const FLAG_DEPTH_INVERTED: c_int = 1 << 3;
++const FLAG_AUTO_EXPOSURE: c_int = 1 << 6;
++
++#[repr(C)]
++struct PathList {
++    path: *const *const u16,
++    length: c_uint,
++}
++
++#[repr(C)]
++struct Logging {
++    callback: *const c_void,
++    minimum: c_int,
++    disable_other_sinks: bool,
++}
++
++#[repr(C)]
++struct CommonInfo {
++    paths: PathList,
++    internal: *const c_void,
++    logging: Logging,
++}
++
++#[link(name = "nvsdk_ngx_d", kind = "static")]
++unsafe extern "C" {
++    fn NVSDK_NGX_D3D12_Init_with_ProjectID(
++        project: *const c_char,
++        engine: c_int,
++        engine_version: *const c_char,
++        data_path: *const u16,
++        device: *mut c_void,
++        info: *const CommonInfo,
++        version: c_int,
++    ) -> NgxResult;
++    fn NVSDK_NGX_D3D12_GetCapabilityParameters(out: *mut *mut c_void) -> NgxResult;
++    fn NVSDK_NGX_D3D12_CreateFeature(
++        list: *mut c_void,
++        feature: c_int,
++        params: *mut c_void,
++        out: *mut *mut c_void,
++    ) -> NgxResult;
++    fn NVSDK_NGX_D3D12_EvaluateFeature_C(
++        list: *mut c_void,
++        handle: *const c_void,
++        params: *const c_void,
++        callback: *const c_void,
++    ) -> NgxResult;
++    fn NVSDK_NGX_Parameter_SetUI(p: *mut c_void, name: *const c_char, value: c_uint);
++    fn NVSDK_NGX_Parameter_SetI(p: *mut c_void, name: *const c_char, value: c_int);
++    fn NVSDK_NGX_Parameter_SetF(p: *mut c_void, name: *const c_char, value: f32);
++    fn NVSDK_NGX_Parameter_SetD3d12Resource(
++        p: *mut c_void,
++        name: *const c_char,
++        value: *mut c_void,
++    );
++    fn NVSDK_NGX_Parameter_GetI(p: *mut c_void, name: *const c_char, out: *mut c_int) -> NgxResult;
++}
++
++/// A parameter name as the SDK spells it.
++macro_rules! name {
++    ($s:literal) => {
++        concat!($s, "\0").as_ptr().cast::<c_char>()
++    };
++}
++
++const INPUT: [u32; 2] = [1280, 720];
++const FFX_FLAGS: u32 = (1 << 0) | (1 << 3) | (1 << 5);
++
++#[derive(Clone, Copy)]
++struct Preset {
++    output: [u32; 2],
++    quality: c_int,
++}
++
++const HD: Preset = Preset {
++    output: [1920, 1080],
++    quality: 2,
++}; // MaxQuality
++const UHD: Preset = Preset {
++    output: [3840, 2160],
++    quality: 3,
++}; // UltraPerformance
++
++struct Ngx {
++    params: *mut c_void,
++    feature: *mut c_void,
++}
++
++// SAFETY: the queue's provider objects are exclusively used under ACTIVE.
++unsafe impl Send for Ngx {}
++
++struct Active {
++    context: usize,
++    preset: Preset,
++    provider: Option<Ngx>,
++    replaced_history: bool,
++    failed: bool,
++}
++
++// shortcut: one fixed-size context per test process, add fenced retirement before supporting recreation.
++type Context = OnceLock<Mutex<Active>>;
++static ACTIVE: Context = OnceLock::new();
++static REPLACED: AtomicUsize = AtomicUsize::new(0);
++static OWNED_TAG: u8 = 0;
++static OWNED_CREATE: Mutex<()> = Mutex::new(());
++
++fn owned_tag() -> usize {
++    std::ptr::addr_of!(OWNED_TAG) as usize
++}
++
++pub(super) fn is_owned(handle: usize) -> bool {
++    handle == owned_tag()
++}
++
++fn preset() -> Option<Preset> {
++    static PRESET: OnceLock<Option<Preset>> = OnceLock::new();
++    *PRESET.get_or_init(|| match std::env::var("VICTORY_FFX_DLSS").ok().as_deref() {
++        Some("1") => Some(HD),
++        Some("4k") => Some(UHD),
++        _ => None,
++    })
++}
++
++pub(super) fn enabled() -> bool {
++    preset().is_some()
++}
++
++pub(super) fn owns_uhd() -> bool {
++    preset().is_some_and(|preset| preset.output == UHD.output)
++}
++
++fn matches(desc: &CreateUpscale, preset: Preset) -> bool {
++    desc.header.kind == CREATE_UPSCALE
++        && desc.flags == FFX_FLAGS
++        && desc.max_render == INPUT
++        && desc.max_output == preset.output
++}
++
++pub(super) fn matches_uhd(desc: &CreateUpscale) -> bool {
++    matches(desc, UHD)
++}
++
++pub(super) fn observe_context(handle: usize, desc: &CreateUpscale) {
++    let Some(preset) = preset() else { return };
++    if preset.output == HD.output && handle != 0 && matches(desc, preset) {
++        ACTIVE.get_or_init(|| {
++            Mutex::new(Active {
++                context: handle,
++                preset,
++                provider: None,
++                replaced_history: false,
++                failed: false,
++            })
++        });
++    }
++}
++
++pub(super) fn destroy(handle: usize) {
++    if let Some(active) = ACTIVE.get() {
++        let mut active = active.lock().unwrap_or_else(|e| e.into_inner());
++        if active.context == handle {
++            active.context = 0;
++        }
++    }
++}
++
++pub(super) fn create_uhd(publish: impl FnOnce(usize) -> bool) -> u32 {
++    create_uhd_in(
++        &ACTIVE,
++        || {
++            if !initialize_nvapi() {
++                return None;
++            }
++            let device = external::host_device()?;
++            let params = capabilities(&device)?;
++            Some(Ngx {
++                params,
++                feature: std::ptr::null_mut(),
++            })
++        },
++        publish,
++    )
++}
++
++fn create_uhd_in(
++    context: &Context,
++    probe: impl FnOnce() -> Option<Ngx>,
++    publish: impl FnOnce(usize) -> bool,
++) -> u32 {
++    let _creating = OWNED_CREATE.lock().unwrap_or_else(|e| e.into_inner());
++    if context.get().is_some() {
++        return super::PARAMETER;
++    }
++    let Some(ngx) = probe() else {
++        return super::NO_PROVIDER;
++    };
++    let active = context.get_or_init(|| {
++        Mutex::new(Active {
++            context: 0,
++            preset: UHD,
++            provider: Some(ngx),
++            replaced_history: false,
++            failed: false,
++        })
++    });
++    let mut active = active.lock().unwrap_or_else(|e| e.into_inner());
++    if !publish(owned_tag()) {
++        return super::PARAMETER;
++    }
++    active.context = owned_tag();
++    super::OK
++}
++
++pub(super) fn query_uhd(write: impl FnOnce() -> u32) -> u32 {
++    query_uhd_in(&ACTIVE, write)
++}
++
++fn query_uhd_in(context: &Context, write: impl FnOnce() -> u32) -> u32 {
++    let Some(active) = context.get() else {
++        return super::NO_PROVIDER;
++    };
++    let active = active.lock().unwrap_or_else(|e| e.into_inner());
++    if !is_owned(active.context) || active.failed {
++        return super::PARAMETER;
++    }
++    write()
++}
++
++pub(super) fn destroy_uhd(clear: impl FnOnce() -> bool) -> u32 {
++    let status = destroy_uhd_in(&ACTIVE, clear);
++    if status == super::OK {
++        external::finish_submitted();
++    }
++    status
++}
++
++fn destroy_uhd_in(context: &Context, clear: impl FnOnce() -> bool) -> u32 {
++    let Some(active) = context.get() else {
++        return super::PARAMETER;
++    };
++    let mut active = active.lock().unwrap_or_else(|e| e.into_inner());
++    if !is_owned(active.context) || !clear() {
++        return super::PARAMETER;
++    }
++    // Leave the SDK objects pinned for this process. An unsubmitted list
++    // may still have recorded them, even after submitted work is fenced.
++    active.context = 0;
++    super::OK
++}
++
++#[derive(Debug, PartialEq, Eq)]
++pub(super) enum Dispatch {
++    Stock,
++    ResetStock,
++    Replaced,
++    OwnedFailed,
++}
++
++pub(super) fn dispatch(handle: usize, info: &DispatchUpscale) -> Dispatch {
++    dispatch_in(&ACTIVE, handle, |active| {
++        if is_owned(handle)
++            && (info.list.is_null()
++                || !supported(info, UHD)
++                || info.settings[0] & 0xff != 0 // This provider does not apply FFX sharpening.
++                || [0, 1, 2, 6]
++                    .iter()
++                    .any(|&i| info.resources[i].resource.is_null()))
++        {
++            return Err("invalid UHD command list or dispatch descriptor");
++        }
++        external::record(info.list.cast::<Object>(), |list| {
++            record(list, info, active)
++        })
++        .unwrap_or(Err("command list unavailable"))
++    })
++}
++
++fn dispatch_in(
++    context: &Context,
++    handle: usize,
++    record: impl FnOnce(&mut Active) -> Result<(), &'static str>,
++) -> Dispatch {
++    let unavailable = || {
++        if is_owned(handle) {
++            Dispatch::OwnedFailed
++        } else {
++            Dispatch::Stock
++        }
++    };
++    let Some(active) = context.get() else {
++        return unavailable();
++    };
++    let mut active = active.lock().unwrap_or_else(|e| e.into_inner());
++    if active.context == 0 || active.context != handle || active.failed {
++        return unavailable();
++    }
++    match record(&mut active) {
++        Ok(()) => {
++            active.replaced_history = true;
++            let count = REPLACED.fetch_add(1, Ordering::Relaxed) + 1;
++            if count.is_power_of_two() {
++                tracing::info!(count, render = ?INPUT, output = ?active.preset.output, "Series S DLSS replaced stock upscale");
++            }
++            Dispatch::Replaced
++        }
++        Err(reason) => {
++            active.failed = true;
++            if is_owned(handle) {
++                tracing::error!(reason, "NGX-owned FidelityFX UHD dispatch failed");
++                return Dispatch::OwnedFailed;
++            }
++            tracing::warn!(reason, "Series S DLSS fell back to stock upscale");
++            if active.replaced_history {
++                Dispatch::ResetStock
++            } else {
++                Dispatch::Stock
++            }
++        }
++    }
++}
++
++fn supported(info: &DispatchUpscale, preset: Preset) -> bool {
++    let exposure = f32::from_bits(info.settings[3]);
++    info.header.next.is_null()
++        && info.render_size == INPUT
++        && dispatch_output(info.render_size, info.upscale_size, INPUT, preset.output)
++            == Some(preset.output)
++        && info.resources[3..6].iter().all(|r| r.resource.is_null())
++        && info.settings[9] == 0
++        && exposure.is_finite()
++        && exposure > 0.0
++        && info
++            .jitter
++            .iter()
++            .chain(&info.motion_scale)
++            .all(|v| v.is_finite())
++}
++
++fn record(
++    list: &external::Recording<'_>,
++    info: &DispatchUpscale,
++    active: &mut Active,
++) -> Result<(), &'static str> {
++    let preset = active.preset;
++    if !supported(info, preset) {
++        return Err("upscale descriptor outside the tested preset");
++    }
++    let input = |role: usize| {
++        let title = info
++            .resources
++            .get(role)
++            .filter(|r| !r.resource.is_null())
++            .ok_or("missing required input")?
++            .resource
++            .cast::<Object>();
++        list.prepare_input(title)
++            .ok_or("input preparation failed")?;
++        let host = texture(
++            list,
++            title,
++            D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++            INPUT,
++        )?;
++        if is_owned(active.context) {
++            // SAFETY: the list holds this resource through the call.
++            let desc = unsafe { host.GetDesc() };
++            if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++                || desc.Width != u64::from(INPUT[0])
++                || desc.Height != INPUT[1]
++            {
++                return Err("expected an exact 1280x720 DLSS input allocation");
++            }
++        }
++        Ok(host)
++    };
++    let color = input(0)?;
++    let depth = input(1)?;
++    let motion = input(2)?;
++    let output = info.resources[6].resource.cast::<Object>();
++    let output_host = texture(
++        list,
++        output,
++        D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        preset.output,
++    )?;
++    // SAFETY: all four resources remain held by the host command list.
++    let output_desc = unsafe { output_host.GetDesc() };
++    if preset.output == UHD.output
++        && (output_desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++            || output_desc.Width != u64::from(preset.output[0])
++            || output_desc.Height != preset.output[1])
++    {
++        return Err("expected an exact 3840x2160 DLSS output allocation");
++    }
++    let output_format = output_desc.Format;
++    let device = external::host_device().ok_or("no host device")?;
++    let support = &mut D3D12_FEATURE_DATA_FORMAT_SUPPORT {
++        Format: output_format,
++        ..Default::default()
++    };
++    // SAFETY: plain format capability query, using exactly the declared structure.
++    let supports_store = unsafe {
++        device.CheckFeatureSupport(
++            D3D12_FEATURE_FORMAT_SUPPORT,
++            std::ptr::from_mut(support).cast(),
++            size_of_val(support) as u32,
++        )
++    }
++    .is_ok()
++        && support
++            .Support2
++            .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE);
++    if output_format.0 != 10 || !supports_store {
++        return Err("upscale output must have a typed RGBA16F UAV backing");
++    }
++    let commands = list.commands();
++    if active.provider.is_none() {
++        active.provider =
++            Some(init(&device, commands, preset).ok_or("NGX init or feature creation failed")?);
++    }
++    let ngx = active.provider.as_mut().unwrap();
++    if ngx.feature.is_null() {
++        ngx.feature = create_feature(commands, preset, ngx.params)
++            .ok_or("NGX Ultra Performance feature creation failed")?;
++    }
++    let p = ngx.params;
++    // SAFETY: this list, its four held resources and the live NGX feature all use the same device.
++    let result = unsafe {
++        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Color"), color.as_raw());
++        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Depth"), depth.as_raw());
++        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("MotionVectors"), motion.as_raw());
++        NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Output"), output_host.as_raw());
++        NVSDK_NGX_Parameter_SetF(p, name!("Jitter.Offset.X"), info.jitter[0]);
++        NVSDK_NGX_Parameter_SetF(p, name!("Jitter.Offset.Y"), info.jitter[1]);
++        NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.X"), info.motion_scale[0]);
++        NVSDK_NGX_Parameter_SetF(p, name!("MV.Scale.Y"), info.motion_scale[1]);
++        NVSDK_NGX_Parameter_SetI(
++            p,
++            name!("Reset"),
++            i32::from(!active.replaced_history || info.settings[4] & 0xff != 0),
++        );
++        NVSDK_NGX_Parameter_SetF(
++            p,
++            name!("DLSS.Pre.Exposure"),
++            f32::from_bits(info.settings[3]),
++        );
++        NVSDK_NGX_Parameter_SetF(
++            p,
++            name!("FrameTimeDeltaInMsec"),
++            f32::from_bits(info.settings[2]),
++        );
++        NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Render.Subrect.Dimensions.Width"), INPUT[0]);
++        NVSDK_NGX_Parameter_SetUI(p, name!("DLSS.Render.Subrect.Dimensions.Height"), INPUT[1]);
++        NVSDK_NGX_D3D12_EvaluateFeature_C(commands.as_raw(), ngx.feature, p, std::ptr::null())
++    };
++    if result != SUCCESS {
++        tracing::warn!(result, "NGX did not evaluate the upscale");
++        return Err("NGX evaluation failed");
++    }
++    external::output_written(output);
++    Ok(())
++}
++
++fn texture(
++    list: &external::Recording<'_>,
++    title: *const Object,
++    state: D3D12_RESOURCE_STATES,
++    size: [u32; 2],
++) -> Result<ID3D12Resource, &'static str> {
++    if title.is_null() {
++        return Err("missing upscale resource");
++    }
++    let (host, effective) = list
++        .texture(title, state.0 as u32)
++        .ok_or("missing upscale backing")?;
++    // SAFETY: GetDesc queries this live resource by value.
++    let desc = unsafe { host.GetDesc() };
++    if effective != state.0 as u32 || desc.Width < u64::from(size[0]) || desc.Height < size[1] {
++        return Err("upscale backing has incompatible state or dimensions");
++    }
++    Ok(host)
++}
++
++fn initialize_nvapi() -> bool {
++    static NVAPI: OnceLock<bool> = OnceLock::new();
++    *NVAPI.get_or_init(|| {
++        use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
++        let name = windows::core::w!("nvapi64.dll");
++        // SAFETY: the probe stages dxvk-nvapi beside its executable.
++        unsafe {
++            let module = LoadLibraryW(name.as_ptr());
++            if module.is_null() {
++                return false;
++            }
++            let Some(symbol) = GetProcAddress(module, c"nvapi_QueryInterface".as_ptr().cast())
++            else {
++                return false;
++            };
++            let query =
++                std::mem::transmute::<_, unsafe extern "C" fn(u32) -> *const c_void>(symbol);
++            let init = query(0x0150_e828); // NvAPI_Initialize, NVIDIA nvapi_interface.h.
++            if init.is_null() {
++                return false;
++            }
++            let start = std::mem::transmute::<_, unsafe extern "C" fn() -> i32>(init);
++            let status = start();
++            eprintln!("Series S DLSS NvAPI initialize status={status}");
++            status == 0
++        }
++    })
++}
++
++unsafe extern "C" fn ngx_log(message: *const c_char, _: c_int, _: c_int) {
++    static LOGGED: AtomicUsize = AtomicUsize::new(0);
++    if !message.is_null() && LOGGED.fetch_add(1, Ordering::Relaxed) < 48 {
++        // SAFETY: the SDK supplies a NUL-terminated message for this call.
++        let message = unsafe { std::ffi::CStr::from_ptr(message) };
++        eprintln!("NGX: {}", message.to_string_lossy().trim_end());
++    }
++}
++
++fn capabilities(device: &ID3D12Device) -> Option<*mut c_void> {
++    use std::os::windows::ffi::OsStrExt;
++
++    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
++    if !dir.join("nvngx_dlss.dll").is_file() {
++        return None;
++    }
++    let data = std::env::temp_dir().join("victory-ngx");
++    std::fs::create_dir_all(&data).ok()?;
++    let dir_w: Vec<u16> = dir.as_os_str().encode_wide().chain([0]).collect();
++    let data_w: Vec<u16> = data.as_os_str().encode_wide().chain([0]).collect();
++    let paths = [dir_w.as_ptr()];
++    let info = CommonInfo {
++        paths: PathList {
++            path: paths.as_ptr(),
++            length: 1,
++        },
++        internal: std::ptr::null(),
++        logging: Logging {
++            callback: ngx_log as *const c_void,
++            minimum: 2,
++            disable_other_sinks: false,
++        },
++    };
++    let mut params = std::ptr::null_mut();
++    // SAFETY: live device and command list, strings and out pointers for the SDK.
++    unsafe {
++        let result = NVSDK_NGX_D3D12_Init_with_ProjectID(
++            c"5e2f9a3c-1b7d-4c8e-9a6f-0d3b2c1e4f57".as_ptr(),
++            ENGINE_CUSTOM,
++            c"1.0".as_ptr(),
++            data_w.as_ptr(),
++            device.as_raw(),
++            &info,
++            VERSION_API,
++        );
++        if result != SUCCESS {
++            eprintln!(
++                "Series S DLSS NGX initialization failed ({:#010x})",
++                result as u32
++            );
++            return None;
++        }
++        if NVSDK_NGX_D3D12_GetCapabilityParameters(&mut params) != SUCCESS || params.is_null() {
++            return None;
++        }
++        let mut available = 0;
++        if NVSDK_NGX_Parameter_GetI(params, name!("SuperSampling.Available"), &mut available)
++            != SUCCESS
++            || available == 0
++        {
++            return None;
++        }
++    }
++    Some(params)
++}
++
++fn init(
++    device: &ID3D12Device,
++    commands: &ID3D12GraphicsCommandList,
++    preset: Preset,
++) -> Option<Ngx> {
++    if !initialize_nvapi() {
++        return None;
++    }
++    let params = capabilities(device)?;
++    let feature = create_feature(commands, preset, params)?;
++    Some(Ngx { params, feature })
++}
++
++fn create_feature(
++    commands: &ID3D12GraphicsCommandList,
++    preset: Preset,
++    params: *mut c_void,
++) -> Option<*mut c_void> {
++    let mut feature = std::ptr::null_mut();
++    // SAFETY: live SDK parameters and an open command list.
++    unsafe {
++        for (parameter, value) in [
++            (name!("CreationNodeMask"), 1),
++            (name!("VisibilityNodeMask"), 1),
++            (name!("Width"), INPUT[0]),
++            (name!("Height"), INPUT[1]),
++            (name!("OutWidth"), preset.output[0]),
++            (name!("OutHeight"), preset.output[1]),
++        ] {
++            NVSDK_NGX_Parameter_SetUI(params, parameter, value);
++        }
++        NVSDK_NGX_Parameter_SetI(params, name!("PerfQualityValue"), preset.quality);
++        NVSDK_NGX_Parameter_SetI(
++            params,
++            name!("DLSS.Feature.Create.Flags"),
++            FLAG_HDR | FLAG_MV_LOW_RES | FLAG_DEPTH_INVERTED | FLAG_AUTO_EXPOSURE,
++        );
++        NVSDK_NGX_Parameter_SetI(params, name!("DLSS.Enable.Output.Subrects"), 0);
++        let result = NVSDK_NGX_D3D12_CreateFeature(
++            commands.as_raw(),
++            FEATURE_SUPER_SAMPLING,
++            params,
++            &mut feature,
++        );
++        if result != SUCCESS || feature.is_null() {
++            tracing::warn!(result, "Series S DLSS NGX feature creation failed");
++            return None;
++        }
++    }
++    Some(feature)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    #[ignore = "requires an NVIDIA adapter, NGX DLLs and dxvk-nvapi"]
++    fn ngx_initializes_on_the_replay_device() {
++        assert!(initialize_nvapi(), "NvAPI startup");
++        let device = external::host_device().expect("D3D12 host");
++        assert!(
++            capabilities(&device).is_some(),
++            "NGX super-resolution capabilities"
++        );
++    }
++
++    #[test]
++    #[ignore = "requires an NVIDIA adapter, NGX DLLs and dxvk-nvapi"]
++    fn ngx_creates_the_fixed_720p_to_4k_feature() {
++        let device = external::host_device().expect("D3D12 host");
++        // SAFETY: a live device, and the allocator outlives the command list.
++        let (allocator, list): (ID3D12CommandAllocator, ID3D12GraphicsCommandList) = unsafe {
++            let allocator = device
++                .CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)
++                .unwrap();
++            let list = device
++                .CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None)
++                .unwrap();
++            (allocator, list)
++        };
++        assert!(
++            init(&device, &list, UHD).is_some(),
++            "NGX Ultra Performance feature creation"
++        );
++        // SAFETY: this open test list is never submitted.
++        unsafe { list.Close().unwrap() };
++        drop(list);
++        drop(allocator);
++    }
++
++    #[test]
++    fn uhd_owned_context_rejects_stale_handles_and_never_falls_back() {
++        let context = Context::new();
++        let mut handle = 0;
++        assert_eq!(
++            dispatch_in(&context, owned_tag(), |_| panic!("unpublished token")),
++            Dispatch::OwnedFailed
++        );
++        assert_eq!(
++            create_uhd_in(
++                &context,
++                || None,
++                |_| panic!("unavailable provider published a token")
++            ),
++            super::super::NO_PROVIDER
++        );
++        let mock = || {
++            Some(Ngx {
++                params: std::ptr::dangling_mut(),
++                feature: std::ptr::null_mut(),
++            })
++        };
++        assert_eq!(
++            create_uhd_in(&context, mock, |tag| {
++                handle = tag;
++                true
++            }),
++            super::super::OK
++        );
++        assert!(is_owned(handle));
++        assert_eq!(
++            create_uhd_in(&context, || panic!("duplicate probe"), |_| false),
++            super::super::PARAMETER
++        );
++        assert_eq!(
++            query_uhd_in(&context, || super::super::OK),
++            super::super::OK
++        );
++        assert_eq!(
++            dispatch_in(&context, 0x1234, |_| panic!(
++                "stock handle entered owned provider"
++            )),
++            Dispatch::Stock
++        );
++        assert_eq!(
++            dispatch_in(&context, handle, |_| Err("fixture failure")),
++            Dispatch::OwnedFailed
++        );
++        assert_eq!(
++            dispatch_in(&context, handle, |_| panic!("terminal failure retried")),
++            Dispatch::OwnedFailed
++        );
++        assert_eq!(
++            query_uhd_in(&context, || panic!("failed context answered")),
++            super::super::PARAMETER
++        );
++
++        let stale = handle;
++        assert_eq!(destroy_uhd_in(&context, || false), super::super::PARAMETER);
++        assert_eq!(
++            destroy_uhd_in(&context, || {
++                handle = 0;
++                true
++            }),
++            super::super::OK
++        );
++        assert_eq!(handle, 0);
++        assert!(is_owned(stale));
++        assert_eq!(
++            dispatch_in(&context, stale, |_| panic!(
++                "stale token entered the recorder"
++            )),
++            Dispatch::OwnedFailed
++        );
++        assert_eq!(
++            destroy_uhd_in(&context, || panic!("stale token cleared a slot")),
++            super::super::PARAMETER
++        );
++        assert_eq!(
++            create_uhd_in(
++                &context,
++                || panic!("retired resource was reused"),
++                |_| false
++            ),
++            super::super::PARAMETER
++        );
++
++        let bad_slot = Context::new();
++        assert_eq!(
++            create_uhd_in(&bad_slot, mock, |_| false),
++            super::super::PARAMETER
++        );
++        assert_eq!(
++            query_uhd_in(&bad_slot, || panic!("unwritten token published")),
++            super::super::PARAMETER
++        );
++    }
++
++    #[test]
++    fn only_the_observed_unextended_upscale_shape_can_be_replaced() {
++        // SAFETY: the FFX layouts contain only pointers, integers and floats.
++        let mut desc: DispatchUpscale = unsafe { std::mem::zeroed() };
++        desc.render_size = INPUT;
++        desc.upscale_size = HD.output;
++        desc.settings[3] = 1.0f32.to_bits();
++        assert!(supported(&desc, HD));
++        assert!(!supported(&desc, UHD));
++        desc.upscale_size = UHD.output;
++        assert!(supported(&desc, UHD));
++        assert!(!supported(&desc, HD));
++        desc.upscale_size = HD.output;
++        desc.render_size = [960, 540];
++        assert!(!supported(&desc, HD));
++        desc.render_size = INPUT;
++        desc.header.next = std::ptr::dangling_mut();
++        assert!(!supported(&desc, HD));
++        desc.header.next = std::ptr::null_mut();
++        desc.settings[3] = f32::NAN.to_bits();
++        assert!(!supported(&desc, HD));
++    }
++}
+diff --git a/crates/victory-hle/src/modules/fidelityfx/observe.rs b/crates/victory-hle/src/modules/fidelityfx/observe.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..91141dad8b88825d097c78d34e2ea8117d33481b
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/observe.rs
+@@ -0,0 +1,496 @@
++//! Sample the Series S console provider's original upscaler calls and jitter query.
++
++use super::{
++    CREATE_UPSCALE, Call, Create, CreateUpscale, DISPATCH_UPSCALE, DispatchUpscale, Header,
++};
++use std::ffi::c_void;
++use std::mem::MaybeUninit;
++use std::sync::OnceLock;
++use std::sync::atomic::{AtomicUsize, Ordering};
++use victory_loader::{ImportResolver, Provenance, Resolution};
++use victory_pe::ImportSymbol;
++use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
++use windows_sys::Win32::System::{
++    Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess,
++};
++
++static CREATE: OnceLock<Create> = OnceLock::new();
++static DISPATCH: OnceLock<Call> = OnceLock::new();
++static QUERY: OnceLock<Call> = OnceLock::new();
++#[cfg(feature = "dlss")]
++static DESTROY: OnceLock<super::Destroy> = OnceLock::new();
++#[cfg(feature = "dlss")]
++static CONFIGURE: OnceLock<Call> = OnceLock::new();
++#[cfg(feature = "dlss")]
++static UHD_BOUND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++#[cfg(feature = "dlss")]
++mod owned;
++
++fn replace_upscale() -> bool {
++    #[cfg(feature = "dlss")]
++    return super::ngx::enabled();
++    #[cfg(not(feature = "dlss"))]
++    false
++}
++
++pub struct Observer<'a> {
++    inner: &'a dyn ImportResolver,
++    enabled: bool,
++}
++
++impl<'a> Observer<'a> {
++    pub fn new(inner: &'a dyn ImportResolver, series_s: bool) -> Self {
++        let enabled = series_s
++            && (replace_upscale()
++                || std::env::var_os("VICTORY_FFX_OBSERVE").is_some_and(|v| v == "1"));
++        Self { inner, enabled }
++    }
++
++    #[cfg(feature = "dlss")]
++    pub fn bound_stock_upscaler(&self) -> bool {
++        let bound = self.enabled
++            && CREATE.get().is_some()
++            && DESTROY.get().is_some()
++            && DISPATCH.get().is_some()
++            && QUERY.get().is_some();
++        if bound && super::ngx::owns_uhd() {
++            UHD_BOUND.store(true, Ordering::Release);
++        }
++        bound
++    }
++
++    #[cfg(feature = "dlss")]
++    pub fn bound_uhd() -> bool {
++        UHD_BOUND.load(Ordering::Acquire)
++    }
++}
++
++// Keep aliases returned by GetProcAddress on the same boundary as bound
++// imports, including an ordinal that resolves to one of the saved addresses.
++#[cfg(feature = "dlss")]
++pub(crate) unsafe fn redirect_uhd_export(module: usize, name: *const u8, address: usize) -> usize {
++    if !Observer::bound_uhd() || address == 0 {
++        return address;
++    }
++    for (stock, wrapper) in [
++        (
++            CREATE.get().map(|f| *f as usize),
++            observe_create as *const () as usize,
++        ),
++        (
++            DESTROY.get().map(|f| *f as usize),
++            observe_destroy as *const () as usize,
++        ),
++        (
++            QUERY.get().map(|f| *f as usize),
++            observe_query as *const () as usize,
++        ),
++        (
++            DISPATCH.get().map(|f| *f as usize),
++            observe_dispatch as *const () as usize,
++        ),
++        (
++            CONFIGURE.get().map(|f| *f as usize),
++            observe_configure as *const () as usize,
++        ),
++    ] {
++        if stock == Some(address) {
++            return wrapper;
++        }
++    }
++    if name as usize >= 0x1_0000
++        && crate::runtime::image_path(module)
++            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().into_owned()))
++            .is_some_and(|name| name.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll"))
++        // SAFETY: the native lookup already resolved this string.
++        && unsafe { std::ffi::CStr::from_ptr(name.cast()) } == c"ffxConfigure"
++    {
++        return configure_wrapper(address).unwrap_or(0);
++    }
++    address
++}
++
++#[cfg(feature = "dlss")]
++fn configure_wrapper(address: usize) -> Option<usize> {
++    // SAFETY: original, named console export with the known FFX ABI.
++    let saved = CONFIGURE.get_or_init(|| unsafe { std::mem::transmute::<usize, Call>(address) });
++    (*saved as usize == address).then_some(observe_configure as *const () as usize)
++}
++
++impl ImportResolver for Observer<'_> {
++    fn resolve(&self, dll: &str, symbol: &ImportSymbol) -> Resolution {
++        let original = self.inner.resolve(dll, symbol);
++        if !self.enabled || !dll.eq_ignore_ascii_case("amd_fidelityfx_loader_xbox.dll") {
++            return original;
++        }
++        // shortcut: observes named imports only; add dynamic lookup if the query is resolved there.
++        let Resolution::Found {
++            address,
++            provenance: Provenance::Title,
++        } = original
++        else {
++            return original;
++        };
++        let ImportSymbol::Name { name, .. } = symbol else {
++            return original;
++        };
++        let wrapped = match name.as_str() {
++            "ffxCreateContext" => {
++                // SAFETY: original, named console export with the known FFX ABI.
++                let saved =
++                    CREATE.get_or_init(|| unsafe { std::mem::transmute::<usize, Create>(address) });
++                (*saved as usize == address).then_some(observe_create as *const () as usize)
++            }
++            #[cfg(feature = "dlss")]
++            "ffxDestroyContext" if replace_upscale() => {
++                // SAFETY: original, named console export with the known FFX ABI.
++                let saved = DESTROY.get_or_init(|| unsafe {
++                    std::mem::transmute::<usize, super::Destroy>(address)
++                });
++                (*saved as usize == address).then_some(observe_destroy as *const () as usize)
++            }
++            #[cfg(feature = "dlss")]
++            "ffxConfigure" if super::ngx::owns_uhd() => configure_wrapper(address),
++            "ffxQuery" => {
++                let saved = QUERY.get_or_init(|| {
++                    tracing::info!("console FidelityFX named query import observed");
++                    // SAFETY: original, named console export with the known FFX ABI.
++                    unsafe { std::mem::transmute::<usize, Call>(address) }
++                });
++                (*saved as usize == address).then_some(observe_query as *const () as usize)
++            }
++            "ffxDispatch" => {
++                // SAFETY: original, named console export with the known FFX ABI.
++                let saved =
++                    DISPATCH.get_or_init(|| unsafe { std::mem::transmute::<usize, Call>(address) });
++                (*saved as usize == address).then_some(observe_dispatch as *const () as usize)
++            }
++            _ => None,
++        };
++        #[cfg(feature = "dlss")]
++        if super::ngx::owns_uhd()
++            && wrapped.is_none()
++            && matches!(
++                name.as_str(),
++                "ffxCreateContext"
++                    | "ffxDestroyContext"
++                    | "ffxQuery"
++                    | "ffxDispatch"
++                    | "ffxConfigure"
++            )
++        {
++            return Resolution::Missing;
++        }
++        wrapped.map_or(original, |address| Resolution::Found {
++            address,
++            provenance: Provenance::Title,
++        })
++    }
++}
++
++/// The caller must use a layout that accepts all bit patterns.
++unsafe fn snapshot<T: Copy>(source: *const T) -> Option<T> {
++    let mut data = MaybeUninit::<T>::uninit();
++    let mut read = 0;
++    // SAFETY: the OS checks the source mapping and writes at most the size of data.
++    let ok = unsafe {
++        ReadProcessMemory(
++            GetCurrentProcess(),
++            source.cast(),
++            data.as_mut_ptr().cast(),
++            size_of::<T>(),
++            &mut read,
++        )
++    };
++    // SAFETY: an exact copy into a layout that accepts all bit patterns.
++    (ok != 0 && read == size_of::<T>()).then(|| unsafe { data.assume_init() })
++}
++
++unsafe extern "C" fn observe_create(
++    context: *mut *mut c_void,
++    desc: *mut Header,
++    memory: *const c_void,
++) -> u32 {
++    // SAFETY: both layouts accept arbitrary bits and creation uses the saved console export.
++    unsafe {
++        let last = GetLastError();
++        let info = snapshot(desc)
++            .filter(|h| h.kind == CREATE_UPSCALE)
++            .and_then(|_| snapshot(desc.cast::<CreateUpscale>()));
++        #[cfg(feature = "dlss")]
++        if super::ngx::owns_uhd()
++            && let Some(result) = owned::create(context, desc, info)
++        {
++            SetLastError(last);
++            return result;
++        }
++        SetLastError(last);
++        let result = CREATE.get().unwrap()(context, desc, memory);
++        let last = GetLastError();
++        if let Some(info) = info {
++            #[cfg(feature = "dlss")]
++            if result == super::OK
++                && replace_upscale()
++                && let Some(handle) = snapshot(context)
++            {
++                super::ngx::observe_context(handle as usize, &info);
++            }
++
++            tracing::info!(result, flags = info.flags, max_render = ?info.max_render, max_output = ?info.max_output,
++                           "console FidelityFX created upscaler");
++        }
++        SetLastError(last);
++        result
++    }
++}
++
++#[cfg(feature = "dlss")]
++unsafe extern "C" fn observe_destroy(context: *mut *mut c_void, allocator: *const c_void) -> u32 {
++    // SAFETY: this copies the opaque handle if mapped and forwards the original arguments.
++    unsafe {
++        let last = GetLastError();
++        if super::ngx::owns_uhd()
++            && let Some(result) = owned::destroy(context)
++        {
++            SetLastError(last);
++            return result;
++        }
++        if let Some(handle) = snapshot(context) {
++            super::ngx::destroy(handle as usize);
++        }
++        SetLastError(last);
++        DESTROY.get().unwrap()(context, allocator)
++    }
++}
++
++#[cfg(feature = "dlss")]
++unsafe extern "C" fn observe_configure(context: *mut *mut c_void, desc: *mut Header) -> u32 {
++    // SAFETY: the native export receives the same pointers for stock contexts only.
++    unsafe {
++        let last = GetLastError();
++        let result = match owned::handle(context) {
++            None => Some(super::PARAMETER),
++            Some(handle) if super::ngx::is_owned(handle) => Some(super::UNKNOWN_TYPE),
++            _ => None,
++        };
++        SetLastError(last);
++        result.unwrap_or_else(|| CONFIGURE.get().unwrap()(context, desc))
++    }
++}
++
++const GET_JITTER_PHASE_COUNT: u64 = 0x1_0004;
++
++/// The upscaler's public ABI for querying the length of its jitter sequence.
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct JitterPhaseCount {
++    header: Header,
++    render_width: u32,
++    display_width: u32,
++    out: *mut i32,
++}
++
++const _: () = assert!(size_of::<JitterPhaseCount>() == 32);
++
++unsafe extern "C" fn observe_query(context: *mut *mut c_void, desc: *mut Header) -> u32 {
++    static CALLS: AtomicUsize = AtomicUsize::new(0);
++    // SAFETY: the original query gets the original pointers. Snapshots check mapped memory.
++    unsafe {
++        let last = GetLastError();
++        let info = snapshot(desc)
++            .filter(|h| h.kind == GET_JITTER_PHASE_COUNT && h.next.is_null())
++            .and_then(|_| snapshot(desc.cast::<JitterPhaseCount>()));
++        #[cfg(feature = "dlss")]
++        if super::ngx::owns_uhd()
++            && let Some(result) = owned::query(context, desc, info)
++        {
++            SetLastError(last);
++            return result;
++        }
++        SetLastError(last);
++        let result = QUERY.get().unwrap()(context, desc);
++        let last = GetLastError();
++        if let Some(info) = info {
++            let nth = CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
++            if nth <= 8 || nth.is_power_of_two() {
++                let phases = (result == super::OK).then(|| snapshot(info.out)).flatten();
++                tracing::info!(
++                    nth,
++                    result,
++                    render_width = info.render_width,
++                    display_width = info.display_width,
++                    ?phases,
++                    "console FidelityFX queried jitter phase count"
++                );
++            }
++        }
++        SetLastError(last);
++        result
++    }
++}
++
++unsafe extern "C" fn observe_dispatch(context: *mut *mut c_void, desc: *mut Header) -> u32 {
++    static CALLS: AtomicUsize = AtomicUsize::new(0);
++    let nth = CALLS.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
++    // SAFETY: the original ABI receives the same arguments and descriptor layouts accept arbitrary bits.
++    unsafe {
++        let last = GetLastError();
++        let sample = nth <= 8 || nth.is_power_of_two();
++        let info = if sample || replace_upscale() {
++            snapshot(desc)
++                .filter(|h| h.kind == DISPATCH_UPSCALE)
++                .and_then(|_| snapshot(desc.cast::<DispatchUpscale>()))
++        } else {
++            None
++        };
++        #[cfg(feature = "dlss")]
++        if super::ngx::owns_uhd()
++            && let Some(result) = owned::dispatch(context, info)
++        {
++            SetLastError(last);
++            return result;
++        }
++        SetLastError(last);
++        #[cfg(feature = "dlss")]
++        let mut fallback = None;
++        #[cfg(feature = "dlss")]
++        if replace_upscale()
++            && let Some(mut info) = info
++            && let Some(handle) = snapshot(context)
++        {
++            match super::ngx::dispatch(handle as usize, &info) {
++                super::ngx::Dispatch::Stock => {}
++                super::ngx::Dispatch::ResetStock => {
++                    info.settings[4] = (info.settings[4] & !0xff) | 1;
++                    fallback = Some(info);
++                }
++                super::ngx::Dispatch::Replaced => {
++                    SetLastError(last);
++                    return super::OK;
++                }
++                super::ngx::Dispatch::OwnedFailed => {
++                    SetLastError(last);
++                    return owned::RUNTIME_ERROR;
++                }
++            }
++        }
++        #[cfg(feature = "dlss")]
++        let desc = fallback.as_mut().map_or(desc, |info| &raw mut info.header);
++        SetLastError(last);
++        let result = DISPATCH.get().unwrap()(context, desc);
++        let last = GetLastError();
++        if let Some(info) = info.filter(|_| sample) {
++            let resources = info
++                .resources
++                .map(|r| (!r.resource.is_null()).then_some((r.description, r.state)));
++            tracing::info!(nth, result, render = ?info.render_size, output = ?info.upscale_size,
++                jitter = ?info.jitter, motion_scale = ?info.motion_scale,
++                pre_exposure = f32::from_bits(info.settings[3]), reset = (info.settings[4] & 0xff) != 0,
++                flags = info.settings[9], ?resources, "console FidelityFX dispatched upscaler");
++        }
++        SetLastError(last);
++        result
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn observation_reads_mapped_memory_and_rejects_invalid_addresses() {
++        let value = 7u32;
++        // SAFETY: u32 accepts all bit patterns. The read checks its mapping.
++        unsafe {
++            assert_eq!(snapshot(&value), Some(7));
++            assert_eq!(snapshot(std::ptr::null::<u32>()), None);
++        }
++    }
++
++    #[test]
++    fn jitter_query_forwards_original_storage_and_last_error() {
++        unsafe extern "C" fn native(context: *mut *mut c_void, desc: *mut Header) -> u32 {
++            // SAFETY: this fixture passes a live context and typed descriptor.
++            unsafe {
++                assert_eq!(*context as usize, 0x1234);
++                let request = &*desc.cast::<JitterPhaseCount>();
++                assert_eq!(request.header.kind, GET_JITTER_PHASE_COUNT);
++                assert_eq!((request.render_width, request.display_width), (1280, 3840));
++                assert_eq!(GetLastError(), 37);
++                request.out.write(72);
++                SetLastError(53);
++            }
++            super::super::OK
++        }
++        QUERY.set(native).unwrap();
++        let mut phases = 0;
++        let mut query = JitterPhaseCount {
++            header: Header {
++                kind: GET_JITTER_PHASE_COUNT,
++                next: std::ptr::null_mut(),
++            },
++            render_width: 1280,
++            display_width: 3840,
++            out: &raw mut phases,
++        };
++        let mut context = 0x1234usize as *mut c_void;
++        // SAFETY: the descriptor and output match the saved query's ABI.
++        let (result, last) = unsafe {
++            SetLastError(37);
++            let result = observe_query(&raw mut context, &raw mut query.header);
++            (result, GetLastError())
++        };
++        assert_eq!((result, last, phases), (super::super::OK, 53, 72));
++    }
++
++    #[test]
++    fn observation_forwards_arguments_result_and_last_error() {
++        unsafe extern "C" fn native(context: *mut *mut c_void, desc: *mut Header) -> u32 {
++            // SAFETY: this fixture calls with its live context and descriptor.
++            unsafe {
++                assert_eq!(*context as usize, 0x1234);
++                assert_eq!((*desc).kind, DISPATCH_UPSCALE);
++                assert_eq!(GetLastError(), 17);
++                SetLastError(42);
++            }
++            79
++        }
++
++        struct Native;
++        impl ImportResolver for Native {
++            fn resolve(&self, _: &str, _: &ImportSymbol) -> Resolution {
++                Resolution::Found {
++                    address: native as *const () as usize,
++                    provenance: Provenance::Title,
++                }
++            }
++        }
++        let observer = Observer {
++            inner: &Native,
++            enabled: true,
++        };
++        let symbol = ImportSymbol::Name {
++            name: "ffxDispatch".into(),
++            hint: 0,
++        };
++        let Resolution::Found {
++            address,
++            provenance: Provenance::Title,
++        } = observer.resolve("amd_fidelityfx_loader_xbox.dll", &symbol)
++        else {
++            panic!("missing title export")
++        };
++        assert_ne!(address, native as *const () as usize);
++        // SAFETY: all descriptor fields accept zero. The resolver returned the wrapper with this ABI.
++        unsafe {
++            let mut desc: DispatchUpscale = std::mem::zeroed();
++            desc.header.kind = DISPATCH_UPSCALE;
++            let mut context = 0x1234usize as *mut c_void;
++            let observed = std::mem::transmute::<usize, Call>(address);
++            SetLastError(17);
++            let result = observed(&mut context, &mut desc.header);
++            let last = GetLastError();
++            assert_eq!((result, last), (79, 42));
++        }
++    }
++}
+diff --git a/crates/victory-hle/src/modules/fidelityfx/observe/owned.rs b/crates/victory-hle/src/modules/fidelityfx/observe/owned.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd3a5a8be418849a61f4c706f855606e1f9fd65b
+--- /dev/null
++++ b/crates/victory-hle/src/modules/fidelityfx/observe/owned.rs
+@@ -0,0 +1,375 @@
++//! The exact Series S UHD context is owned by NGX, with no stock fallback.
++
++use super::{CreateUpscale, DispatchUpscale, Header, JitterPhaseCount, snapshot};
++use crate::modules::fidelityfx::{CONSOLE_BACKEND, OK, PARAMETER, UNKNOWN_TYPE, ngx};
++use std::ffi::c_void;
++use std::mem::MaybeUninit;
++use std::ptr::null_mut;
++use windows_sys::Win32::System::Diagnostics::Debug::WriteProcessMemory;
++use windows_sys::Win32::System::Memory::{
++    MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY,
++    PAGE_READWRITE, PAGE_WRITECOPY, VirtualQuery,
++};
++use windows_sys::Win32::System::Threading::GetCurrentProcess;
++
++pub(super) const RUNTIME_ERROR: u32 = 3;
++const UHD_PHASES: i32 = 72;
++const CONSOLE_VERSION: u64 = 0x1_000b;
++const CONSOLE_API_4_1_1: u32 = 0x0100_1001;
++
++#[repr(C)]
++#[derive(Clone, Copy)]
++struct ConsoleVersion {
++    header: Header,
++    version: u32,
++}
++
++/// Zero means the API's optional context is absent, not that its slot was unreadable.
++pub(super) fn handle(context: *mut *mut c_void) -> Option<usize> {
++    if context.is_null() {
++        Some(0)
++    } else {
++        // SAFETY: a pointer-sized snapshot accepting all bit patterns.
++        unsafe { snapshot(context) }.map(|handle| handle as usize)
++    }
++}
++
++fn writable<T>(out: *mut T) -> bool {
++    if out.is_null() || !out.is_aligned() {
++        return false;
++    }
++    let mut region = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
++    // SAFETY: VirtualQuery writes only to the local result.
++    let size = unsafe {
++        VirtualQuery(
++            out.cast(),
++            region.as_mut_ptr(),
++            size_of::<MEMORY_BASIC_INFORMATION>(),
++        )
++    };
++    if size != size_of::<MEMORY_BASIC_INFORMATION>() {
++        return false;
++    }
++    // SAFETY: the whole result was written.
++    let region = unsafe { region.assume_init() };
++    region.State == MEM_COMMIT
++        && matches!(
++            region.Protect,
++            PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY
++        )
++        && (out as usize)
++            .checked_sub(region.BaseAddress as usize)
++            .and_then(|offset| offset.checked_add(size_of::<T>()))
++            .is_some_and(|end| end <= region.RegionSize)
++}
++
++fn write<T: Copy>(out: *mut T, value: T) -> bool {
++    if !writable(out) {
++        return false;
++    }
++    let mut transferred = 0;
++    // SAFETY: the OS checks the destination for this in-process copy.
++    let ok = unsafe {
++        WriteProcessMemory(
++            GetCurrentProcess(),
++            out.cast(),
++            std::ptr::from_ref(&value).cast(),
++            size_of::<T>(),
++            &mut transferred,
++        )
++    };
++    ok != 0 && transferred == size_of::<T>()
++}
++
++fn overlaps<T, U>(out: *mut T, input: *const U) -> bool {
++    let (out, input) = (out as usize, input as usize);
++    out < input.saturating_add(size_of::<U>()) && input < out.saturating_add(size_of::<T>())
++}
++
++fn create_request(info: &CreateUpscale) -> bool {
++    if info.header.next.is_null() {
++        return true;
++    }
++    // The backend and the title's compiled FidelityFX version are metadata
++    // for the console provider. NGX obtains its device from the host.
++    // SAFETY: each snapshot checks the mapped chain link before reading it.
++    let first = unsafe { snapshot(info.header.next) };
++    let backend = first.filter(|link| link.kind == CONSOLE_BACKEND);
++    if backend.is_some_and(|link| link.next.is_null()) {
++        return true;
++    }
++    let second = backend.and_then(|link| unsafe { snapshot(link.next) });
++    let version = backend.zip(second).and_then(|(backend, link)| {
++        (link.kind == CONSOLE_VERSION && link.next.is_null())
++            .then(|| unsafe { snapshot(backend.next.cast::<ConsoleVersion>()) })
++            .flatten()
++    });
++    if version.is_some_and(|info| info.version == CONSOLE_API_4_1_1) {
++        return true;
++    }
++    tracing::warn!(
++        first_kind = first.map(|link| link.kind),
++        second_kind = second.map(|link| link.kind),
++        version = version.map(|info| info.version),
++        "NGX-owned FidelityFX UHD rejected an unknown creation extension"
++    );
++    false
++}
++
++pub(super) fn create(
++    context: *mut *mut c_void,
++    desc: *mut Header,
++    info: Option<CreateUpscale>,
++) -> Option<u32> {
++    create_with(context, desc, info, |context| {
++        ngx::create_uhd(|tag| write(context, tag as *mut c_void))
++    })
++}
++
++fn create_with(
++    context: *mut *mut c_void,
++    desc: *mut Header,
++    info: Option<CreateUpscale>,
++    open: impl FnOnce(*mut *mut c_void) -> u32,
++) -> Option<u32> {
++    let Some(current) = handle(context) else {
++        return Some(PARAMETER);
++    };
++    if ngx::is_owned(current) {
++        return Some(PARAMETER);
++    }
++    let info = info.filter(ngx::matches_uhd)?;
++    if current != 0 || overlaps(context, desc.cast::<CreateUpscale>()) || !writable(context) {
++        return Some(PARAMETER);
++    }
++    if !create_request(&info) {
++        return Some(UNKNOWN_TYPE);
++    }
++    let result = open(context);
++    tracing::info!(
++        result, flags = info.flags, max_render = ?info.max_render, max_output = ?info.max_output,
++        "NGX-owned FidelityFX UHD context creation"
++    );
++    Some(result)
++}
++
++pub(super) fn destroy(context: *mut *mut c_void) -> Option<u32> {
++    match handle(context) {
++        Some(handle) if ngx::is_owned(handle) => {
++            Some(ngx::destroy_uhd(|| write(context, null_mut())))
++        }
++        None | Some(0) => Some(PARAMETER),
++        _ => None,
++    }
++}
++
++fn phase_dimensions(info: &JitterPhaseCount) -> bool {
++    (info.render_width, info.display_width) == (1280, 3840)
++}
++
++fn write_phase(context: *mut *mut c_void, desc: *mut Header, info: JitterPhaseCount) -> u32 {
++    if !phase_dimensions(&info)
++        || overlaps(info.out, context)
++        || overlaps(info.out, desc.cast::<JitterPhaseCount>())
++        || !write(info.out, UHD_PHASES)
++    {
++        return PARAMETER;
++    }
++    tracing::info!(
++        render_width = info.render_width,
++        display_width = info.display_width,
++        phases = UHD_PHASES,
++        "NGX-owned FidelityFX UHD jitter phase count"
++    );
++    OK
++}
++
++pub(super) fn query(
++    context: *mut *mut c_void,
++    desc: *mut Header,
++    info: Option<JitterPhaseCount>,
++) -> Option<u32> {
++    let Some(handle) = handle(context) else {
++        return Some(PARAMETER);
++    };
++    if ngx::is_owned(handle) {
++        // SAFETY: snapshot checks readable storage. A borrowed invalid query
++        // cannot escape to the stock provider with our token.
++        let invalid = if unsafe { snapshot(desc) }.is_some() {
++            UNKNOWN_TYPE
++        } else {
++            PARAMETER
++        };
++        return Some(info.map_or(invalid, |info| {
++            ngx::query_uhd(|| write_phase(context, desc, info))
++        }));
++    }
++    if handle == 0
++        && let Some(info) = info.filter(phase_dimensions)
++    {
++        return Some(ngx::query_uhd(|| write_phase(context, desc, info)));
++    }
++    None
++}
++
++pub(super) fn dispatch(context: *mut *mut c_void, info: Option<DispatchUpscale>) -> Option<u32> {
++    match handle(context) {
++        Some(handle) if ngx::is_owned(handle) => Some(match info {
++            Some(info) if ngx::dispatch(handle, &info) == ngx::Dispatch::Replaced => OK,
++            Some(_) => RUNTIME_ERROR,
++            None => PARAMETER,
++        }),
++        None | Some(0) => Some(PARAMETER),
++        _ => None,
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::modules::fidelityfx::observe::GET_JITTER_PHASE_COUNT;
++    use crate::modules::fidelityfx::{CREATE_UPSCALE, NO_PROVIDER};
++    use windows_sys::Win32::System::Memory::{
++        MEM_RELEASE, MEM_RESERVE, PAGE_READONLY, VirtualAlloc, VirtualFree,
++    };
++
++    fn request() -> CreateUpscale {
++        CreateUpscale {
++            header: Header {
++                kind: CREATE_UPSCALE,
++                next: null_mut(),
++            },
++            flags: 41,
++            max_render: [1280, 720],
++            max_output: [3840, 2160],
++            message: 0,
++        }
++    }
++
++    #[test]
++    fn uhd_create_abi_accepts_only_the_exact_request_and_writable_empty_slot() {
++        let mut desc = request();
++        let mut context: *mut c_void = null_mut();
++        let mut backend = Header {
++            kind: CONSOLE_BACKEND,
++            next: null_mut(),
++        };
++        desc.header.next = &raw mut backend;
++        assert_eq!(
++            create_with(&raw mut context, &raw mut desc.header, Some(desc), |_| {
++                NO_PROVIDER
++            }),
++            Some(NO_PROVIDER)
++        );
++        assert!(context.is_null());
++
++        let mut version = ConsoleVersion {
++            header: Header {
++                kind: CONSOLE_VERSION,
++                next: null_mut(),
++            },
++            version: CONSOLE_API_4_1_1,
++        };
++        backend.next = &raw mut version.header;
++        assert_eq!(
++            create_with(&raw mut context, &raw mut desc.header, Some(desc), |_| {
++                NO_PROVIDER
++            }),
++            Some(NO_PROVIDER)
++        );
++        version.version ^= 1;
++        assert_eq!(
++            create_with(
++                &raw mut context,
++                &raw mut desc.header,
++                Some(desc),
++                |_| panic!("unknown console version reached NGX")
++            ),
++            Some(UNKNOWN_TYPE)
++        );
++
++        let mut unsupported = Header {
++            kind: 7,
++            next: null_mut(),
++        };
++        desc.header.next = &raw mut unsupported;
++        assert_eq!(
++            create_with(
++                &raw mut context,
++                &raw mut desc.header,
++                Some(desc),
++                |_| panic!("extension reached NGX")
++            ),
++            Some(UNKNOWN_TYPE)
++        );
++        assert_eq!(
++            create_with(null_mut(), &raw mut desc.header, Some(desc), |_| panic!(
++                "null slot reached NGX"
++            )),
++            Some(PARAMETER)
++        );
++
++        desc.max_output = [1920, 1080];
++        assert_eq!(
++            create_with(
++                &raw mut context,
++                &raw mut desc.header,
++                Some(desc),
++                |_| panic!("stock request reached NGX")
++            ),
++            None
++        );
++    }
++
++    #[test]
++    fn uhd_phase_abi_writes_exactly_72_to_checked_nonaliasing_storage() {
++        let mut output = [11, -1, 13];
++        let mut context: *mut c_void = null_mut();
++        let mut info = JitterPhaseCount {
++            header: Header {
++                kind: GET_JITTER_PHASE_COUNT,
++                next: null_mut(),
++            },
++            render_width: 1280,
++            display_width: 3840,
++            out: &raw mut output[1],
++        };
++        assert_eq!(
++            write_phase(&raw mut context, &raw mut info.header, info),
++            OK
++        );
++        assert_eq!(output, [11, 72, 13]);
++
++        info.render_width = 1920;
++        output[1] = -1;
++        assert_eq!(
++            write_phase(&raw mut context, &raw mut info.header, info),
++            PARAMETER
++        );
++        assert_eq!(output, [11, -1, 13]);
++        info.render_width = 1280;
++        info.out = (&raw mut context).cast();
++        assert_eq!(
++            write_phase(&raw mut context, &raw mut info.header, info),
++            PARAMETER
++        );
++        assert!(context.is_null());
++        info.out = null_mut();
++        assert_eq!(
++            write_phase(&raw mut context, &raw mut info.header, info),
++            PARAMETER
++        );
++
++        // SAFETY: a private read-only page, released at the end of the test.
++        let page =
++            unsafe { VirtualAlloc(null_mut(), 4096, MEM_RESERVE | MEM_COMMIT, PAGE_READONLY) };
++        assert!(!page.is_null());
++        info.out = page.cast();
++        assert_eq!(
++            write_phase(&raw mut context, &raw mut info.header, info),
++            PARAMETER
++        );
++        assert!(!write(page.cast::<*mut c_void>(), std::ptr::dangling_mut()));
++        assert_ne!(unsafe { VirtualFree(page, 0, MEM_RELEASE) }, 0);
++    }
++}
+diff --git a/crates/victory-hle/src/modules/kernel.rs b/crates/victory-hle/src/modules/kernel.rs
+index 5b8fb20d8781179c1585080082f2c8c14e91a6bd..572fa5e4405d5f8a4db12729a1a676d2619f862f 100644
+--- a/crates/victory-hle/src/modules/kernel.rs
++++ b/crates/victory-hle/src/modules/kernel.rs
+@@ -158,7 +158,22 @@ pub extern "system" fn GetProcAddress(module: *mut c_void, name: *const u8) -> *
+         module
+     };
+     let Some(m) = registry().iter().find(|m| handle(m) == module) else {
+-        return host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
++        let address = host_override(module, name).unwrap_or_else(|| host::get_proc_address(module, name));
++        #[cfg(all(feature = "diagnostics", feature = "dlss"))]
++        {
++            if super::fidelityfx::Observer::bound_uhd() {
++                use windows_sys::Win32::Foundation::{GetLastError, SetLastError};
++                // SAFETY: preserve the native lookup's thread-local result.
++                let last = unsafe { GetLastError() };
++                // SAFETY: the native lookup above used this module and symbol.
++                let address = unsafe {
++                    super::fidelityfx::redirect_uhd_export(module as usize, name, address as usize)
++                };
++                unsafe { SetLastError(last) };
++                return address as *mut c_void;
++            }
++        }
++        return address;
+     };
+     // Values below 0x10000 are ordinals; we export by name only.
+     if (name as usize) < 0x1_0000 {
+diff --git a/crates/victory-hle/src/modules/xmem.rs b/crates/victory-hle/src/modules/xmem.rs
+index e2a2c5355a0853163d49124adaf616802bd9e87c..4ec73f2604c259fc9022eed3512004aca1eacb31 100644
+--- a/crates/victory-hle/src/modules/xmem.rs
++++ b/crates/victory-hle/src/modules/xmem.rs
+@@ -300,6 +300,34 @@ fn hooks() -> [usize; 2] {
+ /// The title's general allocator, for middleware too: its hook if it has
+ /// one, else [`XMemAllocDefault`].
+ pub extern "system" fn XMemAlloc(size: usize, attributes: u64) -> *mut c_void {
++    #[cfg(feature = "dlss")]
++    if size == 33_423_360 && std::env::var_os("VICTORY_FFX_DLSS").is_some_and(|v| v == "4k") {
++        static SAID: std::sync::Once = std::sync::Once::new();
++        SAID.call_once(|| {
++            use windows_sys::Win32::{
++                Foundation::{GetLastError, SetLastError},
++                System::{Diagnostics::Debug::ReadProcessMemory, Threading::GetCurrentProcess},
++            };
++            let Some(address) = crate::runtime::main_image()
++                .and_then(|base| base.checked_add(0xa94390c)) else {
++                return;
++            };
++            let mut count = 0u32;
++            let mut read = 0;
++            // SAFETY: one checked read from the matched title build at its first scanout allocation.
++            let last = unsafe { GetLastError() };
++            let ok = unsafe {
++                ReadProcessMemory(
++                    GetCurrentProcess(), address as _, (&raw mut count).cast(),
++                    size_of::<u32>(), &mut read,
++                )
++            };
++            if ok != 0 && read == size_of::<u32>() {
++                tracing::info!(count, size, "Series S scanout buffer count");
++            }
++            unsafe { SetLastError(last) };
++        });
++    }
+     match hooks()[0] {
+         0 => XMemAllocDefault(size, attributes),
+         hook => {
+diff --git a/crates/victory-loader/src/resolution.rs b/crates/victory-loader/src/resolution.rs
+index 0c8102658338eb26ec36c654f77b8e0771ae458a..92f87cf3ab0de04b2ecaf5bd982387a63e199655 100644
+--- a/crates/victory-loader/src/resolution.rs
++++ b/crates/victory-loader/src/resolution.rs
+@@ -289,6 +289,72 @@ pub unsafe fn write(base: usize, size: usize, site: &Site, code: &[u8]) -> Patch
+     Patched::Done
+ }
+
++/// At the Series S scanout-pool selection, the byte count is used both
++/// to reserve its memory and to set its allocator's end.
++#[cfg(any(windows, test))]
++const SERIES_S_SCANOUT_POOL: Site = Site {
++    at: 0x247ad45,
++    what: "Series S scanout pool size",
++    bytes: &[0xb8, 0x00, 0x00, 0x20, 0x05],
++};
++
++#[cfg(any(windows, test))]
++const SERIES_S_TRANSIENT_POOL: Site = Site {
++    at: 0x1d488ac,
++    what: "Series S transient render-target pool size",
++    bytes: &[0xb8, 0x90, 0x12, 0x00, 0x00],
++};
++
++#[cfg(any(windows, test))]
++const SERIES_S_UHD_TRANSIENT_MIB: u32 = 576;
++
++#[cfg(any(windows, test))]
++fn series_s_4k_plan() -> [(&'static Site, Vec<u8>); 4] {
++    // Four 31.875 MiB allocations leave 512 KiB for the existing pool check.
++    let mut scanout = SERIES_S_SCANOUT_POOL.bytes.to_vec();
++    scanout[1..].copy_from_slice(&(128u32 << 20).to_le_bytes());
++    // The title uses the same 64 KiB page count for the reservation and check.
++    // Its first UHD layout requires 517.875 MiB.
++    let mut transient = SERIES_S_TRANSIENT_POOL.bytes.to_vec();
++    transient[1..].copy_from_slice(&(SERIES_S_UHD_TRANSIENT_MIB * 16).to_le_bytes());
++    [
++        (&OUTPUT, output_code(3840, 2160)),
++        (&FFX_SCALE, ffx_scale_code(1.0 / 3.0)),
++        (&SERIES_S_SCANOUT_POOL, scanout),
++        (&SERIES_S_TRANSIENT_POOL, transient),
++    ]
++}
++
++/// Installs the exact 720p-to-4K profile after checking all stock sites.
++///
++/// # Safety
++/// The image stays mapped and no thread runs its code yet. A caller must
++/// abandon this mapped image if installation fails.
++#[cfg(windows)]
++pub unsafe fn apply_series_s_4k(base: usize, size: usize) -> Result<(), (&'static str, Patched)> {
++    let plan = series_s_4k_plan();
++    for (site, _) in &plan {
++        // SAFETY: the caller owns a mapped image and has not started it.
++        let found = unsafe { matches(base, size, site) };
++        if found != Patched::Done {
++            return Err((site.what, found));
++        }
++    }
++    for (site, code) in plan {
++        // SAFETY: the image is still unstarted; write also rechecks the bytes.
++        let applied = unsafe { write(base, size, site, &code) };
++        if applied != Patched::Done {
++            return Err((site.what, applied));
++        }
++    }
++    tracing::info!(
++        render = ?[1280, 720], output = ?[3840, 2160], scanout_mib = 128,
++        transient_mib = SERIES_S_UHD_TRANSIENT_MIB,
++        "applied Series S 4K display profile"
++    );
++    Ok(())
++}
++
+ /// Applies what the switches ask for; a line each in the log and on
+ /// standard output.
+ ///
+@@ -384,6 +450,33 @@ mod tests {
+         assert!(c[50..].iter().all(|&x| x == 0xcc));
+     }
+
++    #[test]
++    fn series_s_4k_plan_sets_the_output_scale_and_pools() {
++        let [(output, code), (scale, loads), (pool, allocation), (transient, pages)] =
++            series_s_4k_plan();
++        assert_eq!(pool.at, SERIES_S_SCANOUT_POOL.at);
++        assert_eq!(allocation[0], 0xb8);
++        let capacity = u32::from_le_bytes(allocation[1..].try_into().unwrap());
++        let scanout_bytes = 4 * 33_423_360;
++        assert_eq!(capacity - scanout_bytes, 512 << 10);
++        assert!(capacity - scanout_bytes < 2 << 20);
++        assert_eq!(transient.at, SERIES_S_TRANSIENT_POOL.at);
++        assert_eq!(pages[0], 0xb8);
++        let page_count = u32::from_le_bytes(pages[1..].try_into().unwrap());
++        assert_eq!(page_count << 16, 576 << 20);
++        assert!(page_count << 16 >= 0x205e0000);
++        assert_eq!(output.at, OUTPUT.at);
++        assert_eq!(code[1..5], 3840u32.to_le_bytes());
++        assert_eq!(code[12..16], 2160u32.to_le_bytes());
++        assert_eq!(scale.at, FFX_SCALE.at);
++        let factor = f32::from_le_bytes(loads[0x64..0x68].try_into().unwrap());
++        assert_eq!([3840.0, 2160.0].map(|size| size * factor), [1280.0, 720.0]);
++        for at in [0x28, 0x32] {
++            let disp = i32::from_le_bytes(loads[at + 4..at + 8].try_into().unwrap());
++            assert_eq!(at as i32 + 8 + disp, 0x64);
++        }
++    }
++
+     #[test]
+     fn the_scale_codes() {
+         let own = own_scale_code(0.5);

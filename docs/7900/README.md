@@ -1,11 +1,29 @@
-# Series S ray-traced replay on RTX 5090
+# Series S 4K DLSS replay on RTX 5090
 
 This is the renderer built by the root [build script](../../build.sh). It uses
 [VIctory-7900XTX at 014d52d](https://github.com/avatarmanz/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
-with LinVxtory's Linux and face/hair work, CPU submission changes, and bounded
-readback capture. The patch is GPL-3.0-or-later like the renderer. The kit
-provides source, settings, and input hashes. Use your own game files and
-build the runtime locally.
+with LinVxtory's Linux and face/hair work, CPU submission changes, bounded
+readback capture, and direct 4K DLSS Super Resolution. The patches are
+GPL-3.0-or-later like the renderer. The kit provides source, settings, and
+input hashes. Use your own game files and build the runtime locally.
+
+## Current 4K baseline
+
+The current Series S profile feeds **1280×720** into DLSS Super Resolution
+in Ultra Performance mode and presents a **3840×2160** swap chain. The
+title still generates jitter, using the 72-phase count reported by the
+upscaler. The renderer composites the UI at presentation.
+
+The offline AOC replay on CachyOS and RTX 5090 completed its scheduled
+301-second run. It logged **at least 1,024 DLSS evaluations**, all 53
+ray-tracing builder pipelines and ambient substitute off. In the cell
+from elapsed seconds 240–295, 585 title Present intervals yielded
+**10.77 median FPS**, a 92.89 ms median frame interval and a **119.01 ms
+95th-percentile** interval. Face and hair rendered in the intro, and the
+ponytail, wire window and lighting remained visible in the cell.
+
+This is one 4K baseline replay. A matched speed comparison and longer
+session have yet to run. The feature in this build is Super Resolution.
 
 ## Build and launch
 
@@ -13,16 +31,21 @@ Set up Rust 1.98.1 and the Windows x64 MSVC cross toolchain, with Cargo's
 locked dependencies available offline.
 [Cross-toolchain setup](../pr995-candidate/README.md#reconstruct-and-build)
 
-From the LinVxtory checkout:
+Get NVIDIA DLSS SDK **310.9.16** and point `VICTORY_DLSS_SDK` at the
+directory containing `lib/Windows_x86_64/nvsdk_ngx_d.lib`.
+[NVIDIA DLSS SDK release](https://github.com/NVIDIA/DLSS/releases/tag/v310.9.16)
+
+From the LinVxtory checkout, build the renderer.
 
 ```sh
+export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
 Use a fresh external source directory when upgrading. The script reconstructs
-and verifies the tested Git tree `0ab430bbecb29f450d2d9e837673ad10aa1210b4`
-and checks all 259 build inputs. It builds the diagnostic profile used for
-these measurements.
+and verifies the tested Git tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`
+and checks all 263 build inputs. It builds the diagnostic DLSS profile used
+for the 4K measurement.
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
@@ -39,25 +62,42 @@ The replay used a read-only game mount, an isolated offline runtime, and a
 fixed stop time. The settings disable the renderer watchdog, so use a time
 limit for unattended tests.
 
+Prepare the dedicated Wine prefix with the Microsoft x64 Visual C++ v14
+runtime. Set `NGX_RUNTIME` to a local folder with the official SDK's
+`nvngx_dlss.dll`, `_nvngx.dll` and `nvngx.dll` from the installed NVIDIA
+driver's Wine components, and the x64 `nvapi64.dll` from Proton's
+DXVK-NVAPI. Use the signed NVIDIA DLLs from your installation. The build
+kit contains none of these files.
+[Microsoft Visual C++ runtime](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) · [DXVK-NVAPI](https://github.com/jp7677/dxvk-nvapi)
+
 ```sh
 src=$(realpath "../linvxtory-rt-renderer")
+bin="$src/target/x86_64-pc-windows-msvc/diag"
+system32="$WINEPREFIX/drive_c/windows/system32"
+mkdir -p "$system32"
+for dll in _nvngx.dll nvngx.dll nvapi64.dll; do
+    install -m 0644 "$NGX_RUNTIME/$dll" "$system32/$dll"
+done
+install -m 0644 "$NGX_RUNTIME/nvngx_dlss.dll" "$bin/nvngx_dlss.dll"
+export WINEDLLOVERRIDES='d3d12=n;d3d12core=n;dxgi=n;nvngx_dlss,_nvngx,nvngx,nvapi64,concrt140,msvcp140,vcruntime140,vcruntime140_1=n'
+"$PROTON_WINE" wineboot -u
+"$PROTON_WINE" reg add 'HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore' \
+  /v FullPath /t REG_SZ /d 'C:\Windows\System32' /f
 set -a
 . ./docs/7900/rt-speed.env.sh
 set +a
-export WINEDLLOVERRIDES='d3d12=n;d3d12core=n;dxgi=n'
 export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
-"$PROTON_WINE" "$src/target/x86_64-pc-windows-msvc/diag/victory.exe" \
+"$PROTON_WINE" "$bin/victory.exe" \
   run "$TITLE_EXE" --execute --console series-s
 ```
 
-This selects Series S at 1920×1080 with ray tracing active and the ambient
+This selects the 4K baseline with ray tracing active and the ambient
 substitute disabled. The preset waits up to five seconds on a pipeline's
-first use. A cold run can spend several minutes compiling. The FPS
-measurements below use a warmed shader cache.
+first use. A cold run can spend several minutes compiling.
 
 ## Findings
 
-Each comparison uses the same executable within the pair, warm cache seed,
+Each earlier 1080p comparison uses the same executable within the pair, warm cache seed,
 runtime, save, and offline 1080p preset. FPS is the median of individual
 title Present intervals from elapsed seconds 240–295. The second capture
 pair ran capture-on first and capture-off second. The table lists the settings
@@ -66,10 +106,10 @@ as off/on or small/large for comparison.
 | Comparison | Median FPS | Median copyback per frame |
 | --- | ---: | ---: |
 | Producer capture off → on, earlier renderer | 7.94 → 8.28 | 19.05 → 18.50 ms |
-| Producer capture off → on, current renderer | 8.14 → 8.89 | 19.35 → 16.70 ms |
+| Producer capture off → on, published 1080p renderer | 8.14 → 8.89 | 19.35 → 16.70 ms |
 | 8 → 16 MiB per capture slot, separate experiment | 9.03 → 8.34 | 17.85 → 18.30 ms |
 
-Both arms of the current comparison ran for about 356 seconds and created
+Both arms of the published 1080p comparison ran for about 356 seconds and created
 all 53 ray-tracing builder pipelines. Capture-on recorded 477 Present
 intervals, and capture-off recorded 362. Fetch wait fell from 10.30 to
 8.80 ms per frame. The equivalent 4,250–4,499 draw band also improved
@@ -116,7 +156,7 @@ Narrower enhanced-barrier scopes also gave similar or slower timings
 in the fixture. The preset leaves ordered batching disabled.
 [Ordered batching implementation](https://github.com/avatarmanz/VIctory-7900XTX/pull/438)
 
-### DLSS Super Resolution on Proton
+### Earlier 1080p DLSS trial on Proton
 
 A private trial adapted the DLSS replacement to the Series S upscaler call.
 Both replays used the same executable, cache seed, driver, 720p render at
@@ -130,8 +170,8 @@ The +240 to +295 second window measured **7.28 FPS with FidelityFX and
 The +260 to +295 second window measured **7.37 and 7.28 FPS**. In the
 later +300 to +350 second window, 95th-percentile frame time increased
 from **335 to 744 ms**. This single pair shows that Super Resolution can
-run on this Linux setup. A repeatable speedup remains unverified, so the
-published build keeps FidelityFX. [Donor DLSS experiment](https://github.com/avatarmanz/VIctory-7900XTX/pull/203)
+run on this Linux setup. A repeatable 1080p speedup remains unverified.
+[Donor DLSS experiment](https://github.com/avatarmanz/VIctory-7900XTX/pull/203)
 
 ## Earlier ray-traced measurements
 
@@ -168,4 +208,6 @@ the face/hair fixes developed with [OctoAlgo's inkVI stack](../inkvi/README.md).
 The CPU work includes adaptations of
 [batched descriptor retirement](https://github.com/fxceless/victory-fork/pull/1429)
 and [in-place dirty-range merging](https://github.com/fxceless/victory-fork/pull/1431).
+The DLSS bridge builds on the
+[7900XTX DLSS experiment](https://github.com/avatarmanz/VIctory-7900XTX/pull/203).
 See the [project credits](../../README.md#attribution) for earlier work.
