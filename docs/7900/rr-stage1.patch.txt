@@ -1,0 +1,936 @@
+diff --git a/crates/victory-gpu/src/dof.rs b/crates/victory-gpu/src/dof.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..51452daecc3e9a13d4c0ff9cd7bfd7e56493adfb
+--- /dev/null
++++ b/crates/victory-gpu/src/dof.rs
+@@ -0,0 +1,375 @@
++//! The title's final depth-of-field composite and the following FFX input.
++
++use std::sync::OnceLock;
++
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::Win32::Graphics::Dxgi::Common::*;
++use windows::core::s;
++
++use crate::host::{HostList, host, transition};
++use crate::object::This;
++
++pub(crate) const SHADER: &str = "456f02b52910aabc";
++const WIDTH: u32 = 1280;
++const HEIGHT: u32 = 720;
++const INPUT: D3D12_RESOURCE_STATES = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++const SOURCE: &str = r#"
++Texture2D<float4> beforeDof : register(t0);
++Texture2D<float4> afterDof : register(t1);
++RWTexture2D<float> guide : register(u0);
++
++[RootSignature("DescriptorTable(SRV(t0, numDescriptors=2), UAV(u0))")]
++[numthreads(16, 16, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    float3 delta = afterDof.Load(int3(id.xy, 0)).rgb - beforeDof.Load(int3(id.xy, 0)).rgb;
++    float value = dot(delta, float3(0.25, 0.5, 0.25));
++    guide[id.xy] = isfinite(value) ? clamp(value, -65504.0, 65504.0) : 0.0;
++}
++"#;
++
++pub(crate) fn enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_DOF_GUIDE").is_some_and(|v| v == "1"))
++}
++
++pub(crate) struct Before {
++    texture: ID3D12Resource,
++    title: usize,
++    serial: u64,
++    epoch: u64,
++    frame: u64,
++}
++
++pub(crate) fn invalidate(list: &HostList) {
++    if enabled() {
++        list.dof_before().take();
++    }
++}
++
++fn same_frame(expected: [u64; 4], current: [u64; 4]) -> bool {
++    expected == current
++}
++
++fn is_color(desc: D3D12_RESOURCE_DESC) -> bool {
++    desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        && desc.Width == u64::from(WIDTH)
++        && desc.Height == HEIGHT
++        && desc.DepthOrArraySize == 1
++        && desc.MipLevels == 1
++        && desc.SampleDesc.Count == 1
++        && desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT
++        && !desc
++            .Flags
++            .contains(D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE)
++}
++
++fn texture(
++    device: &ID3D12Device,
++    desc: &D3D12_RESOURCE_DESC,
++    state: D3D12_RESOURCE_STATES,
++) -> Option<ID3D12Resource> {
++    let mut resource = None;
++    // SAFETY: plain committed resource on the host device.
++    unsafe {
++        device
++            .CreateCommittedResource(
++                &D3D12_HEAP_PROPERTIES {
++                    Type: D3D12_HEAP_TYPE_DEFAULT,
++                    ..Default::default()
++                },
++                D3D12_HEAP_FLAG_NONE,
++                desc,
++                state,
++                None,
++                &mut resource,
++            )
++            .ok()?;
++    }
++    resource
++}
++
++pub(crate) fn before(list: &HostList, title: This) -> Option<()> {
++    let host = host()?;
++    let color = crate::resource::made_copy(title)?;
++    // SAFETY: the Arc holds the color resource.
++    let mut desc = unsafe { color.texture.GetDesc() };
++    if !is_color(desc) {
++        return None;
++    }
++    desc.Flags = D3D12_RESOURCE_FLAG_NONE;
++    let texture = texture(&host.device, &desc, D3D12_RESOURCE_STATE_COPY_DEST)?;
++    list.keep(&texture);
++    crate::list::ensure_state(list, title, D3D12_RESOURCE_STATE_COPY_SOURCE.0 as u32);
++    // SAFETY: open list, matching descriptions and live resources.
++    unsafe { list.list.CopyResource(&texture, &color.texture) };
++    crate::list::ensure_state(list, title, D3D12_RESOURCE_STATE_RENDER_TARGET.0 as u32);
++    *list.dof_before() = Some(Before {
++        texture,
++        title: title as usize,
++        serial: color.serial,
++        epoch: list.epoch(),
++        frame: crate::queue::presented() + 1,
++    });
++    Some(())
++}
++
++struct Pipeline {
++    root: ID3D12RootSignature,
++    pso: ID3D12PipelineState,
++}
++
++fn pipeline(device: &ID3D12Device) -> Option<&'static Pipeline> {
++    fn create(device: &ID3D12Device) -> windows::core::Result<Pipeline> {
++        let code = crate::host::compile(SOURCE, s!("main"), s!("cs_6_0"))?;
++        let mut support = D3D12_FEATURE_DATA_FORMAT_SUPPORT {
++            Format: DXGI_FORMAT_R16_FLOAT,
++            ..Default::default()
++        };
++        // SAFETY: plain device capability query and pipeline creation.
++        unsafe {
++            device.CheckFeatureSupport(
++                D3D12_FEATURE_FORMAT_SUPPORT,
++                std::ptr::from_mut(&mut support).cast(),
++                size_of_val(&support) as u32,
++            )?;
++            if !support
++                .Support2
++                .contains(D3D12_FORMAT_SUPPORT2_UAV_TYPED_STORE)
++            {
++                return Err(windows::core::Error::empty());
++            }
++            let root: Option<ID3D12RootSignature> = Some(device.CreateRootSignature(0, &code)?);
++            let pso = device.CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                pRootSignature: std::mem::transmute_copy(&root),
++                CS: D3D12_SHADER_BYTECODE {
++                    pShaderBytecode: code.as_ptr().cast(),
++                    BytecodeLength: code.len(),
++                },
++                ..Default::default()
++            });
++            Ok(Pipeline {
++                root: root.ok_or_else(windows::core::Error::empty)?,
++                pso: pso?,
++            })
++        }
++    }
++    static PIPELINE: OnceLock<Option<Pipeline>> = OnceLock::new();
++    PIPELINE
++        .get_or_init(|| {
++            create(device)
++                .inspect_err(|error| tracing::warn!(%error, "DOF guide pipeline unavailable"))
++                .ok()
++        })
++        .as_ref()
++}
++
++pub(crate) fn produce(list: &HostList, title: This) -> Option<ID3D12Resource> {
++    if !enabled() {
++        return None;
++    }
++    let Some(before) = list.dof_before().take() else {
++        return None;
++    };
++    if title.is_null() || !crate::resource::is_resource(title) {
++        return None;
++    }
++    let color = crate::resource::made_copy(title)?;
++    let frame = crate::queue::presented() + 1;
++    if !same_frame(
++        [
++            before.title as u64,
++            before.serial,
++            before.epoch,
++            before.frame,
++        ],
++        [title as u64, color.serial, list.epoch(), frame],
++    ) || crate::resource::alias_of(title).is_some()
++        || crate::texture::title_written(&color.texture)
++    {
++        tracing::debug!(frame, "DOF guide withheld for mismatched or dirty handoff");
++        return None;
++    }
++    let host = host()?;
++    let device = &host.device;
++    let pipeline = pipeline(device)?;
++    // SAFETY: matched to the resource held during the pre-composite copy.
++    let mut desc = unsafe { color.texture.GetDesc() };
++    desc.Format = DXGI_FORMAT_R16_FLOAT;
++    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    let output = texture(device, &desc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS)?;
++    // SAFETY: plain heap creation.
++    let heap: ID3D12DescriptorHeap = unsafe {
++        device
++            .CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
++                Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++                NumDescriptors: 3,
++                Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++                NodeMask: 0,
++            })
++            .ok()?
++    };
++    list.keep(&output);
++    list.keep(&heap);
++    // SAFETY: the heap has three descriptors and the list holds all three textures.
++    unsafe {
++        let stride = device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV)
++            as usize;
++        let mut cpu = heap.GetCPUDescriptorHandleForHeapStart();
++        device.CreateShaderResourceView(&before.texture, None, cpu);
++        cpu.ptr += stride;
++        device.CreateShaderResourceView(&color.texture, None, cpu);
++        cpu.ptr += stride;
++        device.CreateUnorderedAccessView(&output, None::<&ID3D12Resource>, None, cpu);
++    }
++    crate::list::ensure_state(list, title, INPUT.0 as u32);
++    // SAFETY: open list, held resources, exact dimensions divisible by 16.
++    unsafe {
++        list.list.barriers(&[transition(
++            &before.texture,
++            D3D12_RESOURCE_STATE_COPY_DEST,
++            INPUT,
++        )]);
++        list.list.SetDescriptorHeaps(&[Some(heap.clone())]);
++        list.list.SetComputeRootSignature(&pipeline.root);
++        list.list.SetPipelineState(&pipeline.pso);
++        list.list
++            .SetComputeRootDescriptorTable(0, heap.GetGPUDescriptorHandleForHeapStart());
++        list.list.Dispatch(WIDTH / 16, HEIGHT / 16, 1);
++        list.list.barriers(&[transition(
++            &output,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            INPUT,
++        )]);
++    }
++    capture_check(list, &output, frame);
++    static RECORDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    let recorded = RECORDED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
++    if recorded <= 4 || recorded.is_multiple_of(256) {
++        tracing::info!(
++            frame,
++            serial = color.serial,
++            recorded,
++            "DOF guide recorded before FidelityFX"
++        );
++    }
++    Some(output)
++}
++
++const PITCH: u32 = (WIDTH * 2).next_multiple_of(256);
++
++fn capture_check(list: &HostList, source: &ID3D12Resource, frame: u64) {
++    static FRAME: OnceLock<Option<u64>> = OnceLock::new();
++    static CHECKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++    let first = *FRAME.get_or_init(|| std::env::var("VICTORY_DOF_CHECK_FRAME").ok()?.parse().ok());
++    if first.is_none_or(|first| frame < first)
++        || CHECKED.swap(true, std::sync::atomic::Ordering::Relaxed)
++    {
++        return;
++    }
++    let Some(buffer) = host().and_then(|h| h.read_back_buffer(u64::from(PITCH * HEIGHT))) else {
++        return;
++    };
++    // SAFETY: copy locations borrow the held resources through submission.
++    unsafe {
++        let from = D3D12_TEXTURE_COPY_LOCATION {
++            pResource: std::mem::transmute_copy(source),
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                SubresourceIndex: 0,
++            },
++        };
++        let to = D3D12_TEXTURE_COPY_LOCATION {
++            pResource: std::mem::transmute_copy(&buffer),
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: 0,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: DXGI_FORMAT_R16_FLOAT,
++                        Width: WIDTH,
++                        Height: HEIGHT,
++                        Depth: 1,
++                        RowPitch: PITCH,
++                    },
++                },
++            },
++        };
++        list.list
++            .barriers(&[transition(source, INPUT, D3D12_RESOURCE_STATE_COPY_SOURCE)]);
++        list.list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
++        list.list
++            .barriers(&[transition(source, D3D12_RESOURCE_STATE_COPY_SOURCE, INPUT)]);
++    }
++    list.dof_readback(Readback { buffer, frame });
++}
++
++pub(crate) struct Readback {
++    buffer: ID3D12Resource,
++    frame: u64,
++}
++
++impl Readback {
++    pub(crate) fn check(&self) {
++        let bytes = (PITCH * HEIGHT) as usize;
++        let mut ptr = std::ptr::null_mut();
++        // SAFETY: called after the host submission fence; the whole footprint was copied.
++        let map = unsafe {
++            self.buffer.Map(
++                0,
++                Some(&D3D12_RANGE {
++                    Begin: 0,
++                    End: bytes,
++                }),
++                Some(&mut ptr),
++            )
++        };
++        if map.is_err() || ptr.is_null() {
++            tracing::warn!(frame = self.frame, "DOF guide readback failed");
++            return;
++        }
++        let [mut zero, mut positive, mut negative, mut non_finite] = [0; 4];
++        let mut max_abs_half = 0;
++        // SAFETY: successful Map covers the footprint.
++        let data = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), bytes) };
++        for row in data.chunks_exact(PITCH as usize) {
++            for p in row[..(WIDTH * 2) as usize].chunks_exact(2) {
++                let bits = u16::from_le_bytes([p[0], p[1]]);
++                let absolute = bits & 0x7fff;
++                if absolute >= 0x7c00 {
++                    non_finite += 1;
++                } else if absolute == 0 {
++                    zero += 1;
++                } else if bits == absolute {
++                    positive += 1;
++                } else {
++                    negative += 1;
++                }
++                max_abs_half = max_abs_half.max(absolute);
++            }
++        }
++        // SAFETY: the readback is still mapped; no CPU writes.
++        unsafe {
++            self.buffer
++                .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }))
++        };
++        tracing::info!(
++            frame = self.frame,
++            zero,
++            positive,
++            negative,
++            non_finite,
++            max_abs_half,
++            "DOF guide GPU readback"
++        );
++    }
++}
++
++#[test]
++fn handoff_rejects_a_recycled_copy_or_an_intervening_gpu_operation() {
++    assert!(same_frame([1, 2, 3, 4], [1, 2, 3, 4]));
++    for changed in 0..4 {
++        let mut current = [1, 2, 3, 4];
++        current[changed] += 1;
++        assert!(!same_frame([1, 2, 3, 4], current));
++    }
++}
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 33e0ec5b8c96c806f635a6990f2babde67261215..0c7d87994fd42a81e42d8ca672e390c6fd6c3e55 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1670,6 +1670,8 @@ impl State {
+         compute: bool,
+         launch: Option<&crate::pipeline::host::MeshLaunch>,
+     ) -> bool {
++        #[cfg(feature = "diagnostics")]
++        crate::dof::invalidate(list);
+         let (pso, signature) = launch.map_or((&p.pso, &p.root), |launch| (&launch.pso, &launch.root));
+         let l = &list.list;
+         // Textures picked by index, before anything asks for them.
+@@ -3017,9 +3019,13 @@ impl State {
+         }
+         #[cfg(feature = "diagnostics")]
+         let stamp = crate::host::rtstamps::before(&list.list);
++        #[cfg(feature = "diagnostics")]
++        let stats = crate::host::pass_stats::before(list, p.stages.first().map(|s| s.shader.hash.as_str()), 1);
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
+         #[cfg(feature = "diagnostics")]
++        crate::host::pass_stats::after(list, stats);
++        #[cfg(feature = "diagnostics")]
+         if stamp.is_some() {
+             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+         }
+@@ -4384,10 +4390,24 @@ impl State {
+         if kind == MESH {
+             self.mesh_scissor(list, true);
+         }
++        #[cfg(feature = "diagnostics")]
++        if crate::dof::enabled()
++            && kind == INDEXED && max == 1
++            && p.stages.iter().any(|stage| stage.shader.hash == crate::dof::SHADER)
++            && let [target] = self.targets.as_slice()
++        {
++            let _ = crate::dof::before(list, *target as This);
++        }
+         // SAFETY: an open list with everything set; the scratch buffer and
+         // host copies are kept alive by the list, and the signature is cached.
+         #[cfg(feature = "diagnostics")]
+         let stamp = if kind == DISPATCH { crate::host::rtstamps::before(&list.list) } else { None };
++        #[cfg(feature = "diagnostics")]
++        let stats = if kind == DISPATCH {
++            crate::host::pass_stats::before(list, p.stages.first().map(|s| s.shader.hash.as_str()), max)
++        } else {
++            None
++        };
+         unsafe {
+             list.list.ExecuteIndirect(
+                 &signature,
+@@ -4398,6 +4418,8 @@ impl State {
+                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+             )
+         };
++        #[cfg(feature = "diagnostics")]
++        crate::host::pass_stats::after(list, stats);
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 25b4803e4c46ba07080478e7b3fad52fe43866e8..f2a1a1eff6ecf17e7aa01de783663fa7944d45c0 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -39,6 +39,13 @@ impl Recording<'_> {
+         Some(())
+     }
+ 
++    /// Record a signed FP16 guide from the same-list stock DOF composite.
++    /// Call before preparing the other FidelityFX inputs.
++    #[cfg(feature = "diagnostics")]
++    pub fn dof_guide(&self, color: This) -> Option<ID3D12Resource> {
++        crate::dof::produce(self.0, color)
++    }
++
+     /// Access flushes any pending host barriers before the provider runs.
+     pub fn commands(&self) -> &ID3D12GraphicsCommandList {
+         &self.0.list
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..bcdac97ad6e3240161e0ff7939bbadc1cf98a98b 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1384,6 +1384,8 @@ fn give_batch_buffers(buffers: Vec<ID3D12Resource>) {
+ /// A host command list and its allocator, always used together.
+ pub(crate) struct HostList {
+     allocator: ID3D12CommandAllocator,
++    #[cfg(feature = "diagnostics")]
++    dof_before: Mutex<Option<crate::dof::Before>>,
+     /// With barriers held and joined (`rec`).
+     pub(crate) list: rec::Rec,
+     /// Work for submission time, in recorded order.
+@@ -1409,6 +1411,8 @@ pub(crate) struct HostList {
+     /// What its indirect executions ran, for the report of a removed device.
+     #[cfg(feature = "diagnostics")]
+     indirects: indirects::Shared,
++    #[cfg(feature = "diagnostics")]
++    pass_stats: Mutex<Vec<pass_stats::Sample>>,
+     /// The work its indirect executions may still do (`indirect`): a
+     /// shader-writable word, zeroed when the list is submitted, and after
+     /// it what the clamp notes about mesh records. In memory the CPU maps.
+@@ -2667,6 +2671,8 @@ struct Deferred {
+     back_wanted: Vec<crate::texback::Target>,
+     /// Those copies, whose texels go to title memory once the list has run.
+     texture_backs: Vec<crate::texback::Back>,
++    #[cfg(feature = "diagnostics")]
++    dof_backs: Vec<crate::dof::Readback>,
+     /// Whether the indirect-work budget is zeroed for this recording (a
+     /// step on the CPU, or in the list for the card's copy).
+     budget_zeroed: bool,
+@@ -4272,6 +4278,8 @@ mod traffic;
+ pub(crate) mod upcheck;
+ #[cfg(feature = "diagnostics")]
+ pub(crate) mod rtstamps;
++#[cfg(feature = "diagnostics")]
++pub(crate) mod pass_stats;
+ #[cfg(test)]
+ mod fused_capture;
+ #[cfg(test)]
+@@ -4428,6 +4436,10 @@ pub(crate) fn walls_trace() -> bool {
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+ fn read_backs(list: &HostList) {
++    #[cfg(feature = "diagnostics")]
++    for check in std::mem::take(&mut list.deferred().dof_backs) {
++        check.check();
++    }
+     // Textures shaders wrote that the title reads on the CPU
+     // ([`crate::texback`]).
+     for back in &list.deferred().texture_backs {
+@@ -4675,6 +4687,8 @@ impl Host {
+             }
+             Ok(HostList {
+                 allocator,
++                #[cfg(feature = "diagnostics")]
++                dof_before: Mutex::default(),
+                 list: rec::Rec::new(list),
+                 deferred: Mutex::default(),
+                 scratch: Mutex::default(),
+@@ -4684,6 +4698,8 @@ impl Host {
+                 pipelines,
+                 #[cfg(feature = "diagnostics")]
+                 indirects,
++                #[cfg(feature = "diagnostics")]
++                pass_stats: Mutex::default(),
+                 budget: OnceLock::new(),
+                 card_budget: OnceLock::new(),
+                 indirect_args: Mutex::default(),
+@@ -6206,6 +6222,8 @@ impl Host {
+         }
+         let behind = late && flying();
+         stage.next("submit: gathering what to ask about");
++        #[cfg(feature = "diagnostics")]
++        pass_stats::report_completed(&self.fence);
+         let this_submission = STARTED.fetch_add(1, Ordering::AcqRel) + 1;
+         // The ranges shaders write are counted for it (with the relay).
+         crate::shadow::preparing(this_submission);
+@@ -6379,6 +6397,8 @@ impl Host {
+         }
+         #[cfg(feature = "diagnostics")]
+         let sending = crate::timeline::ticks();
++        #[cfg(feature = "diagnostics")]
++        let stats_frame = crate::queue::presented() + 1;
+         if late {
+             *submitted += 1;
+             #[cfg(feature = "diagnostics")]
+@@ -6407,6 +6427,8 @@ impl Host {
+             }
+             #[cfg(feature = "diagnostics")]
+             split.part(5);
++            #[cfg(feature = "diagnostics")]
++            pass_stats::submitted(stats_frame, this_submission, runs, *submitted);
+             let back = crate::picked::with(declared, &picked.written);
+             let mut texture_back_ranges = Vec::new();
+             for list in runs {
+@@ -6506,6 +6528,11 @@ impl Host {
+             let _ = (_i, started);
+         }
+         let _ = &firsts;
++        #[cfg(feature = "diagnostics")]
++        {
++            pass_stats::submitted(stats_frame, this_submission, runs, *submitted);
++            pass_stats::report_completed(&self.fence);
++        }
+         FINISHED.store(this_submission, Ordering::Release);
+         bury(this_submission);
+         let gpu = prepared.elapsed();
+@@ -7007,6 +7034,8 @@ impl HostList {
+     pub(crate) fn reset(&self) {
+         self.changed_something();
+         #[cfg(feature = "diagnostics")]
++        crate::dof::invalidate(self);
++        #[cfg(feature = "diagnostics")]
+         let started = std::time::Instant::now();
+         let _resetting = crate::timeline::span("resetting a host list");
+         self._alive.used();
+@@ -7018,6 +7047,8 @@ impl HostList {
+         #[cfg(feature = "diagnostics")]
+         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         #[cfg(feature = "diagnostics")]
++        self.pass_stats.lock().unwrap_or_else(|e| e.into_inner()).clear();
++        #[cfg(feature = "diagnostics")]
+         self.notes.lock().unwrap_or_else(|e| e.into_inner()).clear();
+         {
+             let mut scratch = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+@@ -8001,6 +8032,16 @@ impl HostList {
+         self.deferred().indirect_readable = scratch.as_raw() as usize;
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn dof_before(&self) -> std::sync::MutexGuard<'_, Option<crate::dof::Before>> {
++        self.dof_before.lock().unwrap_or_else(|e| e.into_inner())
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn dof_readback(&self, check: crate::dof::Readback) {
++        self.deferred().dof_backs.push(check);
++    }
++
+     /// Keeps `object` alive until the list is reset.
+     pub(crate) fn keep(&self, object: &impl Interface) {
+         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+diff --git a/crates/victory-gpu/src/host/pass_stats.rs b/crates/victory-gpu/src/host/pass_stats.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..329fb915c16f10676ae1dbfc57e5fa72608ca6ae
+--- /dev/null
++++ b/crates/victory-gpu/src/host/pass_stats.rs
+@@ -0,0 +1,284 @@
++//! Opt-in host pipeline statistics for the title's reflection and lighting passes.
++
++use std::sync::{
++    Mutex, OnceLock,
++    atomic::{AtomicU32, Ordering::Relaxed},
++};
++
++use windows::Win32::Graphics::Direct3D12::*;
++
++use super::{HostList, host};
++
++const CAPACITY: u32 = 128;
++const BYTES: usize = size_of::<D3D12_QUERY_DATA_PIPELINE_STATISTICS>();
++const HASHES: &[&str] = &[
++    "34992f2b65a789a5", // Alpha temporal
++    "71883e40620a567a", // Opaque temporal and frame statistics
++    "dce085c07b9414b6", // Opaque bilateral
++    "6fad2980c2774c90", // Opaque history
++    "63381c3250b287fa",
++    "ff6fdf23ce0b9048", // Spatial variants
++    "7168dd781ca7efb9",
++    "d2b169b82f67ec5b",
++    "6d7fe7745ab9c6d8", // Ray prepass and trace
++    "2dc364df5d3278b8",
++    "940c2635dc1312f4",
++    "34fb51b8a0312e82", // Indirect diffuse
++    "577248728544d74b", // Apply combined deferred lighting
++];
++
++struct Queries {
++    heap: ID3D12QueryHeap,
++    readback: ID3D12Resource,
++    mapped: usize,
++    next: AtomicU32,
++    pending: Mutex<Vec<Pending>>,
++}
++
++#[derive(Clone, Copy)]
++pub(crate) struct Sample {
++    slot: u32,
++    recorded_frame: u64,
++    shader: &'static str,
++    max_commands: u32,
++    sent: bool,
++}
++
++struct Pending {
++    sample: Sample,
++    fence: u64,
++    frame: u64,
++    submission: u64,
++    list_index: usize,
++    list_epoch: u64,
++}
++
++static QUERIES: OnceLock<Option<Queries>> = OnceLock::new();
++
++fn capture_frame() -> Option<u64> {
++    static FRAME: OnceLock<Option<u64>> = OnceLock::new();
++    *FRAME.get_or_init(|| {
++        let value = std::env::var_os("VICTORY_PASS_STATS_FRAME")?;
++        let frame = value
++            .to_str()
++            .and_then(|s| s.parse().ok())
++            .filter(|&n| n != 0);
++        if frame.is_none() {
++            tracing::warn!(
++                "pass statistics unavailable: expected a positive VICTORY_PASS_STATS_FRAME"
++            );
++        }
++        frame
++    })
++}
++
++fn frame() -> u64 {
++    crate::queue::presented() + 1
++}
++
++fn create() -> Option<Queries> {
++    let host = host()?;
++    let mut heap = None;
++    let mut mapped = std::ptr::null_mut();
++    // SAFETY: plain creation and mapping. Dedicated lifetime storage, separate from guest queries.
++    unsafe {
++        host.device
++            .CreateQueryHeap(
++                &D3D12_QUERY_HEAP_DESC {
++                    Type: D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS,
++                    Count: CAPACITY,
++                    NodeMask: 0,
++                },
++                &mut heap,
++            )
++            .ok()?;
++        let readback = host.read_back_buffer((BYTES * CAPACITY as usize) as u64)?;
++        readback.Map(0, None, Some(&mut mapped)).ok()?;
++        if mapped.is_null() {
++            return None;
++        }
++        std::ptr::write_bytes(mapped.cast::<u8>(), 0xff, BYTES * CAPACITY as usize);
++        Some(Queries {
++            heap: heap?,
++            readback,
++            mapped: mapped as usize,
++            next: AtomicU32::new(0),
++            pending: Mutex::new(Vec::new()),
++        })
++    }
++}
++
++pub(crate) fn before(list: &HostList, shader: Option<&str>, max_commands: u32) -> Option<Sample> {
++    let target = capture_frame()?;
++    let recorded_frame = frame();
++    if !(target.saturating_sub(2)..=target).contains(&recorded_frame) {
++        return None;
++    }
++    let shader = HASHES.iter().copied().find(|&hash| Some(hash) == shader)?;
++    let queries = QUERIES
++        .get_or_init(|| {
++            let queries = create();
++            if queries.is_none() {
++                tracing::warn!(
++                    target,
++                    "pass statistics unavailable: could not create host query heap/readback"
++                );
++            }
++            queries
++        })
++        .as_ref()?;
++    let slot = queries.next.fetch_add(1, Relaxed);
++    if slot >= CAPACITY {
++        if slot == CAPACITY {
++            tracing::warn!(
++                target,
++                CAPACITY,
++                "pass statistics incomplete: slot limit reached"
++            );
++        }
++        return None;
++    }
++    // SAFETY: the graphics list is open. This slot belongs to this dispatch and is never reused.
++    unsafe {
++        list.list
++            .BeginQuery(&queries.heap, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, slot)
++    };
++    Some(Sample {
++        slot,
++        recorded_frame,
++        shader,
++        max_commands,
++        sent: false,
++    })
++}
++
++pub(crate) fn after(list: &HostList, sample: Option<Sample>) {
++    let (Some(sample), Some(queries)) = (sample, QUERIES.get().and_then(Option::as_ref)) else {
++        return;
++    };
++    // SAFETY: paired to before() on this same list, with a disjoint readback range per slot.
++    unsafe {
++        list.list.EndQuery(
++            &queries.heap,
++            D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
++            sample.slot,
++        );
++        list.list.ResolveQueryData(
++            &queries.heap,
++            D3D12_QUERY_TYPE_PIPELINE_STATISTICS,
++            sample.slot,
++            1,
++            &queries.readback,
++            (BYTES * sample.slot as usize) as u64,
++        );
++    }
++    list.pass_stats
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .push(sample);
++}
++
++/// Associate the recorded samples with the actual host submission and its trailing fence.
++pub(crate) fn submitted(frame: u64, submission: u64, runs: &[&HostList], fence: u64) {
++    let Some(queries) = QUERIES.get().and_then(Option::as_ref) else {
++        return;
++    };
++    let mut pending = queries.pending.lock().unwrap_or_else(|e| e.into_inner());
++    for (list_index, list) in runs.iter().enumerate() {
++        let list_epoch = list.epoch();
++        for sample in list
++            .pass_stats
++            .lock()
++            .unwrap_or_else(|e| e.into_inner())
++            .iter_mut()
++        {
++            if sample.sent {
++                pending.retain(|p| p.sample.slot != sample.slot);
++                tracing::warn!(
++                    frame,
++                    submission,
++                    list_index,
++                    list_epoch,
++                    slot = sample.slot,
++                    "pass statistics incomplete: a sampled list ran again"
++                );
++                continue;
++            }
++            sample.sent = true;
++            pending.push(Pending {
++                sample: *sample,
++                fence,
++                frame,
++                submission,
++                list_index,
++                list_epoch,
++            });
++        }
++    }
++}
++
++/// Called under the host submission lock. The fence orders the resolved readback.
++pub(crate) fn report_completed(fence: &ID3D12Fence) {
++    let Some(queries) = QUERIES.get().and_then(Option::as_ref) else {
++        return;
++    };
++    let mut pending = queries.pending.lock().unwrap_or_else(|e| e.into_inner());
++    if pending.is_empty() {
++        return;
++    }
++    // SAFETY: a plain query of the host's queue fence.
++    let completed = unsafe { fence.GetCompletedValue() };
++    if completed == u64::MAX {
++        pending.clear();
++        tracing::warn!("pass statistics unavailable: host device removed");
++        return;
++    }
++    pending.retain(|p| {
++        if p.fence > completed {
++            return true;
++        }
++        let Sample {
++            slot,
++            recorded_frame,
++            shader,
++            max_commands,
++            ..
++        } = p.sample;
++        // SAFETY: private mapped result, below the signalled fence and within its slot.
++        let cs_invocations = unsafe {
++            let at = (queries.mapped + BYTES * slot as usize)
++                as *const D3D12_QUERY_DATA_PIPELINE_STATISTICS;
++            std::ptr::addr_of!((*at).CSInvocations).read_volatile()
++        };
++        let (frame, submission, list_index, list_epoch, fence) =
++            (p.frame, p.submission, p.list_index, p.list_epoch, p.fence);
++        if cs_invocations == u64::MAX {
++            tracing::warn!(
++                frame,
++                submission,
++                list_index,
++                list_epoch,
++                slot,
++                recorded_frame,
++                shader,
++                fence,
++                "pass statistics incomplete: no resolved value at retired fence"
++            );
++        } else {
++            tracing::info!(
++                frame,
++                submission,
++                list_index,
++                list_epoch,
++                slot,
++                recorded_frame,
++                shader,
++                max_commands,
++                fence,
++                cs_invocations,
++                "retired pass statistics"
++            );
++        }
++        false
++    });
++}
+diff --git a/crates/victory-gpu/src/lib.rs b/crates/victory-gpu/src/lib.rs
+index df03e719b155445730e2ae3584cabe9fc3659db8..377ce1b46342a43ba3023991d7e5b0ca46899092 100644
+--- a/crates/victory-gpu/src/lib.rs
++++ b/crates/victory-gpu/src/lib.rs
+@@ -25,6 +25,8 @@ mod texlate;
+ mod texstore;
+ #[cfg(all(windows, feature = "diagnostics"))]
+ mod capture;
++#[cfg(all(windows, feature = "diagnostics"))]
++mod dof;
+ #[cfg(windows)]
+ mod compose;
+ pub mod console;
+diff --git a/crates/victory-gpu/src/list.rs b/crates/victory-gpu/src/list.rs
+index 1e60358b6ce5fecbd4789760c15ce983a538490a..b3b40e23b25aea68caceafac6fc5064c542a4221 100644
+--- a/crates/victory-gpu/src/list.rs
++++ b/crates/victory-gpu/src/list.rs
+@@ -1385,6 +1385,8 @@ extern "system" fn clear_rtv(
+                     State(RENDER_TARGET as i32),
+                 )]);
+             }
++            #[cfg(feature = "diagnostics")]
++            crate::dof::invalidate(list);
+             list.list.ClearRenderTargetView(rtv, color, rects);
+         }
+     }
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index b69486d0c0e87b7556da7d1eb27082af229f0bf1..b14ee17e20fa5b0cadb52e5103d4ec981b1b8708 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -403,6 +403,12 @@ fn record(
+         }
+         Ok(host)
+     };
++    #[cfg(feature = "diagnostics")]
++    let _dof_guide = if is_owned(active.context) {
++        list.dof_guide(info.resources[0].resource.cast::<Object>())
++    } else {
++        None
++    };
+     let color = input(0)?;
+     let depth = input(1)?;
+     let motion = input(2)?;

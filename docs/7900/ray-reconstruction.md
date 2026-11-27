@@ -349,3 +349,22 @@ These measurements confirm actual GPU execution of both stock filters in
 the SR control. A gameplay bypass must demonstrate the corresponding
 work was removed and the 4K presented frame came from RR. A fixed frame
 number alone does not reproduce the scene across runs.
+
+Apply the [stage-one instrumentation](rr-stage1.patch.txt) immediately
+after the renderer backend overlay to reproduce the guide and execution
+counters. Starting from the control tree above, applying those two patches
+in order produces tree `f1d5002bb0f51a99c7a052800365f8ba4628a4b9`.
+Build the Windows diagnostics profile with the pinned SDK, then set
+`VICTORY_DOF_GUIDE=1`, `VICTORY_DOF_CHECK_FRAME=1779` and
+`VICTORY_PASS_STATS_FRAME=1780`. The DOF count describes the stored guide.
+The conversion maps nonfinite input differences to zero and clamps to
+representable FP16. Use a separate capture to identify the scene.
+
+The cell graph also contains filters that supply other essential inputs.
+The local-light denoiser updates a packed shadow visibility atlas and tile
+metadata used by light pruning. The diffuse screen-probe filters supply
+the lighting gather and later reflection and caustic work. The alpha probe
+feeds particle shading and transmission. Skipping those passes without
+valid replacement outputs changes scene lighting. A separate 4K dithering
+draw follows the current NGX handoff. Its contribution to visible grain
+has yet to be measured.
