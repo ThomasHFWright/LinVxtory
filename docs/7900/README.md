@@ -42,10 +42,14 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a fresh external source directory when upgrading. The script reconstructs
-and verifies the tested Git tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`
-and checks all 263 build inputs. It builds the diagnostic DLSS profile used
-for the 4K measurement.
+Use a fresh external source directory when upgrading. The build reconstructs
+the measured 4K baseline at `3d033cbd633757d2fd15f97a4323d566e8a043ba`,
+then applies [nvidia-shader-extent.patch.txt](nvidia-shader-extent.patch.txt).
+This candidate limits offline shader hashing to each validated DXBC container.
+The wrapper verifies the resulting Git tree `3ca6a13aecd7edadf807271f9e3e7a1feed603c9`
+and all 263 build inputs before compiling the diagnostic DLSS profile.
+The published replay measurements are from the baseline.
+[VIctory-NVIDIA source change](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/b1369afb40017099471223ff61327c4550669a61)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
