@@ -335,3 +335,17 @@ export VICTORY_RR_SAMPLE_TABLES='7168dd781ca7efb9,srv,0,664;6d7fe7745ab9c6d8,uav
 Use the actual camera, command list, backing serial and occurrence in the
 results. The same shader can process a separate transparent surface, and
 recording for a title frame can span two Present intervals.
+
+The next instrumented game run produced the signed blur guide at all
+921,600 render pixels. The fenced FP16 readback contained 299,219 zeros,
+407,333 positive values, 215,048 negative values and zero nonfinite
+values. Its largest absolute value was 7,316 in native HDR luminance
+units. The effect of that range on an RR gameplay frame remains untested.
+
+The frame-1780 window capture showed the opening cutscene. Retired D3D12
+pipeline-statistics queries counted 122,624 compute invocations for the
+opaque temporal denoiser and 517,632 for one alpha temporal dispatch.
+These measurements confirm actual GPU execution of both stock filters in
+the SR control. A gameplay bypass must demonstrate the corresponding
+work was removed and the 4K presented frame came from RR. A fixed frame
+number alone does not reproduce the scene across runs.
