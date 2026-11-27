@@ -993,7 +993,9 @@ upscale submitted to the GPU.
 Over seconds 240–295 in the loaded cell, 451 of 453 verified Presents
 used RR with native GI and the original optical input. The other two
 used stock SR. The capture-free interval measured **8.37 median FPS**
-and **133.31 ms p95 Present interval**. This is one default-preset
+and **133.31 ms p95 title Present interval** across both paths. The
+449 intervals between consecutive verified RR Presents measured
+**8.36 median FPS** and **131.21 ms p95**. This is one default-preset
 measurement with no paired performance control.
 
 The wavy pane and hair remained visible. Separate exact taps at the
