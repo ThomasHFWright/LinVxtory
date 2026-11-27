@@ -391,3 +391,5 @@ introduces a different NVIDIA renderer baseline. Its [DLSS implementation
 notes](https://github.com/fxceless/victory-fork/blob/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea/docs/dlss.md)
 describe Streamline Super Resolution and Frame Generation. The 4K control
 here remains pinned to the tested renderer.
+
+For command-driven 4K frame captures and shareable Present receipts, see the [inkVI-dive test instructions](dive-testing.md).
