@@ -1,0 +1,39 @@
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index e159611a8242685394cedd77ec455c6f7422a389..c5a289f13993bb0691bbfd188927b60e96355e21 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1562,6 +1562,9 @@ fn wide(jobs: Vec<Job>) {
+     }
+     let workers = workers();
+     let _wide = crate::timeline::span("work spread over threads");
++    // The caller drains the same queue and can take one job itself.
++    let helpers = wide_threads();
++    let wake = (jobs.len() - 1).min(helpers);
+     let left = Arc::new((Mutex::new(jobs.len()), std::sync::Condvar::new()));
+     {
+         let mut queue = workers.jobs.lock().unwrap_or_else(|e| e.into_inner());
+@@ -1578,7 +1581,13 @@ fn wide(jobs: Vec<Job>) {
+             }));
+         }
+     }
+-    workers.more.notify_all();
++    if wake == helpers {
++        workers.more.notify_all();
++    } else {
++        for _ in 0..wake {
++            workers.more.notify_one();
++        }
++    }
+     loop {
+         let job = workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).pop_front();
+         match job {
+@@ -1827,7 +1836,8 @@ mod wide_tests {
+     /// only when all have.
+     #[test]
+     fn all_jobs_run_before_wide_returns() {
+-        for n in [0usize, 1, 2, 7, 300] {
++        let helpers = super::wide_threads();
++        for n in [0, 1, 2, helpers, helpers + 1, helpers + 2, 300] {
+             let ran = Arc::new(AtomicUsize::new(0));
+             let jobs: Vec<Job> = (0..n)
+                 .map(|i| {
