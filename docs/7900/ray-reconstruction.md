@@ -865,3 +865,16 @@ indoor sites, while the packed result stayed within 1.86%. These
 short bounded samples show that the retained accumulation works.
 The longer visual check and capture-free matched timing are separate.
 [Reproduction](dive-testing.md#check-the-deferred-camera-and-diffuse-history-gi-replacement)
+
+The longer stationary capture sampled 47 consecutive RR pairs. The
+90th-percentile peak indoor patch change was 0.088 EV, down from 0.865 EV
+in the current-only replay. With native GI it was 0.032 EV. The sampled
+stone and sky medians stayed steady on consecutive RR frames. A local
+dark bunk patch still changed by 0.259 EV. The tower, roof and table
+ripple patches retained 95–98% of the preceding SR contrast. The
+ponytail outline remained intact, with softer fine hair and wire detail.
+
+The 55-second visual capture contained 282 RR and 11 SR Presents.
+281 of the RR Presents used all paired replacements. These capture
+counts establish route and image evidence, and the timing run uses the
+same build without captures.

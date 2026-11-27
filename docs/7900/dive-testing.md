@@ -385,8 +385,8 @@ accepted RR Present to its original native counters and the retired
 `probe_diffuse_history_kernel` query. The original probe kernel must
 show the calibrated floor. The other replacement and optical receipts
 still apply. `VICTORY_RR_LIGHT_TAPS` optionally points at an existing
-private Windows directory for rail-matched GI and 720p pre-NGX HDR
-samples during this bounded stage. Keep all samples and captures local.
+private Windows directory for GI and 720p pre-NGX HDR samples linked
+to the same frame. Keep all samples and captures local.
 
 Both probe switches select the replacement that retains the diffuse
 and caustic accumulation. The older current-only experiment uses
