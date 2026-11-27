@@ -817,3 +817,28 @@ to the lighting instability in this cell. The separate camera admission
 failures still cause provider switching. The captures measure visible
 stability, and the capture-free timing above measures the earlier mixed
 configuration.
+
+On a separate bounded capture, fenced source taps matched three
+consecutive full-route RR Presents (2155–2157). At four sampled sites
+the packed GI output was byte-identical to the current RGB9E5 input
+on each frame. Over those three frames the left and far wall probe
+luma fell 37.5% and 23.5%, and the corresponding raw composed 720p
+HDR luma fell 6.2% and 2.9% before NGX ran. The supplied title
+pre-exposure stayed at 1.0. This locates part of the change upstream
+of RR and motivates retaining the accumulation needed to form stable
+diffuse lighting before compositing.
+
+### Native camera continuity check
+
+The deferred camera check keeps a fresh matching VelocityFill sample
+provisional until the earlier queued opaque producer independently
+confirms its projection and depth/motion identity. It publishes the
+camera for the next frame only when the exact FFX submission signals.
+
+A separate 55-second stationary hardware audit presented 454 RR frames,
+all with the optical layer and the opaque and alpha replacements.
+There were zero SR fallbacks and zero unknown Presents. The trace
+matched all 59 deferred camera confirmations to their actual opaque
+source, FFX submission, and accepted RR Present. This camera audit
+used native GI to isolate continuity. Lighting and timing for the
+combined build require their own replays.
