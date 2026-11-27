@@ -42,10 +42,13 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a fresh external source directory when upgrading. The script reconstructs
-and verifies the tested Git tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`
-and checks all 263 build inputs. It builds the diagnostic DLSS profile used
-for the 4K measurement.
+Use a fresh external source directory when upgrading. The build reconstructs
+the measured 4K baseline at `3d033cbd633757d2fd15f97a4323d566e8a043ba`,
+then applies [partial-descriptor-copies.patch.txt](partial-descriptor-copies.patch.txt). This candidate marks partial writes to descriptor records when the runtime copies heap memory.
+The wrapper verifies the resulting Git tree `c42e05411a4da08a99226dc487462ba65e81861f` and
+all 263 build inputs before compiling the diagnostic DLSS profile.
+The replay results on this page were collected on the baseline.
+[SlaktarnVI source](https://github.com/Slaktarn700/SlaktarnVI/blob/42b222681c7bc4d9572b8021b26055effd436ad3/crates/victory-gpu/src/port_descriptors.rs)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
