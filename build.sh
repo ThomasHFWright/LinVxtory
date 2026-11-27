@@ -11,7 +11,8 @@ src=$1
 base=014d52dedf837d1ac660a0bd256c4704be9eeb40
 base_tree=0b2726fef1258f1d7817afdf0af8b251870e408b
 linux_tree=0ab430bbecb29f450d2d9e837673ad10aa1210b4
-tested_tree=3d033cbd633757d2fd15f97a4323d566e8a043ba
+dlss_tree=3d033cbd633757d2fd15f97a4323d566e8a043ba
+locked_tree=81d785a1bb1a8bd39b2797227fb9ee582e6e8b10
 base_url=https://github.com/avatarmanz/VIctory-7900XTX.git
 kit="$root/docs/7900"
 
@@ -46,9 +47,12 @@ fi
 if [ "$(git -C "$src" write-tree)" = "$linux_tree" ] && git -C "$src" diff --quiet; then
     git -C "$src" apply --index "$kit/dlss-4k.patch.txt"
 fi
-if [ "$(git -C "$src" write-tree)" != "$tested_tree" ] ||
+if [ "$(git -C "$src" write-tree)" = "$dlss_tree" ] && git -C "$src" diff --quiet; then
+    git -C "$src" apply --index "$kit/buffer-sweep-spans.patch.txt"
+fi
+if [ "$(git -C "$src" write-tree)" != "$locked_tree" ] ||
    ! git -C "$src" diff --quiet; then
-    echo 'Renderer changes differ from the tested source tree.' >&2
+    echo 'Renderer changes differ from the locked source tree.' >&2
     exit 1
 fi
 if [ -n "$(git -C "$src" ls-files --others -- apps crates .cargo Cargo.lock Cargo.toml rust-toolchain.toml)" ]; then
