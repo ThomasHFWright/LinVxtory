@@ -299,3 +299,39 @@ The post-timing sequence shows the player's face in profile, the ponytail,
 wire window, bedding and room lighting during the turn. The short
 high-cadence crop during the turn coincided with a game stall and contained
 no new title Presents. That crop cannot establish frame-to-frame ghosting.
+
+## Camera and depth-of-field measurements
+
+The Series S velocity-fill pass supplies a rotation, a right-handed
+projection, an inverse rotation and a world-space camera position. In one
+cell sample, its camera-relative view-projection matched the projection
+used by the reflection tracer to within 6.3×10⁻⁸ in the coefficient
+comparison. The signed projection shift was (−0.28414344, +0.01111841)
+render pixels, matching the same camera sample's upscale jitter to within
+6×10⁻⁹ pixels. An adjacent geometry recording carried another frame-begin
+identifier. These checks qualify one observed camera and projection.
+The [upstream velocity-buffer investigation](https://github.com/Marvisak/VIctory/pull/2751)
+provided an independent starting point for the camera layout.
+
+GPU readbacks of the 720p pre-DOF and post-DOF HDR from the same command
+list and backing produced finite signed luminance differences at all 256
+sampled positions. Sixteen changed. The range was −0.01285 to +0.00550.
+This identifies an aligned source for the SDK's single-channel blur guide.
+The signed-difference guide is separate from the noisy lighting RR needs.
+
+To reproduce the bounded point samples, apply the [guide sampling
+overlay](rr-guide-samples.patch.txt) to its own fresh reconstructed 4K
+control tree and build the diagnostics profile as for the graph trace.
+The resulting tree must be `b591699968e6d683e3533e0ca0332838dd7554f4`.
+Set `VICTORY_CAPTURE` to a private Windows directory and
+`VICTORY_RR_SAMPLE_FRAME` to the chosen recording interval. For example,
+this selector samples the opaque prepass's material SRV and the
+ray-tracing dispatch's distance UAV:
+
+```sh
+export VICTORY_RR_SAMPLE_TABLES='7168dd781ca7efb9,srv,0,664;6d7fe7745ab9c6d8,uav,1,144'
+```
+
+Use the actual camera, command list, backing serial and occurrence in the
+results. The same shader can process a separate transparent surface, and
+recording for a title frame can span two Present intervals.

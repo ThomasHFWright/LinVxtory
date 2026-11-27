@@ -1,0 +1,1176 @@
+diff --git a/crates/victory-gpu/src/capture.rs b/crates/victory-gpu/src/capture.rs
+index 7e2e39b17eb044839afc9f6042b104c7e5ba46eb..fd18065fc8e54752090cbfc669924efb166ceea3 100644
+--- a/crates/victory-gpu/src/capture.rs
++++ b/crates/victory-gpu/src/capture.rs
+@@ -251,22 +251,7 @@ fn read_back_of(
+     texture: &ID3D12Resource,
+     sub: u32,
+ ) -> Option<(ID3D12Resource, D3D12_PLACED_SUBRESOURCE_FOOTPRINT)> {
+-    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
+-    let mut total = 0;
+-    // SAFETY: a live texture; outputs for one subresource.
+-    unsafe {
+-        let desc = texture.GetDesc();
+-        device.GetCopyableFootprints(
+-            &desc,
+-            sub,
+-            1,
+-            0,
+-            Some(&mut footprint),
+-            None,
+-            None,
+-            Some(&mut total),
+-        );
+-    }
++    let (footprint, _, total) = texture_footprint(device, texture, sub);
+     let heap = D3D12_HEAP_PROPERTIES {
+         Type: D3D12_HEAP_TYPE_READBACK,
+         ..Default::default()
+@@ -298,22 +283,50 @@ fn read_back_of(
+             )
+             .ok()?;
+         let buffer = buffer?;
++        copy_texture_region(list, texture, sub, &buffer, footprint, None);
++        Some((buffer, footprint))
++    }
++}
++
++/// Layout for copying one subresource into a linear buffer.
++pub(crate) fn texture_footprint(
++    device: &ID3D12Device,
++    texture: &ID3D12Resource,
++    sub: u32,
++) -> (D3D12_PLACED_SUBRESOURCE_FOOTPRINT, u64, u64) {
++    let mut footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default();
++    let (mut row, mut total) = (0, 0);
++    // SAFETY: a live texture; outputs for one subresource.
++    unsafe {
++        device.GetCopyableFootprints(
++            &texture.GetDesc(), sub, 1, 0, Some(&mut footprint), None, Some(&mut row), Some(&mut total),
++        );
++    }
++    (footprint, row, total)
++}
++
++/// Copies the named texture region to a compatible buffer footprint.
++pub(crate) unsafe fn copy_texture_region(
++    list: &ID3D12GraphicsCommandList,
++    texture: &ID3D12Resource,
++    sub: u32,
++    buffer: &ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    region: Option<&D3D12_BOX>,
++) {
++    // SAFETY: caller supplies live resources, compatible locations and states.
++    unsafe {
+         let to = D3D12_TEXTURE_COPY_LOCATION {
+-            pResource: std::mem::transmute_copy(&buffer),
++            pResource: std::mem::transmute_copy(buffer),
+             Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                PlacedFootprint: footprint,
+-            },
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: footprint },
+         };
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+             pResource: std::mem::transmute_copy(texture),
+             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+-            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                SubresourceIndex: sub,
+-            },
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: sub },
+         };
+-        list.CopyTextureRegion(&to, 0, 0, 0, &from, None);
+-        Some((buffer, footprint))
++        list.CopyTextureRegion(&to, 0, 0, 0, &from, region.map(std::ptr::from_ref));
+     }
+ }
+ 
+@@ -793,27 +806,14 @@ pub(crate) fn probe(
+                 (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
+                 (2 * (i / GRID) + 1) * d.Height / (2 * GRID),
+             );
+-            let to = D3D12_TEXTURE_COPY_LOCATION {
+-                pResource: std::mem::transmute_copy(&buffer),
+-                Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                    PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
+-                        Offset: SLOT * u64::from(i),
+-                        Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
+-                            Format: d.Format,
+-                            Width: 1,
+-                            Height: 1,
+-                            Depth: 1,
+-                            RowPitch: 256,
+-                        },
+-                    },
+-                },
+-            };
+-            let from = D3D12_TEXTURE_COPY_LOCATION {
+-                pResource: std::mem::transmute_copy(texture),
+-                Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+-                Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                    SubresourceIndex: 0,
++            let footprint = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                Offset: SLOT * u64::from(i),
++                Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                    Format: d.Format,
++                    Width: 1,
++                    Height: 1,
++                    Depth: 1,
++                    RowPitch: 256,
+                 },
+             };
+             let pixel = D3D12_BOX {
+@@ -824,7 +824,7 @@ pub(crate) fn probe(
+                 bottom: y + 1,
+                 back: 1,
+             };
+-            list.CopyTextureRegion(&to, 0, 0, 0, &from, Some(&pixel));
++            copy_texture_region(list, texture, 0, &buffer, footprint, Some(&pixel));
+         }
+         Some(buffer)
+     }
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 5bc0be33ce14b2e531fde2e010955e8f70bbdcae..e0fc5f9ff38ea5cc600eb5952c928fbfeecb97de 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -1531,6 +1531,26 @@ pub(crate) fn view(handle: u64) -> Option<View> {
+     view_at(i, generation)
+ }
+ 
++/// A diagnostic lookup through the live, bound heap. Read the descriptor via
++/// the kernel so an unmapped title page cannot fault the probe.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn diagnostic_view(heap: usize, table: u64, dwords: u32) -> Option<View> {
++    with_heap(heap, |heap| {
++        let index = heap.index(table)?;
++        if heap.samplers() || heap.handle(index)? != table || dwords % 8 != 0 {
++            return None;
++        }
++        let handle = heap.handle(index.checked_add(dwords / 8)?)?;
++        let mut bytes = [0u8; 12];
++        if !crate::host::read_into(handle as *const u8, &mut bytes) {
++            return None;
++        }
++        let [tag, i, generation] =
++            std::array::from_fn(|i| u32::from_le_bytes(bytes[i * 4..][..4].try_into().unwrap()));
++        (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten()
++    })?
++}
++
+ /// A description of `N` words, if the title passes one.
+ fn words<const N: usize>(desc: *const [u32; N]) -> Option<[u32; N]> {
+     // SAFETY: the title passes a description or null.
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 33e0ec5b8c96c806f635a6990f2babde67261215..98fd2773679559539c0420fed80394ac7b65cdd0 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -24,6 +24,11 @@ use crate::host::HostList;
+ use crate::object::This;
+ use crate::pipeline::host::HostPipeline;
+ 
++#[cfg(feature = "diagnostics")]
++pub(crate) mod guide_samples;
++#[cfg(feature = "diagnostics")]
++mod rr_camera;
++
+ /// Shader interface metadata shared by every pipeline variant and draw.
+ pub(crate) struct TablePlan {
+     groups: Vec<TableGroup>,
+@@ -3017,9 +3022,16 @@ impl State {
+         }
+         #[cfg(feature = "diagnostics")]
+         let stamp = crate::host::rtstamps::before(&list.list);
++        #[cfg(feature = "diagnostics")]
++        {
++            guide_samples::capture(self, list, p, "dispatch", false);
++            rr_camera::capture(self, p, list);
++        }
+         // SAFETY: an open list with everything set.
+         unsafe { list.list.Dispatch(x, y, z) };
+         #[cfg(feature = "diagnostics")]
++        guide_samples::capture(self, list, p, "dispatch", true);
++        #[cfg(feature = "diagnostics")]
+         if stamp.is_some() {
+             crate::host::rtstamps::after(&list.list, stamp, self.stamp_kind(p), p.pso.as_raw() as usize, &p.name);
+         }
+@@ -3074,6 +3086,26 @@ impl State {
+         })
+     }
+ 
++    #[cfg(feature = "diagnostics")]
++    fn guide_table_view(&self, compute: bool, slot: u8, offset: u32) -> Option<View> {
++        let Root::Table(base) = self.roots_ref(compute).get(usize::from(slot))? else {
++            return None;
++        };
++        crate::descriptor::diagnostic_view(self.heaps[0], *base, offset)
++    }
++
++    #[cfg(feature = "diagnostics")]
++    fn guide_draw(&self, list: &HostList, operation: &'static str, after: bool) {
++        if guide_samples::frame().is_some()
++            && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
++        {
++            guide_samples::capture(self, list, p, operation, after);
++            if !after {
++                rr_camera::capture(self, p, list);
++            }
++        }
++    }
++
+     /// The view a shader of the bound pipeline reads through a table, at
+     /// (root parameter, dwords into the table): its texture's or buffer's
+     /// description and its place in the bound view heap. Tables made afresh
+@@ -3437,8 +3469,12 @@ impl State {
+                     if x > 65_535 {
+                         once!(x, "a mesh dispatch of more groups than the host takes: cut");
+                     }
++                    #[cfg(feature = "diagnostics")]
++                    self.guide_draw(list, "mesh", false);
+                     // SAFETY: an open list with everything set.
+                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
++                    #[cfg(feature = "diagnostics")]
++                    self.guide_draw(list, "mesh", true);
+                     self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+                     self.mesh_scissor(list, false);
+                     DRAWN.fetch_add(1, Ordering::Relaxed);
+@@ -3937,11 +3973,22 @@ impl State {
+             };
+             #[cfg(feature = "diagnostics")]
+             list.note_op(|| self.op_text(format!("draw {count}x{instances}"), false));
++            #[cfg(feature = "diagnostics")]
++            {
++                self.guide_draw(list, "draw", false);
++                if count == 3 && instances == 1 && guide_samples::frame().is_some()
++                    && let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This)
++                {
++                    rr_camera::capture_velocity(self, p, list);
++                }
++            }
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+                     .DrawInstanced(count, instances, from, first_instance)
+             };
++            #[cfg(feature = "diagnostics")]
++            self.guide_draw(list, "draw", true);
+             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+@@ -4042,11 +4089,15 @@ impl State {
+         if ran {
+             #[cfg(feature = "diagnostics")]
+             list.note_op(|| self.op_text(format!("indexed {indices}x{instances}"), false));
++            #[cfg(feature = "diagnostics")]
++            self.guide_draw(list, "indexed", false);
+             // SAFETY: an open list with everything set.
+             unsafe {
+                 list.list
+                     .DrawIndexedInstanced(indices, instances, first, base, first_instance)
+             };
++            #[cfg(feature = "diagnostics")]
++            self.guide_draw(list, "indexed", true);
+             self.drew(list, crate::pipeline::host_pipeline(self.pipeline as This));
+             DRAWN.fetch_add(1, Ordering::Relaxed);
+         }
+@@ -4388,6 +4439,13 @@ impl State {
+         // host copies are kept alive by the list, and the signature is cached.
+         #[cfg(feature = "diagnostics")]
+         let stamp = if kind == DISPATCH { crate::host::rtstamps::before(&list.list) } else { None };
++        #[cfg(feature = "diagnostics")]
++        let operation = if kind == DISPATCH { "indirect-dispatch" } else { "indirect-draw" };
++        #[cfg(feature = "diagnostics")]
++        {
++            guide_samples::capture(self, list, p, operation, false);
++            rr_camera::capture(self, p, list);
++        }
+         unsafe {
+             list.list.ExecuteIndirect(
+                 &signature,
+@@ -4398,6 +4456,8 @@ impl State {
+                 counter.as_ref().map_or(0, |(s, at)| s.offset(*at)),
+             )
+         };
++        #[cfg(feature = "diagnostics")]
++        guide_samples::capture(self, list, p, operation, true);
+         if kind == MESH {
+             self.mesh_scissor(list, false);
+         }
+diff --git a/crates/victory-gpu/src/draw/guide_samples.rs b/crates/victory-gpu/src/draw/guide_samples.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..93c25bc315c8d6255ef0363b3b1bcc506e09a732
+--- /dev/null
++++ b/crates/victory-gpu/src/draw/guide_samples.rs
+@@ -0,0 +1,549 @@
++//! Private numeric RR input diagnostics at the point of shader consumption.
++use super::*;
++
++use std::io::{BufWriter, Write};
++use std::sync::OnceLock;
++
++const GRID: u32 = 8;
++const SLOT: u64 = 512;
++const ROW: u32 = 256;
++const BUDGET: u64 = 64 << 20;
++const MOST_REQUESTS: usize = 12;
++const MOST_PASSES: u64 = 3;
++
++struct Request {
++    hash: String,
++    kind: ResourceType,
++    slot: u8,
++    dwords: u32,
++    attempts: AtomicU64,
++}
++
++#[derive(Clone, Copy)]
++enum GridMode {
++    Native,
++    PaddedSpatial,
++    Primary(u32),
++}
++
++impl Request {
++    fn grid(&self) -> GridMode {
++        match (self.hash.as_str(), self.kind, self.slot, self.dwords) {
++            ("71883e40620a567a", ResourceType::Srv, 1, 16) => GridMode::PaddedSpatial,
++            ("71883e40620a567a", ResourceType::Srv, 1, 104) => GridMode::Primary(26),
++            ("1cd9bc634417a981", ResourceType::Srv, 0, 456) => GridMode::Primary(67),
++            _ => GridMode::Native,
++        }
++    }
++}
++
++/// A common grid in half-resolution coordinates for the two primary
++/// radiance views and the padded spatial-history view.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++struct Grid {
++    width: u32,
++    height: u32,
++    scale: u32,
++}
++
++impl GridMode {
++    fn layout(self, width: u32, height: u32, format: u32) -> Option<Grid> {
++        match self {
++            Self::Native => Some(Grid {
++                width,
++                height,
++                scale: 1,
++            }),
++            Self::PaddedSpatial if (width, height, format) == (1280, 720, 10) => Some(Grid {
++                width: 640,
++                height: 360,
++                scale: 1,
++            }),
++            Self::Primary(expected) if (width, height, format) == (1280, 720, expected) => {
++                Some(Grid {
++                    width: 640,
++                    height: 360,
++                    scale: 2,
++                })
++            }
++            _ => None,
++        }
++    }
++}
++
++impl Grid {
++    fn position(self, point: u32) -> (u32, u32) {
++        let (x, y) = position(point, self.width, self.height);
++        (x * self.scale, y * self.scale)
++    }
++}
++
++fn requests() -> &'static [Request] {
++    static REQUESTS: OnceLock<Vec<Request>> = OnceLock::new();
++    REQUESTS.get_or_init(|| {
++        std::env::var("VICTORY_RR_SAMPLE_TABLES")
++            .unwrap_or_default()
++            .split(';')
++            .take(MOST_REQUESTS)
++            .filter(|entry| !entry.is_empty())
++            .filter_map(|entry| {
++                let parsed = parse_request(entry);
++                if parsed.is_none() {
++                    tracing::warn!(entry, "invalid RR sample table selector");
++                }
++                parsed
++            })
++            .collect()
++    })
++}
++
++fn parse_request(entry: &str) -> Option<Request> {
++    let mut fields = entry.split(',');
++    let (hash, kind, slot, dwords) = (
++        fields.next()?,
++        fields.next()?,
++        fields.next()?,
++        fields.next()?,
++    );
++    if fields.next().is_some() {
++        return None;
++    }
++    if hash.len() != 16 || !hash.bytes().all(|c| c.is_ascii_hexdigit()) {
++        return None;
++    }
++    let kind = match kind {
++        "srv" => ResourceType::Srv,
++        "uav" => ResourceType::Uav,
++        _ => return None,
++    };
++    let dwords = dwords.parse().ok()?;
++    if dwords % 8 != 0 {
++        return None;
++    }
++    Some(Request {
++        hash: hash.to_ascii_lowercase(),
++        kind,
++        slot: slot.parse().ok()?,
++        dwords,
++        attempts: AtomicU64::new(0),
++    })
++}
++
++/// Same 1-indexed recording-frame counter as the regular draw log.
++pub(super) fn frame() -> Option<u64> {
++    static FRAME: OnceLock<Option<u64>> = OnceLock::new();
++    let frame = *FRAME.get_or_init(|| {
++        crate::capture::folder()?;
++        std::env::var("VICTORY_RR_SAMPLE_FRAME").ok()?.parse().ok()
++    });
++    frame.filter(|&frame| frame == crate::queue::presented() + 1)
++}
++
++pub(super) fn capture(
++    state: &State,
++    list: &HostList,
++    p: &HostPipeline,
++    operation: &'static str,
++    after: bool,
++) {
++    let Some(frame) = frame() else { return };
++    static EVENT: AtomicU64 = AtomicU64::new(0);
++    let mut event = None;
++    for request in requests() {
++        let write = request.kind == ResourceType::Uav;
++        if after != write {
++            continue;
++        }
++        let Some(stage) = p.stages.iter().find(|stage| {
++            stage.shader.hash == request.hash
++                && stage.translated().used.iter().any(|u| {
++                    u.root == RootType::Table
++                        && u.kind == request.kind
++                        && u.slot == request.slot
++                        && u.table_offset_dwords == request.dwords
++                })
++        }) else {
++            continue;
++        };
++        let Ok(occurrence) =
++            request
++                .attempts
++                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++                    (n < MOST_PASSES).then_some(n + 1)
++                })
++        else {
++            continue;
++        };
++        let event = *event.get_or_insert_with(|| {
++            let event = EVENT.fetch_add(1, Ordering::Relaxed) + 1;
++            if p.compute
++                && matches!(
++                    request.hash.as_str(),
++                    "7168dd781ca7efb9"
++                        | "6d7fe7745ab9c6d8"
++                        | "63381c3250b287fa"
++                        | "71883e40620a567a"
++                )
++            {
++                let layout = rr_camera::sample_layout(state, &stage.translated().used);
++                tracing::info!(
++                    frame,
++                    event,
++                    shader = request.hash,
++                    epoch = list.epoch(),
++                    ?layout,
++                    "RR guide phase at record time"
++                );
++            }
++            event
++        });
++        let role = if write { "uav-after" } else { "srv-before" };
++        let name = format!(
++            "guide-{frame}-e{event}-{}-{operation}-{role}-s{}-d{}-{}",
++            request.hash,
++            request.slot,
++            request.dwords,
++            occurrence + 1
++        );
++        let result = state
++            .guide_table_view(p.compute, request.slot, request.dwords)
++            .ok_or("descriptor unavailable")
++            .and_then(|view| record(list, &name, view, write, request.grid()));
++        if let Err(reason) = result {
++            tracing::info!(name, reason, "RR guide sample skipped");
++        }
++    }
++}
++
++fn record(
++    list: &HostList,
++    name: &str,
++    view: View,
++    write: bool,
++    grid: GridMode,
++) -> Result<(), &'static str> {
++    let (resource, words) = match view {
++        View::Shader(resource, Some(words)) if !write => (resource, words),
++        View::Unordered(resource, 0, Some(words)) if write => (resource, words),
++        View::Placed(false, resource, words) if !write && resource[0] == 3 => {
++            let address = u64::from(words[10]) | u64::from(words[11]) << 32;
++            let resource = crate::resource::texture_at_made(address, &resource)
++                .ok_or("untracked placed texture")?;
++            (resource as usize, words[..10].try_into().unwrap())
++        }
++        _ => return Err("wrong descriptor type or missing typed view"),
++    };
++    record_texture(list, name, resource, Some((words, write)), grid)
++}
++
++/// The full-resolution HDR image after the last title DOF blend, just
++/// before the native SR evaluate reads it.
++pub(crate) fn ngx_color(list: &HostList, resource: usize) -> Option<u64> {
++    let frame = frame()?;
++    static ATTEMPTS: AtomicU64 = AtomicU64::new(0);
++    let occurrence = ATTEMPTS
++        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++            (n < MOST_PASSES).then_some(n + 1)
++        })
++        .ok()?;
++    let name = format!(
++        "guide-{frame}-ngx-sr-color-before-evaluate-{}",
++        occurrence + 1
++    );
++    if let Err(reason) = record_texture(list, &name, resource, None, GridMode::Native) {
++        tracing::info!(name, reason, "RR guide sample skipped");
++    }
++    Some(frame)
++}
++
++fn record_texture(
++    list: &HostList,
++    name: &str,
++    resource: usize,
++    view: Option<([u32; 10], bool)>,
++    grid: GridMode,
++) -> Result<(), &'static str> {
++    let (copy, state) = list
++        .guide_texture(resource)
++        .ok_or("no tracked texture state in this list")?;
++    let texture = &copy.texture;
++    // SAFETY: the tracked Arc holds the host texture.
++    let desc = unsafe { texture.GetDesc() };
++    if desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        || desc.DepthOrArraySize != 1
++        || desc.SampleDesc.Count != 1
++    {
++        return Err("requires a single-sample, single-slice Texture2D");
++    }
++    let (mip, plane, view_format, write) = match view {
++        Some((words, write)) if words[1] == 4 => {
++            let (mip, plane) = if write {
++                (words[2], words[3])
++            } else {
++                (crate::resource::first_mip(&words), words[6])
++            };
++            (mip, plane, crate::resource::pc_format(words[0]), write)
++        }
++        Some(_) => return Err("requires a Texture2D view"),
++        None if desc.Width == 1280
++            && desc.Height == 720
++            && desc.Format.0 == 10
++            && state == D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE.0 as u32 =>
++        {
++            (0, 0, 10, false)
++        }
++        None => return Err("unexpected NGX scene color format, size or state"),
++    };
++    let mip_count = u32::from(desc.MipLevels);
++    let mip_host = mip
++        .checked_sub(copy.base)
++        .filter(|&mip| mip < mip_count)
++        .ok_or("view mip unavailable")?;
++    // shortcut: sample only the first plane, add a plane format table before probing stencil or video.
++    if plane != 0
++        || !matches!(view_format, 2 | 10..=14 | 20..=21 | 24..=43 | 46 | 49..=59 | 61..=64 | 67 | 87..=91)
++    {
++        return Err("unsupported plane or typed format");
++    }
++    let whole = desc.Flags.contains(D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
++    if write && (whole || state != D3D12_RESOURCE_STATE_UNORDERED_ACCESS.0 as u32) {
++        return Err("UAV is not the tracked writable texture");
++    }
++    let host = crate::host::made_host().ok_or("device unavailable")?;
++    let (footprint, row_size, total) =
++        crate::capture::texture_footprint(&host.device, texture, mip_host);
++    let [width, height] = [footprint.Footprint.Width, footprint.Footprint.Height];
++    let element = row_size
++        .checked_div(u64::from(width))
++        .ok_or("missing footprint width")?;
++    if width < 2
++        || height < 2
++        || width > 16384
++        || height > 16384
++        || footprint.Footprint.Depth != 1
++        || !matches!(element, 1 | 2 | 4 | 8 | 16)
++        || row_size != element * u64::from(width)
++        || (!whole && crate::resource::element(view_format) != Some((element, 1)))
++    {
++        return Err("unexpected texture footprint");
++    }
++    let grid = grid
++        .layout(width, height, view_format)
++        .ok_or("unexpected radiance grid backing or typed format")?;
++    let bytes = if whole {
++        total
++    } else {
++        SLOT * u64::from(GRID * GRID)
++    };
++    static USED: AtomicU64 = AtomicU64::new(0);
++    if bytes == 0
++        || USED
++            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
++                n.checked_add(bytes).filter(|&n| n <= BUDGET)
++            })
++            .is_err()
++    {
++        return Err("readback byte limit reached");
++    }
++    let buffer = host
++        .read_back_buffer(bytes)
++        .ok_or("GPU readback allocation failed")?;
++    let before = D3D12_RESOURCE_STATES(state as i32);
++    let copy_state = D3D12_RESOURCE_STATE_COPY_SOURCE;
++    let transition = !before.contains(copy_state);
++    // SAFETY: the texture is held in the list's state map and the buffer is
++    // kept through reset (the list can be submitted again). Restore exactly
++    // the state the binding established so subsequent title barriers agree.
++    unsafe {
++        if transition {
++            list.list
++                .ResourceBarrier(&[crate::host::transition(texture, before, copy_state)]);
++        }
++        if whole {
++            // D3D12 requires whole-subresource copies for depth-stencil.
++            crate::capture::copy_texture_region(
++                &list.list, texture, mip_host, &buffer, footprint, None,
++            );
++        } else {
++            for i in 0..GRID * GRID {
++                let (x, y) = grid.position(i);
++                let region = D3D12_BOX {
++                    left: x,
++                    top: y,
++                    front: 0,
++                    right: x + 2,
++                    bottom: y + 2,
++                    back: 1,
++                };
++                let to = D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: u64::from(i) * SLOT,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: footprint.Footprint.Format,
++                        Width: 2,
++                        Height: 2,
++                        Depth: 1,
++                        RowPitch: ROW,
++                    },
++                };
++                crate::capture::copy_texture_region(
++                    &list.list,
++                    texture,
++                    mip_host,
++                    &buffer,
++                    to,
++                    Some(&region),
++                );
++            }
++        }
++        if transition {
++            list.list
++                .ResourceBarrier(&[crate::host::transition(texture, copy_state, before)]);
++        }
++    }
++    list.keep(&buffer);
++    let map_format = footprint.Footprint.Format.0;
++    let metadata = format!(
++        "resource={resource:#x}\tserial={}\tepoch={}\tsize={width}x{height}\tmip={mip}\tsubresource={mip_host}\tplane={plane}\tformat={}\tview={view_format}\tcopy_format={map_format}\tbytes={element}\tgrid={}x{}\tgrid_scale={}\tlist={:#x}",
++        copy.serial,
++        list.epoch(),
++        desc.Format.0,
++        grid.width,
++        grid.height,
++        grid.scale,
++        list.list.as_raw() as usize,
++    );
++    list.guide_readback(Readback {
++        name: name.to_owned(),
++        metadata,
++        buffer,
++        footprint,
++        grid,
++        bytes: bytes as usize,
++        element: element as usize,
++        whole,
++    });
++    Ok(())
++}
++
++fn position(i: u32, width: u32, height: u32) -> (u32, u32) {
++    let center = |k: u32, size: u32| ((2 * k + 1) * size / (2 * GRID)).min(size - 2) & !1;
++    (center(i % GRID, width), center(i / GRID, height))
++}
++
++pub(crate) struct Readback {
++    name: String,
++    metadata: String,
++    buffer: ID3D12Resource,
++    footprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT,
++    grid: Grid,
++    bytes: usize,
++    element: usize,
++    whole: bool,
++}
++
++impl Readback {
++    pub(crate) fn save(&self) {
++        let Some(folder) = crate::capture::folder() else {
++            return;
++        };
++        let mut data = std::ptr::null_mut();
++        let range = D3D12_RANGE {
++            Begin: 0,
++            End: self.bytes,
++        };
++        // SAFETY: host calls this only after the GPU submission's wait.
++        let saved = unsafe {
++            match self.buffer.Map(0, Some(&range), Some(&mut data)) {
++                Ok(()) if !data.is_null() => {
++                    let bytes = std::slice::from_raw_parts(data.cast::<u8>(), self.bytes);
++                    let result = std::fs::File::create(folder.join(format!("{}.tsv", self.name)))
++                        .and_then(|file| self.write(BufWriter::new(file), bytes));
++                    self.buffer
++                        .Unmap(0, Some(&D3D12_RANGE { Begin: 0, End: 0 }));
++                    result
++                }
++                _ => Err(std::io::Error::other("readback map failed")),
++            }
++        };
++        if let Err(error) = saved {
++            tracing::warn!(name = self.name, %error, "RR guide sample was not saved");
++        }
++    }
++
++    fn write(&self, mut out: impl Write, bytes: &[u8]) -> std::io::Result<()> {
++        writeln!(out, "# {}", self.metadata)?;
++        writeln!(out, "x\ty\thex")?;
++        for i in 0..GRID * GRID {
++            let (x, y) = self.grid.position(i);
++            for row in 0..2 {
++                for col in 0..2 {
++                    let start = if self.whole {
++                        self.footprint.Offset as usize
++                            + (y + row) as usize * self.footprint.Footprint.RowPitch as usize
++                            + (x + col) as usize * self.element
++                    } else {
++                        i as usize * SLOT as usize
++                            + row as usize * ROW as usize
++                            + col as usize * self.element
++                    };
++                    let pixel = bytes
++                        .get(start..start + self.element)
++                        .ok_or_else(|| std::io::Error::other("texel outside readback"))?;
++                    write!(out, "{}\t{}\t", x + col, y + row)?;
++                    for byte in pixel {
++                        write!(out, "{byte:02x}")?;
++                    }
++                    writeln!(out)?;
++                }
++            }
++        }
++        out.flush()
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn selectors_require_a_whole_descriptor_offset_and_exact_hash() {
++        let request = parse_request("7168dd781ca7efb9,srv,1,40").unwrap();
++        assert_eq!(
++            (
++                request.hash.as_str(),
++                request.kind,
++                request.slot,
++                request.dwords
++            ),
++            ("7168dd781ca7efb9", ResourceType::Srv, 1, 40)
++        );
++        assert!(parse_request("7168dd781ca7efb9,srv,1,41").is_none());
++        assert!(parse_request("7168dd78,srv,1,40").is_none());
++    }
++
++    #[test]
++    fn samples_cover_both_parities_within_odd_or_even_extents() {
++        assert_eq!(position(0, 640, 360), (40, 22));
++        assert_eq!(position(63, 640, 360), (600, 336));
++        for i in 0..GRID * GRID {
++            let (x, y) = position(i, 641, 361);
++            assert_eq!((x % 2, y % 2), (0, 0));
++            assert!(x + 1 < 641 && y + 1 < 361);
++        }
++    }
++    #[test]
++    fn known_radiance_views_share_half_resolution_coordinates() {
++        let raw = GridMode::Native.layout(640, 360, 26).unwrap();
++        let spatial = GridMode::PaddedSpatial.layout(1280, 720, 10).unwrap();
++        let primary = GridMode::Primary(67).layout(1280, 720, 67).unwrap();
++        assert_eq!(raw, spatial);
++        assert!(GridMode::PaddedSpatial.layout(1280, 720, 26).is_none());
++        assert!(GridMode::Primary(67).layout(640, 360, 67).is_none());
++        for i in 0..GRID * GRID {
++            let (x, y) = raw.position(i);
++            let (px, py) = primary.position(i);
++            assert_eq!((px, py), (2 * x, 2 * y));
++            assert!(x + 1 < 640 && y + 1 < 360 && px + 1 < 1280 && py + 1 < 720);
++        }
++    }
++}
+diff --git a/crates/victory-gpu/src/draw/rr_camera.rs b/crates/victory-gpu/src/draw/rr_camera.rs
+new file mode 100644
+index 0000000000000000000000000000000000000000..4df0f5e09e424d0cba0e510e6b8e18e336044802
+--- /dev/null
++++ b/crates/victory-gpu/src/draw/rr_camera.rs
+@@ -0,0 +1,194 @@
++use std::sync::atomic::{AtomicU32, Ordering};
++
++use super::{HostList, HostPipeline, ResourceType, RootType, State, UsedResource, View};
++
++fn matrix_words(bytes: [u8; 64]) -> Option<[u32; 16]> {
++    let mut words = [0; 16];
++    for (word, bytes) in words.iter_mut().zip(bytes.chunks_exact(4)) {
++        *word = u32::from_le_bytes(bytes.try_into().ok()?);
++    }
++    (words != [0; 16] && words.iter().all(|&word| f32::from_bits(word).is_finite()))
++        .then_some(words)
++}
++
++fn bind_cbv(
++    state: &State,
++    used: &[UsedResource],
++    compute: bool,
++    slot: u8,
++    dwords: u32,
++) -> Option<(u64, u32)> {
++    if !used.iter().any(|binding| {
++        binding.root == RootType::Table
++            && binding.kind == ResourceType::Cbv
++            && binding.slot == slot
++            && binding.table_offset_dwords == dwords
++    }) {
++        return None;
++    }
++    let View::Constant(base, size) = state.guide_table_view(compute, slot, dwords)? else {
++        return None;
++    };
++    Some((base, size))
++}
++
++fn snapshot<const N: usize>(base: u64, size: u32, offset: u32) -> Option<[u8; N]> {
++    let end = offset.checked_add(u32::try_from(N).ok()?)?;
++    if end > size {
++        return None;
++    }
++    base.checked_add(u64::from(end))?;
++    let address = (base + u64::from(offset)) as *const u8;
++    let mut first = [0; N];
++    let mut second = [0; N];
++    (crate::host::read_into(address, &mut first)
++        && crate::host::read_into(address, &mut second)
++        && first == second)
++        .then_some(first)
++}
++
++pub(super) fn sample_layout(
++    state: &State,
++    used: &[UsedResource],
++) -> Option<([f32; 4], [f32; 2], [u32; 2])> {
++    let (base, size) = bind_cbv(state, used, true, 0, 1032)?;
++    let trace = snapshot::<16>(base, size, 0)?;
++    let primary = snapshot::<8>(base, size, 0x30)?;
++    let seeds = snapshot::<8>(base, size, 0x200)?;
++    let trace: [f32; 4] =
++        std::array::from_fn(|i| f32::from_le_bytes(trace[i * 4..i * 4 + 4].try_into().unwrap()));
++    let primary: [f32; 2] =
++        std::array::from_fn(|i| f32::from_le_bytes(primary[i * 4..i * 4 + 4].try_into().unwrap()));
++    if !(0..2).all(|i| {
++        (1.0..=16384.0).contains(&trace[i])
++            && (1.0..=16384.0).contains(&primary[i])
++            && (trace[i] * trace[i + 2] - 1.0).abs() < 0.01
++    }) {
++        return None;
++    }
++    let seeds =
++        std::array::from_fn(|i| u32::from_le_bytes(seeds[i * 4..i * 4 + 4].try_into().unwrap()));
++    Some((trace, primary, seeds))
++}
++
++pub(super) fn capture(state: &State, pipeline: &HostPipeline, list: &HostList) {
++    let Some(frame) = super::guide_samples::frame() else {
++        return;
++    };
++    let Some((stage, table_dwords, offset)) = pipeline.stages.iter().find_map(|stage| {
++        let (table_dwords, offset) = match (pipeline.compute, stage.shader.hash.as_str()) {
++            (true, "7168dd781ca7efb9") => (144, 0x160),
++            (true, "6d7fe7745ab9c6d8") => (168, 0x160),
++            (true, "71883e40620a567a") => (152, 0x1a0),
++            (false, "cf43bdbfc75c9296" | "b7a81f5b96f4ca93") => (40, 0x160),
++            _ => return None,
++        };
++        Some((stage, table_dwords, offset))
++    }) else {
++        return;
++    };
++    let shader = stage.shader.hash.as_str();
++    let used = &stage.translated().used;
++    let slot = 1;
++    let Some((base, size)) = bind_cbv(state, used, pipeline.compute, slot, table_dwords) else {
++        return;
++    };
++    static COMPUTE: AtomicU32 = AtomicU32::new(0);
++    static GEOMETRY: AtomicU32 = AtomicU32::new(0);
++    let (captures, limit) = if pipeline.compute {
++        (&COMPUTE, 32)
++    } else {
++        (&GEOMETRY, 4)
++    };
++    if captures.fetch_add(1, Ordering::Relaxed) >= limit {
++        return;
++    }
++    let words = snapshot(base, size, offset).and_then(matrix_words);
++    let layout = (shader == "7168dd781ca7efb9")
++        .then(|| sample_layout(state, used))
++        .flatten();
++    // shortcut: record-time snapshots, compare with ordered CBV fills if a buffer changes before submission.
++    tracing::info!(
++        frame,
++        begun = crate::frames_begun(),
++        list_epoch = list.epoch(),
++        shader,
++        slot,
++        table_dwords,
++        offset,
++        ?words,
++        ?layout,
++        "RR camera constants at record time"
++    );
++}
++
++pub(super) fn capture_velocity(state: &State, pipeline: &HostPipeline, list: &HostList) {
++    let Some(frame) = super::guide_samples::frame() else {
++        return;
++    };
++    const VS: &str = "4adcfeaa24ae6450";
++    const PS: &str = "9ab96b7a002d6ac8";
++    if pipeline.compute || !pipeline.stages.iter().any(|stage| stage.shader.hash == VS) {
++        return;
++    }
++    let Some(stage) = pipeline.stages.iter().find(|stage| stage.shader.hash == PS) else {
++        return;
++    };
++    let Some(viewport) = state.viewports.first() else {
++        return;
++    };
++    let Some((base, 480)) = bind_cbv(state, &stage.translated().used, false, 1, 8) else {
++        return;
++    };
++    static CAPTURES: AtomicU32 = AtomicU32::new(0);
++    if CAPTURES.fetch_add(1, Ordering::Relaxed) >= 8 {
++        return;
++    }
++    let Some(rotation) = snapshot(base, 480, 0).and_then(matrix_words) else {
++        return;
++    };
++    let Some(projection) = snapshot(base, 480, 0x40).and_then(matrix_words) else {
++        return;
++    };
++    let Some(position) = snapshot::<16>(base, 480, 0xc0) else {
++        return;
++    };
++    let position: [f32; 4] =
++        std::array::from_fn(|i| f32::from_le_bytes(position[i * 4..i * 4 + 4].try_into().unwrap()));
++    if projection[11] != (-1.0f32).to_bits()
++        || f32::from_bits(projection[15]) != 0.0
++        || position[3] != 1.0
++        || !position.iter().all(|x| x.is_finite())
++    {
++        return;
++    }
++    let viewport = [viewport.Width, viewport.Height];
++    tracing::info!(
++        frame,
++        begun = crate::frames_begun(),
++        list_epoch = list.epoch(),
++        ?viewport,
++        ?rotation,
++        ?projection,
++        ?position,
++        "RR velocity-fill camera constants at record time"
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::matrix_words;
++
++    #[test]
++    fn decodes_exact_float_words_in_order() {
++        let words = std::array::from_fn(|i| (i as f32).to_bits());
++        let mut bytes = [0; 64];
++        for (input, output) in words.iter().zip(bytes.chunks_exact_mut(4)) {
++            output.copy_from_slice(&input.to_le_bytes());
++        }
++        assert_eq!(matrix_words(bytes), Some(words));
++        bytes[4..8].copy_from_slice(&f32::INFINITY.to_bits().to_le_bytes());
++        assert_eq!(matrix_words(bytes), None);
++        assert_eq!(matrix_words([0; 64]), None);
++    }
++}
+diff --git a/crates/victory-gpu/src/external.rs b/crates/victory-gpu/src/external.rs
+index 25b4803e4c46ba07080478e7b3fad52fe43866e8..ac9d77af086f19a028c4c5206c74dff7253e501d 100644
+--- a/crates/victory-gpu/src/external.rs
++++ b/crates/victory-gpu/src/external.rs
+@@ -39,6 +39,13 @@ impl Recording<'_> {
+         Some(())
+     }
+ 
++    /// Retains numeric samples from the fixed UHD SR input at the optional
++    /// RR capture frame, after the title's last scene-color writer.
++    #[cfg(feature = "diagnostics")]
++    pub fn rr_sample_color(&self, resource: This) -> Option<u64> {
++        crate::draw::guide_samples::ngx_color(self.0, resource as usize)
++    }
++
+     /// Access flushes any pending host barriers before the provider runs.
+     pub fn commands(&self) -> &ID3D12GraphicsCommandList {
+         &self.0.list
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..78b5036c7d758c4e374c33172af69611da2afb05 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -2667,6 +2667,8 @@ struct Deferred {
+     back_wanted: Vec<crate::texback::Target>,
+     /// Those copies, whose texels go to title memory once the list has run.
+     texture_backs: Vec<crate::texback::Back>,
++    #[cfg(feature = "diagnostics")]
++    guide_backs: Vec<crate::draw::guide_samples::Readback>,
+     /// Whether the indirect-work budget is zeroed for this recording (a
+     /// step on the CPU, or in the list for the card's copy).
+     budget_zeroed: bool,
+@@ -4428,6 +4430,13 @@ pub(crate) fn walls_trace() -> bool {
+ /// without it, so the title read a buffer nobody wrote, as before read-backs
+ /// were made (the exposure metering's two small float targets, every frame).
+ fn read_backs(list: &HostList) {
++    #[cfg(feature = "diagnostics")]
++    {
++        let samples = std::mem::take(&mut list.deferred().guide_backs);
++        for sample in samples {
++            sample.save();
++        }
++    }
+     // Textures shaders wrote that the title reads on the CPU
+     // ([`crate::texback`]).
+     for back in &list.deferred().texture_backs {
+@@ -8001,6 +8010,22 @@ impl HostList {
+         self.deferred().indirect_readable = scratch.as_raw() as usize;
+     }
+ 
++    /// The texture and its current host state as established by this list's
++    /// normal binding path. A diagnostic view never dereferences a title object.
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn guide_texture(&self, resource: usize) -> Option<(std::sync::Arc<crate::resource::HostTexture>, u32)> {
++        let copy = crate::resource::diagnostic_copy(resource)?;
++        let key = std::sync::Arc::as_ptr(&copy) as usize;
++        let states = self.states.lock().unwrap_or_else(|e| e.into_inner());
++        let (_, state, texture) = states.get(&key)?;
++        Some((texture.clone(), *state))
++    }
++
++    #[cfg(feature = "diagnostics")]
++    pub(crate) fn guide_readback(&self, sample: crate::draw::guide_samples::Readback) {
++        self.deferred().guide_backs.push(sample);
++    }
++
+     /// Keeps `object` alive until the list is reset.
+     pub(crate) fn keep(&self, object: &impl Interface) {
+         if let Ok(object) = object.cast::<windows::core::IUnknown>() {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 89d5fe86bd3a1c8a902ce7acbe42579107f01c48..a56b66e8f8abc94f546274b67ec05cba6b92d9f9 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -2507,6 +2507,17 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
+     hosted(this, false).map(|made| made.0)
+ }
+ 
++/// A host texture held while the title resource is pinned by its live registry.
++#[cfg(all(windows, feature = "diagnostics"))]
++pub(crate) fn diagnostic_copy(at: usize) -> Option<std::sync::Arc<HostTexture>> {
++    let live = textures();
++    if !live.contains(&at) {
++        return None;
++    }
++    let made = resource(at as This).host.made.lock().unwrap_or_else(|e| e.into_inner());
++    made.as_ref().map(|(texture, _)| texture.clone())
++}
++
+ /// A host texture like the title's: same description, in GPU memory,
+ /// without the console's layout and flags.
+ #[cfg(windows)]
+diff --git a/crates/victory-hle/src/modules/fidelityfx/ngx.rs b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+index d1a740bad974029bcdbc6d72c24ce6a01426ecca..f3c6207f779c77c5b9bb19e252080ffa8f3e3c21 100644
+--- a/crates/victory-hle/src/modules/fidelityfx/ngx.rs
++++ b/crates/victory-hle/src/modules/fidelityfx/ngx.rs
+@@ -445,6 +445,27 @@ fn record(
+             .ok_or("NGX Ultra Performance feature creation failed")?;
+     }
+     let p = ngx.params;
++    #[cfg(feature = "diagnostics")]
++    if preset.output == UHD.output
++        && let Some(frame) = list.rr_sample_color(info.resources[0].resource.cast::<Object>())
++    {
++        tracing::info!(
++            frame,
++            begun = victory_gpu::frames_begun(),
++            render = ?info.render_size,
++            output = ?preset.output,
++            jitter = ?info.jitter,
++            motion_scale = ?info.motion_scale,
++            frame_time_ms = f32::from_bits(info.settings[2]),
++            pre_exposure = f32::from_bits(info.settings[3]),
++            reset = !active.replaced_history || (info.settings[4] & 0xff) != 0,
++            camera_near = f32::from_bits(info.settings[5]),
++            camera_far = f32::from_bits(info.settings[6]),
++            camera_fov_y = f32::from_bits(info.settings[7]),
++            view_space_to_meters = f32::from_bits(info.settings[8]),
++            "RR reference SR inputs at record time"
++        );
++    }
+     // SAFETY: this list, its four held resources and the live NGX feature all use the same device.
+     let result = unsafe {
+         NVSDK_NGX_Parameter_SetD3d12Resource(p, name!("Color"), color.as_raw());
