@@ -252,3 +252,30 @@ blurred and pre-blur colors. The 720p graph identifies a pre-blur source
 and the immediate post-blur SR input. This path still requires checked
 same-frame captures and validation on the active model.
 [NVIDIA RR guide, §3.4.13](https://github.com/NVIDIA/DLSS/blob/v310.9.16/doc/DLSS-RR%20Integration%20Guide.pdf)
+
+### Values sampled on the GPU
+
+A separate SR replay copied native texels at selected points on the title's
+command lists and read them after completion. In the opaque 640×360
+reflection allocation, X contained 162 positive values, 29 values of −1
+and 65 zeros across 256 sampled locations. The largest value was 854.5.
+Y contained 69 positive infinities and one negative infinity. The three
+grids taken after the prepass, after ray tracing and before screen-space
+resolve were byte-identical at those coordinates. This verifies the sampled
+values persisted through that interval. It does not establish that the
+tracing dispatch wrote those pixels on this frame.
+
+The title maps each sparse sample to one of four primary pixels using
+frame-dependent parity. The measured extents were 640×360 and 1280×720.
+Two groups recorded near one presentation boundary used distinct parity
+seeds and camera projections. The current camera-relative view-projection
+bytes agreed between a geometry witness and the reflection producer in the
+first group. Joining guides solely by the latest Present number would mix
+different camera samples. The sparse distance and its preserved Y channel
+do not supply dense reflection motion.
+
+Across these replays **the visible title uses 4K Super Resolution and its
+native denoisers**. All RR evaluations reported so far used the standalone
+or renderer hardware fixtures. A valid gameplay comparison requires both a
+confirmed in-game feature-13 evaluation and proof of the specific stock
+filters it replaced.
