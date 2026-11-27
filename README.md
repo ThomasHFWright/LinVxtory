@@ -41,10 +41,11 @@ from the source checkout.
 
 ## Ray Reconstruction research
 
-The separate research branch tracks opt-in DLSS Ray Reconstruction
-experiments, including a D3D12 hardware probe and in-game guide
-validation. A verified gameplay presentation with Ray Reconstruction
-remains an open milestone.
+The research branch presented two consecutive 4K game frames with DLSS
+Ray Reconstruction and then fell back to Super Resolution when a guide
+was missing. Native denoisers ran during that test. Preserving the
+window’s wavy refraction and measuring performance with redundant filters
+disabled remain open.
 [Research branch notes](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/ray-reconstruction.md) ·
 [Reproduce a 4K cell test with inkVI-dive](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/dive-testing.md)
 
