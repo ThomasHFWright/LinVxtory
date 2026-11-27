@@ -72,6 +72,18 @@ output came from feature 13, which title denoisers actually bypassed,
 and whether SR fallback occurred during the interval. A feature creation
 or an offscreen evaluation alone only verifies that stage.
 
+Enable `VICTORY_FRAME_LOG=1` for timing arms. Supply UTC boundaries for
+the visually verified playable segment to the [Present timing tool](present-window.py).
+
+```sh
+python3 docs/7900/present-window.py title.log "$PLAY_START_UTC" "$PLAY_END_UTC"
+```
+
+The tool selects intervals by their end timestamp, including both
+boundaries. FPS is the reciprocal of the median frame interval, and p95
+uses the nearest rank. Keep captures outside the measured window. Include
+the run's selected provider and fallback counts alongside the JSON.
+
 ## Reproduce the experimental in-title RR test
 
 Start from another fresh build of the 4K control. Apply the following
