@@ -1,1 +1,2 @@
 3ca6a13aecd7edadf807271f9e3e7a1feed603c9 518f8b73c99d75237fc5d177464ace3d14228074 nvidia-shader-extent.patch.txt
+1ec8cdd4791d95b60ce2457d71d7b96c70b3b700 917283c4a1d53d71966163b856ed4b335137a6c1 partial-descriptor-copies.patch.txt

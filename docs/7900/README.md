@@ -44,6 +44,15 @@ confirmed that identical containers in different carriers share a key.
 Use `sh build.sh --control <renderer-directory>` to reproduce the original
 source lock. Add `--rr` to reproduce the original Ray Reconstruction lock.
 
+## Descriptor updates
+
+Partial imported copies now mark overlapping view records for descriptor
+sync. An address-only write can therefore refresh a view even when its tag
+sits outside the copied bytes. All eight Windows-target descriptor tests
+passed under Wine. An uncontended copy-hook benchmark added about 0.04 ms
+per 3,800 mixed copies and did not measure downstream sync or game FPS.
+[Implementation and test](partial-descriptor-copies.patch.txt)
+
 ## Build and launch
 
 Set up Rust 1.98.1 and the Windows x64 MSVC cross toolchain, with Cargo's
