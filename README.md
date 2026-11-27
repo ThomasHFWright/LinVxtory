@@ -13,9 +13,9 @@ renderer composites the UI at presentation.
 
 The documented setup is **CachyOS, RTX 5090, NVIDIA driver 620.73.04,
 GE-Proton 11-14 and a locally built, pinned vkd3d-proton**. One offline
-cell replay measured **10.77 median FPS** and **119.01 ms p95** across 585
+cell replay measured **10.77 median FPS** and **119.01 ms p95 frame time** across 585
 title Present intervals in its 55-second timing window. The room lighting,
-wire window and character hair were visible in that checkpoint. Later
+wire window, character face and ponytail were visible in that checkpoint. Later
 scenes and long-session stability remain open.
 [Preset and replay conditions](docs/7900/README.md#current-4k-baseline) ·
 [Runtime versions](docs/7900/vkd3d-source-lock.json)
@@ -23,7 +23,7 @@ scenes and long-session stability remain open.
 ## Build and run
 
 Set up Rust 1.98.1, the Windows x64 MSVC cross toolchain, the locked Cargo
-dependencies and NVIDIA DLSS SDK 310.9.16. From this checkout:
+dependencies and NVIDIA DLSS SDK 310.9.16. Build from this checkout.
 
 ```sh
 export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
@@ -45,7 +45,8 @@ The separate research branch tracks opt-in DLSS Ray Reconstruction
 experiments, including a D3D12 hardware probe and in-game guide
 validation. A verified gameplay presentation with Ray Reconstruction
 remains an open milestone.
-[Ray Reconstruction research branch notes](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/ray-reconstruction.md)
+[Research branch notes](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/ray-reconstruction.md) ·
+[Reproduce a 4K cell test with inkVI-dive](https://github.com/TomTomAIbot/LinVxtory/blob/dlss-ray-reconstruction/docs/7900/dive-testing.md)
 
 ## Credits and development history
 
