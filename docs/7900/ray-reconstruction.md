@@ -6,11 +6,16 @@ Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 585 title Present intervals in the cell at +240 to +295 s. See the
 [control build and results](README.md).
 
-The intended RR path uses one NGX Ray Reconstruction evaluation to produce the
-4K scene from noisy 720p lighting. The title can then composite the UI.
-SR remains the control and the fallback. The branch is experimental.
-The repaired cell test completed one offscreen Ray Reconstruction
-evaluation on title inputs at 4K. The displayed game still used SR.
+The experimental path uses one NGX Ray Reconstruction evaluation to
+produce the 4K scene. The title still applies its later postprocessing
+and composites the UI. SR remains the control and the fallback.
+
+Hardware replays show three consecutive 4K RR frames with two native
+opaque reflection filters bypassed. A separate displayed replay restored
+the game’s intentional glass ripples using the original transmission
+input, with the native filters active in that test. Camera motion and
+matched performance are still being verified. [Opaque filter evidence](#native-4k-frames-with-two-opaque-filters-bypassed)
+· [Displayed optical layer](#the-optical-layer-on-the-aoc-display)
 
 ## Graph investigation
 
@@ -627,6 +632,13 @@ early decision succeeded on neither frame. The matching opaque source
 submissions 19583 and 19631 recorded 15,776 and 11,168 compute
 invocations respectively for **each** of the bilateral and history-update
 filters. The original denoisers were still running in both frames.
+
+The first longer camera replay selected SR in all 373 FFX slots. The
+continuous RR window armed the source and located exact future FFX
+recordings, but the pre-transparency snapshot still required the
+five-frame diagnostic trigger. The renderer safely kept SR and the
+original filters when those input anchors were missing. The test
+captured the camera sequence and recorded no presented RR for analysis.
 
 The native glass producer was independently identified in a stock 4K
 cell replay. At Present 1937, submission 11993, the active transmission
