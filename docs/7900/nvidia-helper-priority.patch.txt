@@ -1,0 +1,100 @@
+diff --git a/crates/victory-gpu/src/cores.rs b/crates/victory-gpu/src/cores.rs
+index 1114252e1a6dfebc35bca0458af88438ca3bc111..2906d1de129d104102e521343915dfdf67d1d092 100644
+--- a/crates/victory-gpu/src/cores.rs
++++ b/crates/victory-gpu/src/cores.rs
+@@ -275,6 +275,22 @@ fn ask(what: &str, from: u32) {
+     tracing::info!(what, fast = fast.len(), of, "the thread is kept on the fast cores (VICTORY_FAST_CORES=0: not)");
+ }
+ 
++/// Match the submission thread's priority on the workers it waits for.
++pub(crate) fn set_helper_priority() {
++    if std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|v| v == "0") {
++        return;
++    }
++    use windows_sys::Win32::System::Threading::{
++        GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
++    };
++    // SAFETY: only the calling worker's scheduling priority changes.
++    if unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) } == 0 {
++        let error = std::io::Error::last_os_error();
++        static WARN: std::sync::Once = std::sync::Once::new();
++        WARN.call_once(|| tracing::warn!(%error, "could not raise submission helper priority"));
++    }
++}
++
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+@@ -292,6 +308,24 @@ mod tests {
+         std::thread::spawn(|| keep_on_fast_cores("test")).join().unwrap();
+     }
+ 
++    #[test]
++    fn submission_helper_applies_the_requested_priority() {
++        use windows_sys::Win32::System::Threading::{
++            GetCurrentThread, GetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
++        };
++        std::thread::spawn(|| {
++            // SAFETY: both queries address this disposable worker.
++            let priority = || unsafe { GetThreadPriority(GetCurrentThread()) };
++            let expected = if std::env::var_os("VICTORY_HELPER_PRIORITY").is_some_and(|v| v == "0") {
++                priority()
++            } else {
++                THREAD_PRIORITY_ABOVE_NORMAL
++            };
++            set_helper_priority();
++            assert_eq!(priority(), expected);
++        }).join().unwrap();
++    }
++
+     const MB: u32 = 1 << 20;
+ 
+     /// `n` sets of one class, two to a core, from id 256.
+diff --git a/crates/victory-gpu/src/descriptor.rs b/crates/victory-gpu/src/descriptor.rs
+index 5bc0be33ce14b2e531fde2e010955e8f70bbdcae..8ac8ae8d0c4b001f3e561f7bec0fec793b84a6f4 100644
+--- a/crates/victory-gpu/src/descriptor.rs
++++ b/crates/victory-gpu/src/descriptor.rs
+@@ -219,6 +219,7 @@ pub(crate) fn begin_sync_heaps() -> SyncedHeaps {
+     STARTED.call_once(|| {
+         let made = std::thread::Builder::new().name("victory-heap-sync".into()).spawn(|| {
+             crate::cores::keep_on_fast_cores("victory-heap-sync");
++            crate::cores::set_helper_priority();
+             let rounds = || SYNC_ROUNDS.0.lock().unwrap_or_else(|e| e.into_inner());
+             /// A round is over, however it ends.
+             struct Over;
+diff --git a/crates/victory-gpu/src/host/aside.rs b/crates/victory-gpu/src/host/aside.rs
+index b46cf61aaa2027387dea128752a620fe82941038..7b01362d54b3a6fc42bb0d8f55de8926f00936c5 100644
+--- a/crates/victory-gpu/src/host/aside.rs
++++ b/crates/victory-gpu/src/host/aside.rs
+@@ -67,6 +67,7 @@ pub(crate) fn begin(work: impl FnOnce() -> Vec<Refresh> + Send + 'static) -> std
+             .name("victory-aside".into())
+             .spawn(move || {
+                 crate::cores::keep_on_fast_cores("victory-aside");
++                crate::cores::set_helper_priority();
+                 jobs.into_iter().for_each(|job| job())
+             })
+             .ok()
+diff --git a/crates/victory-gpu/src/land.rs b/crates/victory-gpu/src/land.rs
+index 2c82434b48c58362baeee0d3992ea3e7a0eeb54d..36e700aa5ed5087aa084014135cf08a12a9bef24 100644
+--- a/crates/victory-gpu/src/land.rs
++++ b/crates/victory-gpu/src/land.rs
+@@ -243,6 +243,7 @@ impl Pool {
+                 } else {
+                     crate::cores::keep_many_on_fast_cores(name);
+                 }
++                crate::cores::set_helper_priority();
+                 pool.help()
+             });
+         }
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index e159611a8242685394cedd77ec455c6f7422a389..c3db23cd287c1beb21fdc4311c2f5e4cb7fdd08c 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -1527,6 +1527,7 @@ fn workers() -> &'static Workers {
+         for i in 0..wide_threads() {
+             let _ = std::thread::Builder::new().name(format!("victory-wide-{i}")).spawn(move || {
+                 crate::cores::keep_helper_on_fast_cores("victory-wide");
++                crate::cores::set_helper_priority();
+                 let workers = WORKERS.get().expect("made above");
+                 loop {
+                     let job = {
