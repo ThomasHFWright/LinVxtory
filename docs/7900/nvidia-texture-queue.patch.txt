@@ -1,0 +1,98 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index bed48193026db7c9c0a1d610c673dcba4cf008f3..80df526423a281ae8e672f56d49a9abeaf069bd5 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -2735,7 +2735,8 @@ impl HostHeap {
+             }
+             Some(View::Shader(r, _)) if crate::resource::buffer_bytes(*r as crate::object::This).is_none() => {
+                 OBJECT_TEXTURE_SLOTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-                true
++                // The indexed upload pass discards textures written by the host.
++                crate::toggled!("VICTORY_QUEUE_HOST_TEXTURES") || crate::resource::title_fills(*r as crate::object::This)
+             }
+             _ => false,
+         };
+@@ -6084,6 +6085,24 @@ mod tests {
+         assert_eq!(slots(frame + 3 + TABLED_FRAMES), [2]);
+     }
+ 
++    #[test]
++    fn replacing_a_title_filled_texture_updates_its_upload_queue_entry() {
++        let Some(heap) = HostHeap::new(false, 8) else { return };
++        let uploaded = crate::resource::test_texture(0);
++        let target = crate::resource::test_texture(1);
++        let queued = |object| {
++            let view = View::Shader(object as usize, None);
++            assert!(heap.note_buffer(1, Some(&view), false).is_empty());
++            heap.queued.may(1)
++        };
++        assert!(queued(uploaded));
++        assert_eq!(queued(target), crate::toggled!("VICTORY_QUEUE_HOST_TEXTURES"));
++        assert!(queued(uploaded));
++        let release: extern "system" fn(crate::object::This) -> u32 = crate::object::slot(uploaded, 0x10);
++        release(uploaded);
++        release(target);
++    }
++
+     #[test]
+     fn dynamic_slots_are_held_until_released() {
+         let Some(heap) = HostHeap::new(false, 4) else {
+diff --git a/crates/victory-gpu/src/resource.rs b/crates/victory-gpu/src/resource.rs
+index 89d5fe86bd3a1c8a902ce7acbe42579107f01c48..dc96415e721b63fd2fc8b3c18bb4831eefb4d8cc 100644
+--- a/crates/victory-gpu/src/resource.rs
++++ b/crates/victory-gpu/src/resource.rs
+@@ -3372,6 +3372,16 @@ static RESOURCE_FUNCTIONS: Table<32> = {
+ 
+ #[cfg(test)]
+ pub(crate) fn test_buffer(width: u64) -> This {
++    test_committed(tests::buffer(width))
++}
++
++#[cfg(all(test, windows))]
++pub(crate) fn test_texture(flags: u32) -> This {
++    test_committed(ResourceDesc { flags, ..tests::texture(4, 4, 28, 1) })
++}
++
++#[cfg(test)]
++fn test_committed(desc: ResourceDesc) -> This {
+     let heap = HeapProperties {
+         kind: 1,
+         cpu_pages: 0,
+@@ -3379,19 +3389,6 @@ pub(crate) fn test_buffer(width: u64) -> This {
+         creation_nodes: 0,
+         visible_nodes: 0,
+     };
+-    let desc = ResourceDesc {
+-        dimension: BUFFER,
+-        alignment: 0,
+-        width,
+-        height: 1,
+-        depth_or_array_size: 1,
+-        mip_levels: 1,
+-        format: 0,
+-        sample_count: 1,
+-        sample_quality: 0,
+-        layout: 1,
+-        flags: 0,
+-    };
+     let mut out = std::ptr::null();
+     let hr = create_committed(
+         std::ptr::null(),
+@@ -3440,7 +3437,7 @@ mod tests {
+         visible_nodes: 0,
+     };
+ 
+-    fn buffer(width: u64) -> ResourceDesc {
++    pub(super) fn buffer(width: u64) -> ResourceDesc {
+         ResourceDesc {
+             dimension: BUFFER,
+             alignment: 0,
+@@ -3456,7 +3453,7 @@ mod tests {
+         }
+     }
+ 
+-    fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
++    pub(super) fn texture(width: u64, height: u32, format: u32, mips: u16) -> ResourceDesc {
+         ResourceDesc {
+             dimension: 3,
+             width,

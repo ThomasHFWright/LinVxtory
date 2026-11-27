@@ -42,10 +42,14 @@ export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
 sh build.sh "../linvxtory-rt-renderer"
 ```
 
-Use a fresh external source directory when upgrading. The script reconstructs
-and verifies the tested Git tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`
-and checks all 263 build inputs. It builds the diagnostic DLSS profile used
-for the 4K measurement.
+Use a fresh external source directory when upgrading. The build reconstructs
+the measured 4K baseline at `3d033cbd633757d2fd15f97a4323d566e8a043ba`,
+then applies [nvidia-texture-queue.patch.txt](nvidia-texture-queue.patch.txt).
+This candidate filters host-written texture objects from the indexed upload queue when the preset is active.
+The wrapper verifies the resulting Git tree `e94850e6c5889940bf7b9e76bcf6534d31b42649`
+and all 263 build inputs before compiling the diagnostic DLSS profile.
+The published replay measurements are from the baseline.
+[VIctory-NVIDIA source change](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/5dda41ddff71e3f6052b843c115d2e09e89df41d)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
