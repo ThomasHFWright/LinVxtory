@@ -71,3 +71,53 @@ and sample count. An RR result also needs confirmation that the presented
 output came from feature 13, which title denoisers actually bypassed,
 and whether SR fallback occurred during the interval. A feature creation
 or an offscreen evaluation alone only verifies that stage.
+
+## Reproduce the experimental in-title RR test
+
+Start from another fresh build of the 4K control. Apply the following
+overlays in order. The last overlay includes its own inkVI-dive capture
+adapter. The resulting diagnostics renderer still presents SR and can run a
+separate feature-13 evaluation on captured title inputs.
+
+```sh
+kit=$(realpath docs/7900)
+sh build.sh "$RR_TEST_SRC"
+cd "$RR_TEST_SRC"
+test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
+for patch in rr-backend rr-stage1 rr-cell-test; do
+  git apply --index "$kit/$patch.patch.txt" || exit 1
+done
+test "$(git write-tree)" = dbe076f814f66e1ddad92c7e2e924e0f0eca92bf
+cargo build --locked --offline --profile diag --features dlss \
+  -p victory --target x86_64-pc-windows-msvc
+```
+
+Include the SDK 310.9.16 release `nvngx_dlssd.dll` in the private runtime
+beside the SR DLL. Keep ambient substitution off and use the published
+4K profile. In addition to the capture switches above, set:
+
+```sh
+export VICTORY_RR_PREPARE=1 VICTORY_RR_CAMERA=1
+export VICTORY_OPAQUE_CURRENT=1 VICTORY_OPAQUE_CUT=1 VICTORY_ALPHA_CURRENT=1
+export VICTORY_RR_REFLECTION_DENSE=1 VICTORY_RR_MATERIAL_GUIDES=1
+export VICTORY_PASS_STATS_FRAME=1 VICTORY_RR_MATERIAL_FRAME=1
+export VICTORY_RR_REFLECTION_CAPTURE=1 VICTORY_RR_REFLECTION_CAPTURE_FRAME=1
+export VICTORY_RR_ORDER_FRAME=1 VICTORY_RR_BACKGROUND_FRAME=1 VICTORY_RR_SHADOW_FRAME=1
+export VICTORY_RR_STAGE_TRIGGER='Z:\path\to\run\captures\arm-stage'
+```
+
+Start with a fresh run directory. Once gameplay is visible, create
+`arm-stage` in the capture directory from the host. This selects the next
+five Present buckets after the trigger is observed. Request your first
+capture burst in that window. Keep each burst’s JSON and record the
+trigger’s `first_present` from the title log.
+
+| Report field | Evidence in the same run |
+| --- | --- |
+| In-process RR creation | `Ray Reconstruction feature preflight retired` with feature 13, completed fence, 1280×720 input and 3840×2160 output. |
+| Opaque filter cut | Retired statistics for shaders `dce085c07b9414b6` and `6fad2980c2774c90` at the selected recording frames. Include actual invocation counts for both and confirm the temporal resolve and lighting continued. A missing counter is inconclusive. |
+| Coverage | Retired material status and dense reflection-motion counts. Include unclassified or unsupported positions. |
+| Actual offscreen evaluation | `RR title shadow output retired`, feature 13, all 8,294,400 output pixels finite and written, and the reported output hash. This build presents SR; the receipt identifies the separate GPU test output. |
+
+Mark missing evidence as missing. Timing this instrumented cut experiment
+does not measure the speed or image quality of a presented RR replacement.
