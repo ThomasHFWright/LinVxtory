@@ -440,6 +440,36 @@ Check for `RR dense reflection-motion candidate completed` and
 `RR title shadow output retired` naming the same title frame. The case
 above reports only one completed offscreen evaluation.
 
+## Same-frame 4K visual comparison
+
+A second real cell replay produced three consecutive, fenced 4K RR
+outputs with the Preset F depth-of-field guide bound. The five-Present
+trigger requested four pairs. Three had the input receipts needed to
+complete the comparison. Each matched SR image came from the same FFX
+handoff and shared the same experimental lighting and filter cuts.
+
+| Present | RR history | RR output FNV-1a 64 |
+| --- | --- | --- |
+| 2250 | Reset | `e738878095dd661b` |
+| 2251 | Reused | `8c3caf32c3356a34` |
+| 2252 | Reused | `408a4510e16d6162` |
+
+Each RR output had 8,294,400 finite, written, nonzero pixels. Present 2252
+referenced the preceding camera at submission 17590. Its SR output hash
+was `d2ff0108d37ca6bd` and both EXRs recorded pre-exposure 1. Viewed with
+one exposure and tone curve, RR reduced speckle on the window and made
+the people outside easier to distinguish. The window also lost some fine
+texture. The ponytail and diamond wire remained visible. Lucia faced away
+from the camera. Face detail and ghosting during turns still require
+their own views.
+
+These are pre-postprocessing provider outputs. The title continued to
+present SR. Image capture and the extra diagnostic evaluation exclude this
+run from a single-provider performance comparison. The separate inkVI-dive
+bookmark returned within 0.003 game-world units, with identical heading
+and clock. The game's camera stayed independent of the saved position.
+[Reproduce the EXR pair](dive-testing.md#capture-native-4k-sr-and-rr-from-one-game-frame)
+
 The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
 introduces a different NVIDIA renderer baseline. Its [DLSS implementation
 notes](https://github.com/fxceless/victory-fork/blob/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea/docs/dlss.md)
