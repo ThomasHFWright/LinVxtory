@@ -4,19 +4,23 @@ The control is LinVxtory `338d80e`, renderer `5b10585` (tree
 `3d033cbd633757d2fd15f97a4323d566e8a043ba`). Its 1280×720 → 3840×2160
 Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 585 title Present intervals in the cell at +240 to +295 s. See the
-[control build and results](README.md).
+[control build and results](README.md#historical-4k-super-resolution-control).
 
-The experimental path uses one NGX Ray Reconstruction evaluation to
-produce the 4K scene. The title still applies its later postprocessing
-and composites the UI. SR remains the control and the fallback.
+The candidate default 4K preset requests one NGX Ray Reconstruction
+evaluation per qualifying frame from startup. It retains the game’s
+native global illumination, preserves the original wavy glass and
+replaces four native reflection filter bodies on eligible frames. The
+title applies its later postprocessing and composites the UI. A frame
+that misses the filter cutoff keeps stock Super Resolution and the
+native filters. The first intro upscales observed in the hardware
+replay still used this fallback.
+[Build and launch](README.md#build-and-launch) · [Native GI and glass](#native-gi-with-original-glass)
 
-On the RTX 5090, accepted 4K RR frames preserved the game’s wavy glass
-and bypassed five original filter bodies. A paired GI shader retained
-the diffuse and caustic accumulation that feeds scene lighting. The
-stock-vs-RR timing pair with the cutoff guard measured 8.54 vs 8.75
-median FPS and 271.46 vs 202.39 ms p95. Stock SR recovered on every
-accepted frame where the early replacement could not commit.
-[GPU filter evidence](#diffuse-history-replacement) · [Same-build timing](#capture-free-timing-with-the-stock-fallback-guard) · [Stock fallback](#stock-fallback-at-the-native-cutoff)
+The earlier five-filter experiment replaced the probe shader with a
+hybrid that retained diffuse and caustic accumulation. Its stock-vs-RR
+timing pair measured 8.54 vs 8.75 median FPS and 271.46 vs 202.39 ms
+p95. Those results apply to the hybrid-GI experiment.
+[Hybrid-GI filter evidence](#diffuse-history-replacement) · [Historical same-build timing](#capture-free-timing-with-the-stock-fallback-guard)
 
 ## Graph investigation
 
@@ -156,7 +160,7 @@ private staging directory. From the LinVxtory root:
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$RESEARCH_SRC"
+sh build.sh --sr --control "$RESEARCH_SRC"
 cd "$RESEARCH_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-backend.patch.txt"
@@ -210,7 +214,7 @@ overlay](rr-graph.patch.txt) to a separate fresh reconstruction of the
 
 ```sh
 kit=$(realpath docs/7900)
-sh build.sh --control "$TRACE_SRC"
+sh build.sh --sr --control "$TRACE_SRC"
 cd "$TRACE_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-graph.patch.txt"
@@ -219,8 +223,8 @@ cargo build --locked --offline --profile diag --features dlss \
   -p victory --target x86_64-pc-windows-msvc
 ```
 
-Use the [4K control replay settings](README.md#build-and-launch) and choose
-a frame in the cell. The frame number varies with loading. Set
+Use the [4K launch settings](README.md#build-and-launch) with
+`VICTORY_RR_AUTO=0` before loading the preset. Choose a frame in the cell. The frame number varies with loading. Set
 `VICTORY_PROVENANCE` to a writable private Windows filename,
 `VICTORY_PROVENANCE_FRAMES` to the selected frame, `VICTORY_CAPTURE` to
 an existing private Windows directory, and `VICTORY_CAPTURE_FRAMES` to
@@ -908,7 +912,7 @@ at the native filter cutoff. The later FidelityFX slot kept the original
 SR command. Its signal and accepted 4K Present identify stock SR with
 all replacement flags clear. The same signal certified the camera for
 the next frame, and the replay presented full-route RR after the warmup.
-[Reproduction and opt-in build](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
+[Diagnostic reproduction](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
 
 In the first camera-turn run of this build, 227 of 229 accepted Presents
 used the full RR route and the other two used exact stock SR. The native
@@ -935,10 +939,77 @@ angles differed from the stock run, and full-frame registration failed
 across the turn. The review uses locally aligned crops and adjacent
 frames from the same replay.
 
+### Native GI with original glass
+
+The native-GI validation build `a53eaa18` presented the 4K cell frame
+1914 on the physical AOC. Its fenced FidelityFX slot used one RR
+evaluation and zero SR evaluations. The Present receipt identifies the
+original optical input and confirms the four reflection replacements
+with native GI selected. The pane retained the visible wavy distortion
+and wire mesh. This is frame-level image and route evidence.
+
+### Continuous startup investigation
+
+A normal launch can request RR without a benchmark trigger. The physical
+AOC replay confirmed full-route 4K RR over more than four minutes. The
+first intro FidelityFX slot still used SR, before the later accepted
+scene path had enough guide and queue evidence.
+
+A closed HDR and alpha bracket can contain no captured pane draw. In
+continuous mode, the proof now accepts that empty pane set when all
+lists passed capture validation. A native pane still requires its
+original depth/HDR serials and draw ordering. The alpha replacement
+still needs its exact writer and reader. With no pane, the already
+composed title color goes directly into RR.
+
+An earlier hybrid-GI diagnostic of this change executed feature 13 on
+intro FFX frame 1369 with a history reset, zero SR GPU evaluations and all five
+targeted replacements. The first FFX frame, 1366, still executed SR.
+An animated letterbox limited accepted Present attribution for the early
+RR frames, so this is a GPU-slot result.
+
+A separate exact input/output tap on a stationary frame pair measured
+the under-bunk metal dropping by 3.15 EV in the color entering RR and
+2.07 EV in its linear output. Both frames used RR history, fixed
+pre-exposure and an empty optical layer at that patch. The image
+variation begins upstream of RR on that pair.
+
+### Default preset replay
+
+The exact default renderer tree `d6adab8` and native-GI preset ran on
+CachyOS, GE-Proton 11-14 and an RTX 5090 with the signed DLSS 310.9.16
+runtime. The replay used read-only input and a separate offline prefix,
+save and cache. It ran on the physical AOC with 1280×720 input and
+3840×2160 output, without a timed RR trigger.
+
+The first 720p-to-4K upscale used SR. The first verified full 4K RR
+Present arrived 63.4 seconds later during the transition into the cell.
+The quiet profile gives an upper bound for RR activation because the
+earliest intro operations lack full-display attribution. A separate
+startup diagnostic with the same lighting reached its first fenced RR
+evaluation on the fourth upscale, 0.81 seconds after the first
+upscale submitted to the GPU.
+
+Over seconds 240–295 in the loaded cell, 451 of 453 verified Presents
+used RR with native GI and the original optical input. The other two
+used stock SR. The capture-free interval measured **8.37 median FPS**
+and **133.31 ms p95 title Present interval** across both paths. The
+449 intervals between consecutive verified RR Presents measured
+**8.36 median FPS** and **131.21 ms p95**. This is one default-preset
+measurement with no paired performance control.
+
+The wavy pane and hair remained visible. Separate exact taps at the
+reported through-glass tree and dark post found temporal variation
+before RR. Pane coverage stayed steady in the sampled tree tile. RR
+reduced the variation, with residual fine shimmer visible through the
+glass. Native sampling and subpixel jitter are still combined in those
+measurements.
+
 ### Capture-free timing with the stock fallback guard
 
-The same executable ran both arms on the physical AOC with the same
-Series S checkpoint, stationary cell pose, save/cache seed and 720p-to-4K
+The historical hybrid-GI experiment used the same executable for both
+arms on the physical AOC with the same Series S checkpoint, stationary
+cell pose, save/cache seed and 720p-to-4K
 profile. Each run excluded loading and the three-second guide warmup
 from its 55-second measurement. Capture, motion and pass diagnostics
 stayed outside the measurement. Before each measured arm in the timing

@@ -1,19 +1,36 @@
-# Series S 4K DLSS replay on RTX 5090
+# Series S 4K DLSS on Linux
 
 This is the renderer built by the root [build script](../../build.sh). It uses
 avatarmanz’s VIctory-7900XTX source at 014d52d from the
 [public source mirror](https://github.com/TheInfamous404/VIctory-7900XTX/commit/014d52dedf837d1ac660a0bd256c4704be9eeb40),
 with LinVxtory's Linux and face/hair work, CPU submission changes, bounded
-readback capture, and direct 4K DLSS Super Resolution. The patches are
+readback capture, and direct 4K DLSS. The patches are
 GPL-3.0-or-later like the renderer. The kit provides source, settings, and
 input hashes. Use your own game files and build the runtime locally.
 
-## Current 4K baseline
+## Default Ray Reconstruction preset
 
-The current Series S profile feeds **1280×720** into DLSS Super Resolution
+The Series S profile enables DLSS Ray Reconstruction automatically on
+qualifying frames in Ultra Performance mode with **1280×720** input and
+**3840×2160** output.
+The game’s native global illumination (GI) remains active. The renderer
+supplies the scene, depth, motion, material and reflection guides and
+preserves the original wavy glass. The title applies its later
+postprocessing and composites the UI at presentation.
+
+For eligible frames, the renderer commits RR before the native filter
+cutoff and replaces four reflection filter passes. When the guides or
+glass data fail to qualify in time, the renderer keeps stock Super
+Resolution and the native filters for that frame. Startup can use
+Super Resolution until the required frame data qualifies.
+[Native GI and glass verification](ray-reconstruction.md#native-gi-with-original-glass) ·
+[Startup investigation](ray-reconstruction.md#continuous-startup-investigation)
+
+## Historical 4K Super Resolution control
+
+The historical profile feeds **1280×720** into DLSS Super Resolution
 in Ultra Performance mode and presents a **3840×2160** swap chain. The
-title still generates jitter, using the 72-phase count reported by the
-upscaler. The renderer composites the UI at presentation.
+title generates jitter using the 72-phase count reported by the upscaler.
 
 The offline AOC replay on CachyOS and RTX 5090 completed its scheduled
 301-second run. It logged **at least 1,024 DLSS evaluations**, all 53
@@ -23,11 +40,9 @@ from elapsed seconds 240–295, 585 title Present intervals yielded
 95th-percentile** interval. Face and hair rendered in the intro, and the
 ponytail, wire window and lighting remained visible in the cell.
 
-This is one 4K baseline replay. A matched speed comparison and longer
-session have yet to run. The feature in this build is Super Resolution.
-
-The [Ray Reconstruction research](ray-reconstruction.md) includes separate
-4K hardware probes and the submitted cell-frame graph.
+This result belongs to the historical Super Resolution renderer. The
+separate same-build SR/RR comparison used the historical hybrid-GI route.
+[Historical hybrid-GI timing](ray-reconstruction.md#capture-free-timing-with-the-stock-fallback-guard)
 
 ## Offline shader lookup
 
@@ -41,8 +56,9 @@ from 0.775 s to 0.051 s and preserved all 256 offsets. A separate fixture
 confirmed that identical containers in different carriers share a key.
 [Upstream fix](https://github.com/trustno1-coder/VIctory-NVIDIA/commit/b1369afb40017099471223ff61327c4550669a61)
 
-Use `sh build.sh --control <renderer-directory>` to reproduce the original
-source lock. Add `--rr` to reproduce the original Ray Reconstruction lock.
+Use `sh build.sh --sr --control <renderer-directory>` to reproduce the
+original Super Resolution source lock. Use `--rr --control` to reproduce
+the Ray Reconstruction source lock before the newer performance patches.
 
 ## Descriptor updates
 
@@ -60,21 +76,31 @@ locked dependencies available offline.
 [Cross-toolchain setup](../pr995-candidate/README.md#reconstruct-and-build)
 
 Get NVIDIA DLSS SDK **310.9.16** and point `VICTORY_DLSS_SDK` at the
-directory containing `lib/Windows_x86_64/nvsdk_ngx_d.lib`.
+directory containing `lib/Windows_x86_64/nvsdk_ngx_d.lib`. If the SDK
+archive places the library under `lib/Windows_x86_64/x64/`, stage a
+local copy one directory up.
 [NVIDIA DLSS SDK release](https://github.com/NVIDIA/DLSS/releases/tag/v310.9.16)
 
 From the LinVxtory checkout, build the renderer.
 
 ```sh
 export VICTORY_DLSS_SDK=/path/to/DLSS-SDK
-sh build.sh "../linvxtory-rt-renderer"
+sh build.sh "../linvxtory-renderer"
 ```
 
-Use a separate external renderer directory for each build mode. The
-script checks all 263 original inputs when it reconstructs the measured
-4K tree `3d033cbd633757d2fd15f97a4323d566e8a043ba`. It checks each
-subsequent overlay tree before building the diagnostic DLSS profile.
-[Current build locks](perf-build-trees.txt)
+Use a separate external renderer directory for each build mode.
+
+| Build options | Renderer |
+| --- | --- |
+| No option or `--rr` | Current Ray Reconstruction renderer |
+| `--sr` | Current 4K Super Resolution renderer |
+| `--sr --control` | Exact historical 4K Super Resolution renderer |
+| `--rr --control` | Historical Ray Reconstruction renderer before the newer performance patches |
+
+The script checks the base tree and all 263 historical build inputs,
+then verifies subsequent overlay trees before compiling the locked
+DLSS profile.
+[RR overlay locks](rr-build-trees.txt) · [Performance overlay locks](perf-build-trees.txt)
 
 The test used CachyOS, RTX 5090 and NVIDIA 620.73.04, GE-Proton 11-14, and the
 [vkd3d-proton source revisions](vkd3d-source-lock.json) with the
@@ -84,23 +110,27 @@ and that patch at the source checkout and patch steps in the
 are built and installed locally. See also the
 [indexed wineserver setup](../runtime/indexed-server/README.md).
 
-Set `PROTON_WINE`, `TITLE_EXE`, `WINEPREFIX`, `VICTORY_DXC`,
-`VICTORY_DXIL`, `VICTORY_CACHE_DIR`, and `VICTORY_DATA_DIR` to your own
-paths. Use a separate shader cache and save directory for the new renderer.
+Set `PROTON_WINE` to your Proton Wine executable and `TITLE_EXE` to your
+title executable. Export `WINEPREFIX` as a Linux path. Export
+`VICTORY_DXC`, `VICTORY_DXIL`, `VICTORY_CACHE_DIR` and
+`VICTORY_DATA_DIR` as paths visible to the Windows process. Use a separate
+shader cache and save directory for the new renderer.
 The replay used a read-only game mount, an isolated offline runtime, and a
 fixed stop time. The settings disable the renderer watchdog, so use a time
 limit for unattended tests.
 
 Prepare the dedicated Wine prefix with the Microsoft x64 Visual C++ v14
-runtime. Set `NGX_RUNTIME` to a local folder with the official SDK's
-`nvngx_dlss.dll`, `_nvngx.dll` and `nvngx.dll` from the installed NVIDIA
-driver's Wine components, and the x64 `nvapi64.dll` from Proton's
-DXVK-NVAPI. Use the signed NVIDIA DLLs from your installation. The build
-kit contains none of these files.
+runtime. Set `NGX_RUNTIME` to a local directory containing the signed
+`nvngx_dlss.dll` and `nvngx_dlssd.dll` from NVIDIA DLSS SDK 310.9.16,
+`_nvngx.dll` and `nvngx.dll` from the installed NVIDIA driver's Wine
+components, and the x64 `nvapi64.dll` from Proton's DXVK-NVAPI.
+`nvngx_dlssd.dll` enables Ray Reconstruction. Keep `nvngx_dlss.dll` for
+Super Resolution, including fallback when RR or its DLL is unavailable.
+The build kit contains none of these files.
 [Microsoft Visual C++ runtime](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist) · [DXVK-NVAPI](https://github.com/jp7677/dxvk-nvapi)
 
 ```sh
-src=$(realpath "../linvxtory-rt-renderer")
+src=$(realpath "../linvxtory-renderer")
 bin="$src/target/x86_64-pc-windows-msvc/diag"
 system32="$WINEPREFIX/drive_c/windows/system32"
 mkdir -p "$system32"
@@ -108,7 +138,10 @@ for dll in _nvngx.dll nvngx.dll nvapi64.dll; do
     install -m 0644 "$NGX_RUNTIME/$dll" "$system32/$dll"
 done
 install -m 0644 "$NGX_RUNTIME/nvngx_dlss.dll" "$bin/nvngx_dlss.dll"
-export WINEDLLOVERRIDES='d3d12=n;d3d12core=n;dxgi=n;nvngx_dlss,_nvngx,nvngx,nvapi64,concrt140,msvcp140,vcruntime140,vcruntime140_1=n'
+if [ -f "$NGX_RUNTIME/nvngx_dlssd.dll" ]; then
+    install -m 0644 "$NGX_RUNTIME/nvngx_dlssd.dll" "$bin/nvngx_dlssd.dll"
+fi
+export WINEDLLOVERRIDES='d3d12=n;d3d12core=n;dxgi=n;nvngx_dlss,nvngx_dlssd,_nvngx,nvngx,nvapi64,concrt140,msvcp140,vcruntime140,vcruntime140_1=n'
 "$PROTON_WINE" wineboot -u
 "$PROTON_WINE" reg add 'HKLM\SOFTWARE\NVIDIA Corporation\Global\NGXCore' \
   /v FullPath /t REG_SZ /d 'C:\Windows\System32' /f
@@ -120,9 +153,17 @@ export VKD3D_DISABLE_EXTENSIONS=VK_NV_raw_access_chains
   run "$TITLE_EXE" --execute --console series-s
 ```
 
-This selects the 4K baseline with ray tracing active and the ambient
-substitute disabled. The preset waits up to five seconds on a pipeline's
-first use. A cold run can spend several minutes compiling.
+This launches the default 720p-to-4K Ray Reconstruction preset with
+ray tracing and native GI active. Ordinary play needs no benchmark or
+frame capture trigger.
+For an explicit Super Resolution launch, start in a fresh shell,
+`export VICTORY_RR_AUTO=0` before sourcing `rt-speed.env.sh`, and
+point `src` at the desired renderer directory in the command above. The
+same setting selects SR when comparing both modes with one RR executable.
+
+The preset waits up to five seconds on a pipeline's first use. A cold
+run can spend several minutes compiling.
+[Diagnostic capture and historical hybrid-GI timing](dive-testing.md#keep-stock-super-resolution-when-the-rr-cutoff-is-missed)
 
 ## Findings
 
@@ -239,4 +280,4 @@ The CPU work includes adaptations of
 and [in-place dirty-range merging](https://github.com/fxceless/victory-fork/pull/1431).
 The DLSS bridge builds on the
 [7900XTX DLSS experiment](https://github.com/avatarmanz/VIctory-7900XTX/pull/203).
-See the [project credits](../../README.md#attribution) for earlier work.
+See the [project credits](../../README.md#credits-and-development-history) for earlier work.
