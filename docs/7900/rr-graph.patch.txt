@@ -14,7 +14,7 @@ index 33e0ec5b8c96c806f635a6990f2babde67261215..055527057fdfed569b5f940bb85eec02
 @@ -3163,6 +3165,86 @@ impl State {
          }
      }
- 
+
 +    #[cfg(feature = "diagnostics")]
 +    fn traced_table_view(&self, compute: bool, slot: u8, offset: u32) -> Option<View> {
 +        let Root::Table(base) = self.roots_ref(compute).get(usize::from(slot))? else {
@@ -162,7 +162,7 @@ index 25b4803e4c46ba07080478e7b3fad52fe43866e8..0d8a57ce0e9acc38632d0db053235575
 @@ -39,6 +39,24 @@ impl Recording<'_> {
          Some(())
      }
- 
+
 +    /// Records the actual evaluated FidelityFX resource handoff for diagnostics.
 +    #[cfg(feature = "diagnostics")]
 +    pub fn trace_upscale(&self, color: This, depth: This, motion: This, output: This) {
@@ -229,7 +229,7 @@ index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..2f05a2da11c876f87a553d84bf5c1e6f
 @@ -7465,6 +7475,16 @@ impl HostList {
          list.cast().ok()
      }
- 
+
 +    #[cfg(feature = "diagnostics")]
 +    pub(crate) fn provenance_recording(&self) -> std::sync::MutexGuard<'_, crate::provenance::Recording> {
 +        self.provenance.lock().unwrap_or_else(|e| e.into_inner())

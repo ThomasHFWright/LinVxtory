@@ -85,7 +85,7 @@ index 7e2e39b17eb044839afc9f6042b104c7e5ba46eb..fd18065fc8e54752090cbfc669924efb
 +        list.CopyTextureRegion(&to, 0, 0, 0, &from, region.map(std::ptr::from_ref));
      }
  }
- 
+
 @@ -793,27 +806,14 @@ pub(crate) fn probe(
                  (2 * (i % GRID) + 1) * d.Width as u32 / (2 * GRID),
                  (2 * (i / GRID) + 1) * d.Height / (2 * GRID),
@@ -138,7 +138,7 @@ index 5bc0be33ce14b2e531fde2e010955e8f70bbdcae..e0fc5f9ff38ea5cc600eb5952c928fbf
 @@ -1531,6 +1531,26 @@ pub(crate) fn view(handle: u64) -> Option<View> {
      view_at(i, generation)
  }
- 
+
 +/// A diagnostic lookup through the live, bound heap. Read the descriptor via
 +/// the kernel so an unmapped title page cannot fault the probe.
 +#[cfg(all(windows, feature = "diagnostics"))]
@@ -169,7 +169,7 @@ index 33e0ec5b8c96c806f635a6990f2babde67261215..98fd2773679559539c0420fed80394ac
 @@ -24,6 +24,11 @@ use crate::host::HostList;
  use crate::object::This;
  use crate::pipeline::host::HostPipeline;
- 
+
 +#[cfg(feature = "diagnostics")]
 +pub(crate) mod guide_samples;
 +#[cfg(feature = "diagnostics")]
@@ -198,7 +198,7 @@ index 33e0ec5b8c96c806f635a6990f2babde67261215..98fd2773679559539c0420fed80394ac
 @@ -3074,6 +3086,26 @@ impl State {
          })
      }
- 
+
 +    #[cfg(feature = "diagnostics")]
 +    fn guide_table_view(&self, compute: bool, slot: u8, offset: u32) -> Option<View> {
 +        let Root::Table(base) = self.roots_ref(compute).get(usize::from(slot))? else {
@@ -1059,7 +1059,7 @@ index 25b4803e4c46ba07080478e7b3fad52fe43866e8..ac9d77af086f19a028c4c5206c74dff7
 @@ -39,6 +39,13 @@ impl Recording<'_> {
          Some(())
      }
- 
+
 +    /// Retains numeric samples from the fixed UHD SR input at the optional
 +    /// RR capture frame, after the title's last scene-color writer.
 +    #[cfg(feature = "diagnostics")]
@@ -1100,7 +1100,7 @@ index 83c3c091a38d38fffd6fe765ceaf49704b1f4da5..78b5036c7d758c4e374c33172af69611
 @@ -8001,6 +8010,22 @@ impl HostList {
          self.deferred().indirect_readable = scratch.as_raw() as usize;
      }
- 
+
 +    /// The texture and its current host state as established by this list's
 +    /// normal binding path. A diagnostic view never dereferences a title object.
 +    #[cfg(feature = "diagnostics")]
@@ -1127,7 +1127,7 @@ index 89d5fe86bd3a1c8a902ce7acbe42579107f01c48..a56b66e8f8abc94f546274b67ec05cba
 @@ -2507,6 +2507,17 @@ pub(crate) fn made_copy(this: This) -> Option<std::sync::Arc<HostTexture>> {
      hosted(this, false).map(|made| made.0)
  }
- 
+
 +/// A host texture held while the title resource is pinned by its live registry.
 +#[cfg(all(windows, feature = "diagnostics"))]
 +pub(crate) fn diagnostic_copy(at: usize) -> Option<std::sync::Arc<HostTexture>> {
