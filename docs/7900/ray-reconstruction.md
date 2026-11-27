@@ -557,10 +557,9 @@ error relative to SR fell 14.2% in the interior more than nine pixels
 from the boundary. It rose 4.2% in the nine-pixel band on either side
 of the boundary, where a few bright flecks appeared near the character’s
 silhouette. Farther outside, the error was about 0.054 in both cases.
-These are selected regions of one stationary reset frame. The mask’s
-final influence after heat haze and DOF, stability during camera motion
-and native presentation quality still need testing. Timing requires a
-separate single-provider replay.
+These are selected regions of one stationary reset frame before title
+postprocessing. The following display test checks the stationary result
+with history. Movement and timing require separate comparisons.
 
 Add the optional [optical overlay patch](rr-glass-optical.patch.txt) to
 the glass comparison tree `30256e4ebd5b64af8f6fcadaffb0a0fce44b31e1`
@@ -587,6 +586,23 @@ SR reference bytes. The optical receipt reports
 `observed_pre_haze_transmission_pixels`. Require positive coverage and
 zero rejected samples in the matching renderer log. Keep all captures
 and generated files local.
+
+#### The optical layer on the AOC display
+
+A separate stationary replay used the native transmission input in the
+selected FFX slot for Presents 1888–1890. Feature 13 retired at fences
+9573, 9589 and 9605, with no SR evaluation in any of those slots. The
+first frame reset history and the next two reused it. All three captured
+title outputs were 3840×2160. This test kept the original native filters
+active.
+
+In the displayed output at 1889, the tower, left roof, right roof and
+table retained 98%, 108%, 96% and 110% of the preceding SR capture's
+mid-scale contrast. The left roof and table show coarser bright ripples.
+The rear ponytail and wire mesh remain visible. This compares nearby
+stationary frames after title postprocessing. The same-frame comparison
+above isolates the effect of the optical layer, while movement and face
+coverage require a separate sequence.
 
 ## Native output and fallback
 
