@@ -136,9 +136,20 @@ measure rendering FPS. [Upstream test result](https://github.com/OctoAlgo/inkVI-
 This run retired the in-game feature-13 creation fence at the requested
 resolutions. The revised indirect-command limit brought each targeted
 post-filter query to **32 compute invocations** in the sampled cell.
-Both shaders use 64-thread groups. The contribution of the indirect
-implementation to the remaining count still needs a target-specific
-check. The title produced GPU snapshots of the camera, HDR, depth and
+Both shaders use 64-thread groups. Four paired submissions (18202,
+18218, 18234 and 18250) each recorded exactly 32 for each filter.
+A hardware calibration using the renderer’s UAV-to-indirect-argument
+barrier measured two count-limited dispatches with 64 counter invocations
+and zero writes to a target UAV. The corresponding ungated single dispatch
+measured 768 invocations and 768 writes. With the two dispatches enabled,
+the counter read 1,600 for 1,536 writes. The translator runs a 32-thread
+shader to clear indirect arguments for each zero-count call. This accounts
+for the full 32 in each title query. Neither native filter executed a
+workgroup in the four captured pairs.
+[Indirect count translation](https://github.com/HansKristian-Work/vkd3d-proton/blob/71cae091b06571e51446cf2a937f0b04c237c04d/libs/vkd3d/command.c#L18923-L18937)
+· [32-thread argument shader](https://github.com/HansKristian-Work/vkd3d-proton/blob/71cae091b06571e51446cf2a937f0b04c237c04d/libs/vkd3d/shaders/cs_execute_indirect_multi_dispatch.comp#L3-L53)
+
+The title produced GPU snapshots of the camera, HDR, depth and
 motion, but the retained material sample belonged to a different prepass
 recording. The diagnostic withheld its RR evaluation and the cell
 continued to present 4K SR.
