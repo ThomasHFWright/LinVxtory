@@ -42,3 +42,13 @@ Decide whether RR is available before skipping a stock pass needed by SR.
 The pinned [NVIDIA RR guide](https://github.com/NVIDIA/DLSS/blob/v310.9.16/doc/DLSS-RR%20Integration%20Guide.pdf)
 and [D3D12 helper](https://github.com/NVIDIA/DLSS/blob/v310.9.16/include/nvsdk_ngx_helpers_dlssd_d3d.h)
 define the SDK inputs.
+
+## D3D12 hardware result
+
+SDK 310.9.16 created feature 13 in Ultra Performance mode on the RTX 5090
+under GE-Proton 11-14. It selected exactly 1280×720 for 3840×2160 output.
+Two synthetic evaluations completed, one with reset and one with history.
+After the GPU fences signaled, both 4K readbacks had finite RGB at every
+pixel and zero remaining sentinel components. The [probe source, build
+instructions and measured outputs](rr-probe/README.md) are reproducible
+without game files. In-game guide validation is still underway.
