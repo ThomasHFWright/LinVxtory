@@ -75,8 +75,8 @@ or an offscreen evaluation alone only verifies that stage.
 ## Reproduce the experimental in-title RR test
 
 Start from another fresh build of the 4K control. Apply the following
-overlays in order. The last overlay includes its own inkVI-dive capture
-adapter. The resulting diagnostics renderer still presents SR and can run a
+overlays in order. They include the inkVI-dive capture adapter and the
+material and camera repair used in the successful offscreen test. The resulting diagnostics renderer still presents SR and can run a
 separate feature-13 evaluation on captured title inputs.
 
 ```sh
@@ -84,10 +84,10 @@ kit=$(realpath docs/7900)
 sh build.sh "$RR_TEST_SRC"
 cd "$RR_TEST_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
-for patch in rr-backend rr-stage1 rr-cell-test; do
+for patch in rr-backend rr-stage1 rr-cell-test rr-cell-join; do
   git apply --index "$kit/$patch.patch.txt" || exit 1
 done
-test "$(git write-tree)" = dbe076f814f66e1ddad92c7e2e924e0f0eca92bf
+test "$(git write-tree)" = 471f1db55f6437dcc62b5b3ffdb0c79dc542c28c
 cargo build --locked --offline --profile diag --features dlss \
   -p victory --target x86_64-pc-windows-msvc
 ```
@@ -153,3 +153,7 @@ The title produced GPU snapshots of the camera, HDR, depth and
 motion, but the retained material sample belonged to a different prepass
 recording. The diagnostic withheld its RR evaluation and the cell
 continued to present 4K SR.
+
+The next replay reproduced the same-frame material and camera join and
+evaluated RR offscreen at Present 1918. The AOC showed the title’s SR
+output. [4K output and guide coverage](ray-reconstruction.md#offscreen-title-evaluation-at-present-1918)

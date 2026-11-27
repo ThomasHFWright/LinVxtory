@@ -9,6 +9,8 @@ Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 The intended RR path uses one NGX Ray Reconstruction evaluation to produce the
 4K scene from noisy 720p lighting. The title can then composite the UI.
 SR remains the control and the fallback. The branch is experimental.
+The repaired cell test completed one offscreen Ray Reconstruction
+evaluation on title inputs at 4K. The displayed game still used SR.
 
 ## Graph investigation
 
@@ -385,6 +387,58 @@ and 795–832 screen-space hits per 640×360 input on three cell frames. It
 checked the same opaque depth serial, camera and native write sequence.
 Most positions had insufficient evidence of a fresh hit. Matching actual
 guide coverage and confirming a presented feature-13 frame are still open.
+
+## Offscreen title evaluation at Present 1918
+
+A subsequent cell replay on the RTX 5090 under GE-Proton 11-14 matched the
+opaque prepass to its own material record and paired the current and
+previous SR cameras in host submission order. The native reflection pass
+ran in submission 11770. The dense guide and offscreen RR handoff used
+the captured inputs for Present 1918, with the input snapshots retired
+under submission 11774.
+
+| Check | Result |
+| --- | --- |
+| Dense reflection motion at 1280×720 | 3,226 reconstructed candidates, 3,221 changed from primary motion, zero unexpected changes to primary-motion fallback, zero nonfinite outputs |
+| Guide coverage | 72,998 unsupported positions, 818,575 rough surfaces, 26,780 without a compatible hit and 21 explicit reflection misses. Zero pixels were marked as fully qualified reflection motion. |
+| Offscreen RR at 3840×2160 | Feature 13 evaluated and retired. All 8,294,400 pixels were finite, written and nonzero. The readback hash was `b6cb0167feaa47ec` (FNV-1a 64). |
+| Display | The AOC continued to show the SR title output. The RR image was read back privately and did not feed presentation. |
+
+The command-count cut brought both targeted opaque post-filters to 32
+query invocations in each of four captured pairs. The calibrated
+vkd3d-proton indirect-argument pass accounts for all 32, leaving zero
+native workgroups for bilateral filtering and history update. The opaque
+temporal resolve and alpha temporal shader still ran. For the linked
+submissions, they recorded 87,040 and 327,168 invocations respectively.
+The feature-13 test used captured title HDR, diagnostic opaque material
+guides and dense candidate reflection motion. It omitted the DOF guide.
+Complete material ownership after alpha composition and a noisy lighting
+handoff with all replaced denoisers bypassed remain open. This replay
+does not establish presented RR image quality, a matched performance
+result or a verified named-bookmark return.
+[Counter calibration and report fields](dive-testing.md#first-live-repeat)
+
+### Reproduce the repaired cell test
+
+The [experimental in-title build recipe](dive-testing.md#reproduce-the-experimental-in-title-rr-test)
+applies the [cell join overlay](rr-cell-join.patch.txt) after the three
+original patches. The overlay includes the material and camera joins and
+the capture receipt changes. It takes the original experimental renderer
+tree `dbe076f814f66e1ddad92c7e2e924e0f0eca92bf` to
+`471f1db55f6437dcc62b5b3ffdb0c79dc542c28c`. Use the documented five-Present
+trigger when the cell is visible.
+
+The reconstructed renderer matches the graphics and capture code in the
+live build, `db305be`. That build also contained an optional bookmark
+command channel. Its position request timed out after the selected
+frame, and the replay performed no bookmark action. The published
+overlay omits that channel and cross-builds with the diagnostics profile.
+Record your executable hash and the actual Present selected by the
+trigger. The live executable SHA-256 was
+`ea4fa1521ee13016ffb7e5bd66fa6aceccedc43aa0342939f852a30392630db5`.
+Check for `RR dense reflection-motion candidate completed` and
+`RR title shadow output retired` naming the same title frame. The case
+above reports only one completed offscreen evaluation.
 
 The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
 introduces a different NVIDIA renderer baseline. Its [DLSS implementation
