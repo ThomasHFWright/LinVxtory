@@ -98,3 +98,58 @@ These findings combine the 4K SR runtime's selected shader identities with
 static producer/consumer analysis and the older frame's resource bindings.
 Addresses, dimensions and pass order from that older capture are unsuitable
 as constants for the 720p renderer.
+
+## Renderer backend and device test
+
+The optional [renderer source overlay](rr-backend.patch.txt) adds a D3D12 RR
+backend and an opt-in hardware test inside `victory-hle`. Game dispatch
+continues to use the published SR path. The backend accepts a verified guide
+bundle, checks its device, dimensions and formats, and records one RR
+evaluation. It accepts dense reflection motion or scalar hit distance with
+camera matrices. The caller owns resource transitions, backing lifetimes,
+queue ordering and the history reset when switching paths.
+
+On the RTX 5090, the renderer test evaluated three frames at 720p → 4K using
+the signed 310.9.16 runtime. Each evaluation completed a GPU fence and
+returned nonzero, finite sampled red values:
+
+| Evaluation | Reflection input | Completed fence |
+| --- | --- | ---: |
+| First frame, reset | Reflection motion | 1 |
+| Following frame, history | Reflection motion | 2 |
+| Explicit reset | Hit distance, world-to-view and view-to-clip matrices | 3 |
+
+On the same device the SR feature also created with its own live parameter
+map and handle, completed fence 4 and released successfully. The renderer
+test uses linear depth. The preceding standalone probe checks a full image.
+Both tests use synthetic geometry.
+
+To reproduce, start with a fresh external source directory, the existing
+[4K build environment](README.md#build-and-launch), and a separate test
+prefix. From the LinVxtory root:
+
+```sh
+kit=$(realpath docs/7900)
+sh build.sh "$RESEARCH_SRC"
+cd "$RESEARCH_SRC"
+test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
+git apply --index "$kit/rr-backend.patch.txt"
+test "$(git write-tree)" = 80481c1fec1ebff7600a947633567c088c4486ea
+cargo test --locked --offline --target x86_64-pc-windows-msvc \
+  -p victory-hle --features dlss,diagnostics --lib --no-run
+```
+
+Use the test executable printed by Cargo. Stage both signed feature DLLs
+beside it before NGX initializes and use the [probe runtime
+setup](rr-probe/README.md#run). In the isolated runtime:
+
+```sh
+"$PROTON_WINE" "$TEST_EXE" --exact \
+  modules::fidelityfx::ngx::rr::tests::renderer_rr_reads_back_reset_and_history \
+  --ignored --nocapture --test-threads=1
+```
+
+Use the original external control directory for SR replays. A future
+in-game caller must choose SR before it skips stock denoising and handle
+a failure during NGX recording without presenting a partially written
+command list.
