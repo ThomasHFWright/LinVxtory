@@ -119,8 +119,14 @@ returned nonzero, finite sampled red values:
 | Following frame, history | Reflection motion | 2 |
 | Explicit reset | Hit distance, world-to-view and view-to-clip matrices | 3 |
 
-On the same device the SR feature also created with its own live parameter
-map and handle, completed fence 4 and released successfully. The renderer
+The original three-frame test also created SR with its own live parameter
+map and handle, completed fence 4 and released successfully. The current
+test adds independently initialized absent, zero, signed-difference, and
+repeat-absent DOF guide arms. It checks that omission clears the binding
+and that all 19 RR submissions complete before the SR coexistence check
+at fence 20. With model preset F on SDK 310.9.16, the omitted and zero
+controls matched at the sampled blur edge. The signed guide changed the
+output by up to 18 binary16 representable steps at those coordinates. The renderer
 test uses linear depth. The preceding standalone probe checks a full image.
 Both tests use synthetic geometry.
 
@@ -145,7 +151,7 @@ sh build.sh "$RESEARCH_SRC"
 cd "$RESEARCH_SRC"
 test "$(git write-tree)" = 3d033cbd633757d2fd15f97a4323d566e8a043ba
 git apply --index "$kit/rr-backend.patch.txt"
-test "$(git write-tree)" = 80481c1fec1ebff7600a947633567c088c4486ea
+test "$(git write-tree)" = ea647718da0ebb9a65b1086766d85a820b35bb08
 cargo test --locked --offline --target x86_64-pc-windows-msvc \
   -p victory-hle --features dlss,diagnostics --lib --no-run
 ```
@@ -279,3 +285,17 @@ native denoisers**. All RR evaluations reported so far used the standalone
 or renderer hardware fixtures. A valid gameplay comparison requires both a
 confirmed in-game feature-13 evaluation and proof of the specific stock
 filters it replaced.
+
+## Second SR control
+
+The published control executable completed a second offline, windowed AOC
+cell replay on the same driver, warm-cache seed and save. Over elapsed
+seconds 240–295, 427 title Present intervals gave **8.64 median FPS** and
+**171.37 ms p95**, versus 10.77 FPS and 119.01 ms in the original control.
+Timing excluded loading and screenshot collection in that window. This
+is run-to-run variation within SR; there is no matched RR measurement yet.
+
+The post-timing sequence shows the player's face in profile, the ponytail,
+wire window, bedding and room lighting during the turn. The short
+high-cadence crop during the turn coincided with a game stall and contained
+no new title Presents. That crop cannot establish frame-to-frame ghosting.
