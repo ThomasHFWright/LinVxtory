@@ -686,3 +686,12 @@ each. Sequence 16753 accepted the refreshed packed history from that
 same backing. The replay used capture and scripted camera motion, so
 its frame times are unsuitable for comparison against the SR control.
 [Combined reproduction](dive-testing.md#reproduce-optical-rr-with-the-opaque-post-filters-bypassed)
+
+When the alpha replacement was also enabled, a separate bounded replay
+found the exact alpha writer and its same-frame consumer in the closed
+queue cohort. It declined the replacement on four frames because the
+title's constant buffer changed between translation and the cutoff.
+The late optical evaluation still ran for request 1881 with the native
+filters enabled. The proposed alpha dispatch uses the renderer's
+existing deferred constant-buffer fill, shared with the original
+shader. Its GPU dispatch and timing are still under test.
