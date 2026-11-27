@@ -470,6 +470,32 @@ bookmark returned within 0.003 game-world units, with identical heading
 and clock. The game's camera stayed independent of the saved position.
 [Reproduce the EXR pair](dive-testing.md#capture-native-4k-sr-and-rr-from-one-game-frame)
 
+### Preserving the wavy window
+
+In a stationary cell replay, two independent RR histories received the
+same 720p game frame, the same DOF guide and a reset. One also received
+the original HDR color captured before transparency. The paired SR
+references were byte-identical. At Present 1766, submission 8717, the RR
+output hashes were `7dd81c301c703ef0` without the guide and
+`c8fe8ece5df38d79` with it. The AOC showed SR throughout this experiment.
+
+The additional guide restored some visible structure along the roof and
+table. In two fixed roof patches, mid-scale luminance contrast relative
+to SR went from 64% to 71% and from 62% to 70%. Neither RR image
+preserved the reference ripple. These ratios describe image contrast in
+one reset frame. They cannot identify native displacement or establish
+temporal stability.
+
+To reproduce the comparison, add the [glass comparison overlay](rr-glass-compare.patch.txt)
+to the [HDR pair tree](dive-testing.md#capture-native-4k-sr-and-rr-from-one-game-frame)
+`5025e20d5658f9a3691999bd85fa726dcc5c4b26`. The resulting tree is
+`30256e4ebd5b64af8f6fcadaffb0a0fce44b31e1`. Use the same diagnostics
+build, keep the native filters on, and set `VICTORY_RR_GLASS_COMPARE=1`,
+`VICTORY_RR_BACKGROUND_FRAME=1`, and `VICTORY_RR_SHADOW_LIMIT=1` in the
+pair setup. Compare the original and `-before-transparency` EXR
+directories after matching their Present, camera, submission, reset,
+exposure and SR image bytes.
+
 ## Native output and fallback
 
 The bounded display experiment selected RR in the actual 4K FFX slot
