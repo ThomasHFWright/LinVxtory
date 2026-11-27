@@ -81,3 +81,26 @@ The tested executable SHA-256 was
 `af5b16357a50e3e5febd724b2e5d4869c038ee5c6993f01d9e8d9cc678cc8a35`.
 The tested `nvngx_dlssd.dll` SHA-256 was
 `b49435ae346f227feafe7bbe937d88277ea0ee7323975ec06488f377fdb46cee`.
+
+### Compare the input and GPU output visually
+
+In a fresh private working directory, run the same fixture with
+`--preview`. The fixture checks the two evaluations and GPU readbacks
+before exporting the final frame.
+
+```sh
+"$PROTON_WINE" "$PROBE_DIR/rr-probe.exe" --preview
+```
+
+`noisy-input-720p.ppm` contains the synthetic input after the same FP16
+quantization used by the GPU upload. `ray-reconstruction-4k.ppm` comes from
+the fenced output readback. Both exports use the same linear-to-sRGB
+conversion and preserve their native resolutions. The export refuses to
+overwrite existing files.
+
+On the RTX 5090 run, a flat background tile provided a simple grain check.
+Within input coordinates x=50…79, y=36…55, the blue channel's population
+standard deviation was 8.95 in the input and 0.90 at the corresponding 4K
+pixel centers (3x+1, 3y+1), in 8-bit sRGB values. This describes the 600
+samples in that synthetic tile. Gameplay quality requires a separate
+in-game comparison.
