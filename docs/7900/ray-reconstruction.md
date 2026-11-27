@@ -512,6 +512,23 @@ this test. Removing redundant native work and preserving the wavy glass
 are still open. A 55-second RR performance comparison awaits those
 changes. [Reproduce the native output test](dive-testing.md#test-the-native-4k-upscaler-slot-on-the-aoc)
 
+A follow-up tested whether the renderer could commit the later RR slot
+before the earlier opaque filters were submitted. Two more 4K RR slots
+retired with zero SR GPU evaluations, at Presents 2385 and 2388. The
+early decision succeeded on neither frame. The matching opaque source
+submissions 19583 and 19631 recorded 15,776 and 11,168 compute
+invocations respectively for **each** of the bilateral and history-update
+filters. The original denoisers were still running in both frames.
+
+The native glass producer was independently identified in a stock 4K
+cell replay. At Present 1937, submission 11993, the active transmission
+draw passed 186,626 raster samples and changed 186,624 pixels of the
+1280×720 HDR buffer. Its footprint excluded the character where she
+occluded the pane and included the visible wire. Its bounding rectangle
+would have included 86,584 additional pixels. This draw precedes heat
+haze and depth of field, so preserving the final glass still needs a
+comparison at the upscaler output.
+
 The [November 27 Victory-fork replacement](https://github.com/fxceless/victory-fork/commit/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea)
 introduces a different NVIDIA renderer baseline. Its [DLSS implementation
 notes](https://github.com/fxceless/victory-fork/blob/5dbf5ce226690bb0f1b2949dc8ef822617ae81ea/docs/dlss.md)
