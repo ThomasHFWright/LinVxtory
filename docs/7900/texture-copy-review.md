@@ -24,10 +24,12 @@ frame times are pending.
 
 ## Reproduce the CPU comparison
 
-Create two separate renderer directories from this branch with
-`sh build.sh --control <renderer-directory>`. The original SR tree is
-`3d033cbd633757d2fd15f97a4323d566e8a043ba`. Apply the overlay only to
-the candidate.
+Create separate baseline and candidate renderer directories with
+`sh build.sh --sr --control <renderer-directory>`. On revisions where
+SR is the default and `--sr` is unavailable, use `sh build.sh --control
+<renderer-directory>`. Both directories start at the original SR tree
+`3d033cbd633757d2fd15f97a4323d566e8a043ba`. Apply the overlay manually
+in the candidate directory.
 
 ```sh
 git apply --index "$kit/docs/7900/texture-copy-rows.patch.txt"
@@ -41,6 +43,13 @@ disposable control directory. Run the same example in `diag` on both
 trees and alternate the order. For a Windows comparison build with
 `--target x86_64-pc-windows-msvc` and run the resulting binaries under Wine.
 
-The overlay applies separately to the original RR control tree
-`7a1a47ccb01b0b13afee08c4b715fbc2793a7987` and produces
-`3a5b4f5ccae92227726882aaacc43d0d7e891e32`.
+## Apply to other locked renderer trees
+
+The same manual application was verified against these source trees.
+The CPU timings above use the original SR control pair.
+
+| Renderer | Base tree | Tree after applying the overlay |
+| --- | --- | --- |
+| Original RR control (`--rr --control`) | `7a1a47ccb01b0b13afee08c4b715fbc2793a7987` | `3a5b4f5ccae92227726882aaacc43d0d7e891e32` |
+| 4K SR (`--sr` on RR-default revisions) | `1ec8cdd4791d95b60ce2457d71d7b96c70b3b700` | `3e3e0067c896d6b90a606b2e248b5653e018e8e4` |
+| Default 4K RR (`--rr` on RR-default revisions) | `d6adab8c7687f8bc1ec4e794168f5490b864db78` | `97024505d7c4efc71514776773d23b4424e42e1a` |
