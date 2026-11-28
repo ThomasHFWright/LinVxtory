@@ -6,10 +6,10 @@ Super Resolution replay measured 10.77 median FPS and 119.01 ms p95 over
 585 title Present intervals in the cell at +240 to +295 s. See the
 [control build and results](README.md#historical-4k-super-resolution-control).
 
-The candidate default 4K preset requests one NGX Ray Reconstruction
-evaluation per qualifying frame from startup. It retains the game’s
-native global illumination, preserves the original wavy glass and
-replaces four native reflection filter bodies on eligible frames. The
+The default 4K preset requests one NGX Ray Reconstruction evaluation
+per qualifying frame from startup. It retains native global illumination
+and alpha reflection history, preserves the original wavy glass, and
+replaces three native opaque reflection passes on eligible frames. The
 title applies its later postprocessing and composites the UI. A frame
 that misses the filter cutoff keeps stock Super Resolution and the
 native filters. The first intro upscales observed in the hardware
@@ -21,6 +21,36 @@ hybrid that retained diffuse and caustic accumulation. Its stock-vs-RR
 timing pair measured 8.54 vs 8.75 median FPS and 271.46 vs 202.39 ms
 p95. Those results apply to the hybrid-GI experiment.
 [Hybrid-GI filter evidence](#diffuse-history-replacement) · [Historical same-build timing](#capture-free-timing-with-the-stock-fallback-guard)
+
+## Cell lighting stability
+
+The 720p → 4K Series S cell replay on RTX 5090, GE-Proton 11-14 and
+NGX 310.9.16 captured the same four patches at the RR input, directly
+after the RR evaluation, and at DXGI Present. The largest underside
+flash was already +5.31 EV in the supplied scene color, measured +5.33
+EV directly after RR, and produced a 113.34-level step in encoded luma
+on the displayed tile. Both frames presented optical RR with continuous
+history and pre-exposure 1.0. The optical layer had zero coverage in
+the measured patches.
+
+The comparison uses adjacent frames from +230 to +410 seconds, after
+the cell loaded. Counts include every exact Present pair in the window,
+including provider changes.
+
+| Reflection histories retained before RR | Exact pairs | Under-bed steps over 5 / 10 / 25 luma levels | Peak absolute step |
+| --- | ---: | ---: | ---: |
+| Neither opaque nor alpha | 894 | 34 / 14 / 3 | 113.34 |
+| Native opaque and alpha | 947 | 6 / 0 / 0 | 7.57 |
+| Native alpha only, the new default | 853 | 2 / 0 / 0 | 5.63 |
+
+All three runs used the same diagnostic executable and retained native
+GI and the original wavy glass. For uninterrupted RR without a history
+reset, the underside exceeded five luma levels in 27 of 706 pairs with
+the cut and 1 of 701 with native alpha alone. Native alpha alone still
+replaced the three opaque passes. The fixture verified 32 full 4K images
+against their matching native-alpha tiles. The +370 s full-image request
+was interrupted, while exact tile capture continued to the end of the
+window. These are instrumented quality results. [Fence-matched replay results](https://github.com/TomTomAIbot/LinVxtory/pull/14#issuecomment-7236347897)
 
 ## Graph investigation
 
