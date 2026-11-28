@@ -52,6 +52,28 @@ against their matching native-alpha tiles. The +370 s full-image request
 was interrupted, while exact tile capture continued to the end of the
 window. These are instrumented quality results. [Fence-matched replay results](https://github.com/TomTomAIbot/LinVxtory/pull/14#issuecomment-7236347897)
 
+### Remaining reflection pulses
+
+Follow-up tests sampled native packed specular and diffuse inputs,
+pre-alpha HDR, raw RR output, the native tone pass and exact DXGI
+Present. In one replay with the opaque filters bypassed, an under-bed
+step of 19.47 luma levels was already +2.21 EV before RR and +2.32 EV
+directly after it. The final RGB10A2-to-Present path contributed at
+most 0.20 levels of coherent variation in that tile. An exact
+depth and motion agreement check in the reflection guide showed no
+clear benefit in pairs with comparable incoming lighting changes.
+
+The native opaque history option keeps the three native filters and
+still presents a single RR evaluation on qualifying 4K frames. In
+the matched +259–410 s window, the worst underside step fell from
+19.47 to 9.48 levels. Steps over ten fell from 4 of 629 uninterrupted
+RR pairs to 0 of 622. The 95th percentile of packed specular input
+steps fell from 1.56 to 0.45 EV. A separate retained-history run
+also recorded zero steps over ten in the same window. Small pulses
+remained, and the retained-history run had more fallback edges.
+The wavy glass remained visible. These instrumented replays
+measured image quality. [Fence-matched follow-up](https://github.com/TomTomAIbot/LinVxtory/pull/15#issuecomment-7236732293)
+
 ## Graph investigation
 
 In the locked renderer, `fidelityfx/observe.rs` intercepts the title's

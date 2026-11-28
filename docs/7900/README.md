@@ -27,6 +27,12 @@ Super Resolution until the required frame data qualifies.
 [Cell lighting results](ray-reconstruction.md#cell-lighting-stability) ·
 [Startup investigation](ray-reconstruction.md#continuous-startup-investigation)
 
+To retain opaque reflection history as well, export
+`VICTORY_RR_RETAIN_NATIVE_OPAQUE=1` before launching the title with
+the default RR preset. The three native opaque filters feed the single
+4K RR evaluation. Use the regular automatic RR build and keep the
+preset’s native alpha and GI settings. [Matched native-history comparison](ray-reconstruction.md#remaining-reflection-pulses)
+
 ## Historical 4K Super Resolution control
 
 The historical profile feeds **1280×720** into DLSS Super Resolution

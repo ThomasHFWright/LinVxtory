@@ -52,4 +52,5 @@ The CPU timings above use the original SR control pair.
 | --- | --- | --- |
 | Original RR control (`--rr --control`) | `7a1a47ccb01b0b13afee08c4b715fbc2793a7987` | `3a5b4f5ccae92227726882aaacc43d0d7e891e32` |
 | 4K SR (`--sr` on RR-default revisions) | `1ec8cdd4791d95b60ce2457d71d7b96c70b3b700` | `3e3e0067c896d6b90a606b2e248b5653e018e8e4` |
-| Default 4K RR (`--rr` on RR-default revisions) | `d6adab8c7687f8bc1ec4e794168f5490b864db78` | `97024505d7c4efc71514776773d23b4424e42e1a` |
+| 4K RR before the native opaque history option | `d6adab8c7687f8bc1ec4e794168f5490b864db78` | `97024505d7c4efc71514776773d23b4424e42e1a` |
+| 4K RR with the native opaque history option | `4801c44982d83927308d42fa500f5632a8bc4105` | `722fa7421662c322247527a2fd3e9fa5ec644725` |
