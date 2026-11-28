@@ -1083,3 +1083,47 @@ The first SR-only control on the same pin measured 4.57 median FPS and
 before the trigger was armed. The size and cause of this run-to-run
 variation remain unresolved. The table uses the repeated SR control
 and describes this tested cell and pair.
+
+### Corner mirror and specular albedo
+
+The previous specular albedo guide used different coefficients and powers
+from the environment BRDF fit in the NVIDIA DLSS-RR Integration Guide
+for SDK 310.9.16. The [source overlay](rr-specular-albedo.patch.txt)
+corrects the fit in the existing opaque guide dispatch. It uses the same
+material reflectance, linear roughness, normals and reflection motion.
+
+An offline Series S replay on CachyOS, GE-Proton 11-14 and RTX 5090
+held a view of the corner mirror at 1280×720 input and 3840×2160 output
+on Xvfb. The comparison kept native opaque history in all three arms.
+Each switch reset RR history before 24 exact feature-13 evaluations
+warmed the new arm. The vent, window jamb and conduit registered at
+zero display-pixel shift between the capture bands.
+
+| First 20 stationary seconds | Original | SDK fit | Original again |
+| --- | ---: | ---: | ---: |
+| Adjacent verified RR pairs after resets | 107 | 58 | 46 |
+| Bright mirror patch-median steps above 5 luma codes | 6 | 0 | 2 |
+| Worst patch-median step, 8-bit luma codes | 17.46 | 2.21 | 7.07 |
+| Fine-detail temporal p95, 8-bit luma codes | 3.67 | 3.43 | 5.87 |
+
+The fit raised median specular guide values by 9–12× across three
+mirror tiles. The reflected room pattern retained a correlation of
+0.989 across the three capture bands. The wavy wired pane and hair
+silhouette remained visible. The raw scene input varied between arms.
+Restricting pairs to a patch-mean input step below 0.1 EV still gave
+maximum display steps of 6.15, 1.00 and 6.80 codes in the three arms.
+The replay left the cell late in the return arm. The table uses the
+common interval before that transition.
+
+A separate 20-second replay with the SDK fit and the default opaque
+post-filter bypass presented 108 verified RR frames and two stock SR
+fallbacks. Across 56 warmed adjacent RR pairs, the largest
+patch-median step in the three mirror tiles was 2.86 luma codes.
+The original pane, wire mesh and backlit hair were visible. An SR
+fallback immediately before the hold changed one bright patch by
+22.62 codes. The matched old-fit comparison used the native opaque
+history route described above.
+
+The capture runs include diagnostics whose overhead precludes
+performance comparison.
+[Earlier sampling-pattern comparison and turn evidence](https://github.com/TomTomAIbot/LinVxtory/pull/17#issuecomment-7237848363).
