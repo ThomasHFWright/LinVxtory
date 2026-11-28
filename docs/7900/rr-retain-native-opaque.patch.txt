@@ -1,0 +1,60 @@
+diff --git a/crates/victory-gpu/src/draw/opaque_current.rs b/crates/victory-gpu/src/draw/opaque_current.rs
+index 59ac171..243f6d1 100644
+--- a/crates/victory-gpu/src/draw/opaque_current.rs
++++ b/crates/victory-gpu/src/draw/opaque_current.rs
+@@ -83,6 +83,23 @@ pub(super) fn kernels_enabled() -> bool {
+         && *ENABLED.get_or_init(|| std::env::var_os("VICTORY_RR_REFLECTION_CURRENT_KERNELS").is_some_and(|v| v == "1"))
+ }
+
++#[cfg(feature = "diagnostics")]
++pub(super) fn retain_native() -> bool {
++    static RETAIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *RETAIN.get_or_init(|| {
++        if !rr_display::continuous()
++            || !std::env::var_os("VICTORY_RR_RETAIN_NATIVE_OPAQUE").is_some_and(|value| value == "1")
++        {
++            return false;
++        }
++        if super::alpha_current::enabled() || super::probe_current::enabled() {
++            tracing::warn!("Native opaque comparison requires native alpha and native GI");
++            return false;
++        }
++        true
++    })
++}
++
+ /// The original one-command indirect range is unchanged. Only its two
+ /// mutually exclusive count entries are private to this recording.
+ #[cfg(feature = "diagnostics")]
+@@ -783,8 +800,11 @@ pub(crate) fn choose_before_deferred(
+     prepared.set_alpha(future.alpha);
+     prepared.set_probe(probe);
+     if future.request.adopt(prepared) {
+-        dirty.cut(free, pair, sequence);
+-        mode.store(CUT, Ordering::Release);
++        let retain_native = retain_native();
++        if !retain_native {
++            dirty.cut(free, pair, sequence);
++            mode.store(CUT, Ordering::Release);
++        }
+         if !rr_display::quiet() {
+             tracing::info!(
+                 sequence,
+@@ -792,6 +812,7 @@ pub(crate) fn choose_before_deferred(
+                 slot_epoch = future.packet.slot_epoch,
+                 history = pair.history,
+                 packed = pair.packed,
++                retain_native,
+                 "RR adopted closed future slot before opaque cutoff"
+             );
+         }
+--- a/crates/victory-gpu/src/draw/rr_display.rs
++++ b/crates/victory-gpu/src/draw/rr_display.rs
+@@ -488,6 +488,6 @@
+         packet,
+         request.frame.motion_scale,
+     )?;
+-    let chosen = encode(request, list, native, 0, true, optical)?;
++    let chosen = encode(request, list, native, 0, !super::opaque_current::retain_native(), optical)?;
+     Ok(Prepared { packet, chosen })
+ }

@@ -20,6 +20,10 @@ with the native filters.
 [Cell lighting results](docs/7900/ray-reconstruction.md#cell-lighting-stability) ·
 [Startup investigation](docs/7900/ray-reconstruction.md#continuous-startup-investigation)
 
+Set `VICTORY_RR_RETAIN_NATIVE_OPAQUE=1` for steadier reflections in the
+cell. This retains the three opaque reflection filters ahead of 4K RR.
+[Matched native-history comparison](docs/7900/ray-reconstruction.md#remaining-reflection-pulses)
+
 ## Build and run
 
 Set up Rust 1.98.1, the Windows x64 MSVC cross toolchain, the locked Cargo
