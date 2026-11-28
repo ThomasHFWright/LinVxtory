@@ -1,0 +1,84 @@
+diff --git a/crates/victory-gpu/src/draw/rr_camera.rs b/crates/victory-gpu/src/draw/rr_camera.rs
+index 0b730d0..6562d4b 100644
+--- a/crates/victory-gpu/src/draw/rr_camera.rs
++++ b/crates/victory-gpu/src/draw/rr_camera.rs
+@@ -79,7 +79,7 @@ impl Source {
+ struct Velocity {
+     rotation: [f32; 16],
+     projection: [f32; 16],
+-    position: [f32; 4],
++    world_offset: [f32; 4],
+     extent: [f32; 2],
+ }
+
+@@ -91,14 +91,20 @@ impl Velocity {
+         Some(Self {
+             rotation: source.words::<16, 64>(0)?,
+             projection: source.words::<16, 64>(0x40)?,
+-            position: source.words::<4, 16>(0xc0)?,
++            world_offset: source.words::<4, 16>(0xc0)?,
+             extent,
+         })
+     }
+
++    fn origin(self) -> [f32; 3] {
++        // The title adds this offset to world positions before view rotation.
++        let [x, y, z, _] = self.world_offset;
++        [-x, -y, -z]
++    }
++
+     fn world_to_view(self) -> Option<[f32; 16]> {
+         let r = self.rotation;
+-        if self.position[3] != 1.0
++        if self.world_offset[3] != 1.0
+             || r[15] != 1.0
+             || [r[3], r[7], r[11], r[12], r[13], r[14]] != [0.0; 6]
+             || self.projection[0] <= 0.0
+@@ -120,8 +126,9 @@ impl Velocity {
+             return None;
+         }
+         let mut world_to_view = r;
++        let origin = self.origin();
+         for i in 0..3 {
+-            world_to_view[12 + i] = -(0..3).map(|k| self.position[k] * r[k * 4 + i]).sum::<f32>();
++            world_to_view[12 + i] = -(0..3).map(|k| origin[k] * r[k * 4 + i]).sum::<f32>();
+         }
+         world_to_view
+             .iter()
+@@ -300,7 +307,7 @@ impl Samples {
+             world_to_view,
+             view_to_clip,
+             jittered_projection: velocity.projection,
+-            origin: [velocity.position[0], velocity.position[1], velocity.position[2]],
++            origin: velocity.origin(),
+             begun,
+             epoch,
+         }, motion))
+@@ -502,7 +509,7 @@ mod tests {
+     };
+     const RENDER: [u32; 2] = [1280, 720];
+
+-    fn pose(jitter: [f32; 2], position_x: f32) -> Velocity {
++    fn pose(jitter: [f32; 2], offset_x: f32) -> Velocity {
+         Velocity {
+             rotation: [
+                 0., -1., 0., 0., 1., 0., 0., 0., 0., 0., 1., 0., 0., 0., 0., 1.,
+@@ -525,7 +532,7 @@ mod tests {
+                 0.05,
+                 0.,
+             ],
+-            position: [position_x, 40., -10., 1.],
++            world_offset: [offset_x, 40., -10., 1.],
+             extent: [1280., 720.],
+         }
+     }
+@@ -587,7 +594,8 @@ mod tests {
+             overflow: false,
+         };
+         let actual = camera(&batch, 1779, 13, jitter).unwrap();
+-        assert_eq!(&actual.world_to_view[12..], &[-40., 20., 10., 1.]);
++        assert_eq!(actual.origin, [-20., -40., 10.]);
++        assert_eq!(&actual.world_to_view[12..], &[40., -20., -10., 1.]);
+         assert_eq!(&actual.view_to_clip[8..12], &[0., 0., 0., -1.]);
+         assert!(camera(&batch, 1778, 13, jitter).is_none());
+         assert!(camera(&batch, 1779, 11, jitter).is_none());

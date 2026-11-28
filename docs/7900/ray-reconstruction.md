@@ -1127,3 +1127,33 @@ history route described above.
 The capture runs include diagnostics whose overhead precludes
 performance comparison.
 [Earlier sampling-pattern comparison and turn evidence](https://github.com/TomTomAIbot/LinVxtory/pull/17#issuecomment-7237848363).
+
+### Camera translation and reflected motion
+
+The native velocity camera constant is a world offset. Negating it at
+capture gives the camera origin used to rebase the previous frame.
+The [source overlay](rr-camera-origin.patch.txt) fixes that convention
+for the origin and world-to-view matrix. Reflection motion retains the
+existing one-render-pixel check against the game's opaque motion.
+
+In five verified 4K RR frames during left and right turns, the old
+static-surface prediction differed from the native primary motion by
+26–57 render pixels at the sampled tile medians. Negating the
+translation reduced the measured median residuals to 0.014–0.061
+render pixels on both the mirror and nearby masonry. This comparison
+uses opaque depth, motion and camera transforms captured for the same
+presented frame.
+
+The corrected build verified three motion-bearing RR Presents with
+the SDK specular fit and the default opaque post-filter bypass. The
+old one-pixel check passed on all four sampled tiles, with a
+reprojection p95 under 0.073 render pixels. Within the three mirror
+tiles, 2,200 of 2,304 samples used reflected motion. Bright
+reflection motion differed from primary motion by roughly 12 render
+pixels on the sampled turns.
+
+The exact moving crops showed the highlight entering and leaving the
+sampled mirror area without a sustained duplicate. Registered
+post-turn 4K views retained the reflected window, the original glass
+and wire mesh, and the face and hair. Full-frame transient
+disocclusion remains unverified.

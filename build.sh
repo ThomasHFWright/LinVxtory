@@ -102,6 +102,7 @@ if [ "$control" -eq 0 ]; then
         apply_locked_patch d6adab8c7687f8bc1ec4e794168f5490b864db78 rr-pane-free-cohort.patch.txt
         apply_locked_patch 4801c44982d83927308d42fa500f5632a8bc4105 rr-retain-native-opaque.patch.txt
         apply_locked_patch e6e197ed9bd33c5eea3bf82d87b2b4b2c16813da rr-specular-albedo.patch.txt
+        apply_locked_patch df1d2db11514ccefdfd464e44fb254e7fe4a0045 rr-camera-origin.patch.txt
     fi
 fi
 if [ "$tree" != "$expected" ]; then
