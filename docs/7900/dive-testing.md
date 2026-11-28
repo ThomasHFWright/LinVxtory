@@ -85,6 +85,33 @@ boundaries. FPS is the reciprocal of the median frame interval, and p95
 uses the nearest rank. Keep captures outside the measured window. Include
 the run's selected provider and fallback counts alongside the JSON.
 
+## Reproduce the corner mirror view
+
+Start the Series S cell from the same save, with Lucia facing the wire
+window. In the diagnostics build, `I`, `J`, `K`, and `L` act as the
+right stick, and `D` moves Lucia sideways. Export the recorded input
+schedule in the title process environment before launch.
+
+```sh
+export VICTORY_KEYS='20:Enter,25:Enter,30:Enter,35:Enter,237.568-238.188:J,256.549-257.099:I,281.724-282.874:J,286.642-287.892:I,308.396-310.296:J,313.554-315.004:I,330.000-331.000:D,344.000-345.000:I,344.013-345.063:L,358.000-359.000:J,370.361-371.081:K,372.000-373.000:J,374.047-375.247:J,394.019-394.569:J'
+```
+
+The times are seconds from the first GameInput poll. On the tested
+RTX 5090 and GE-Proton 11-14 setup, the final input ended near +399 s
+from launch. The settled view has Lucia on the left, the full convex
+mirror below and to the right of the ceiling vent, and the upper
+wire window at the right edge. The mirror reflects the room lights,
+bunks, and Lucia’s orange uniform. Allow the camera to settle after
+the final input, then request two `cap 8` bursts from the capture
+channel with no movement between them.
+
+For a fixed-view reflection comparison, register on the vent, window
+jamb, and wall seams around the mirror. Measure the reflected detail
+inside the rim and the nearby matte wall as a control. Verify the
+provider on each Present and score uninterrupted RR pairs with the
+room geometry aligned. The schedule was tested on one runtime setup.
+Use the landmarks to qualify the captured view on another run.
+
 ## Reproduce the experimental in-title RR test
 
 Start from another fresh build of the 4K control. Apply the following
