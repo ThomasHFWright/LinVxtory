@@ -1,0 +1,50 @@
+diff --git a/crates/victory-gpu/src/rr/opaque_guides.hlsl b/crates/victory-gpu/src/rr/opaque_guides.hlsl
+index ec9943c..17e2d47 100644
+--- a/crates/victory-gpu/src/rr/opaque_guides.hlsl
++++ b/crates/victory-gpu/src/rr/opaque_guides.hlsl
+@@ -37,24 +37,30 @@ float3 decodeNormal(float3 packed)
+     return normalize(normal);
+ }
+
+-// Rational environment BRDF fit from NVIDIA DLSS-RR Integration Guide, appendix.
+-// alpha is squared linear roughness. This is the standard isotropic lobe.
++// NVIDIA DLSS-RR Integration Guide 310.9.16, Specular Albedo Calculation.
+ float3 integratedSpecular(float3 f0, float alpha, float noV)
+ {
+     float noV2 = noV * noV;
+-    float alpha2 = alpha * alpha;
+-    float alpha3 = alpha2 * alpha;
+-    float biasNum = 0.99044 - 1.28514 * noV + alpha * (1.29678 - 0.755907 * noV);
+-    float biasDen = 1.0 + 2.92338 * noV + 59.4188 * noV2
+-        + alpha * (20.3225 - 27.0302 * noV + 222.592 * noV2)
+-        + alpha3 * (121.563 + 626.13 * noV + 316.627 * noV2);
+-    float scaleNum = 3.59685 - 1.36772 * noV
+-        + alpha * (9.04401 - 16.3174 * noV);
+-    float scaleDen = 1.0 + 4.86950 * noV2 + 21.3013 * noV2 * noV
+-        + alpha * (34.5075 + 15.0601 * noV2 + 36.4137 * noV2 * noV)
+-        + alpha3 * (196.288 + 98.2775 * noV2 + 254.956 * noV2 * noV);
+-    float bias = (biasNum / biasDen) * saturate(f0.g * 50.0);
+-    return f0 * max(0.0, scaleNum / scaleDen) + max(0.0, bias);
++    float4 view = float4(1.0, noV, noV2, noV2 * noV);
++    float3 surface = float3(1.0, alpha, alpha * alpha * alpha);
++    const float2x2 biasNumerator = float2x2(0.99044, -1.28514, 1.29678, -0.755907);
++    const float3x3 biasDenominator = float3x3(
++        1.0, 2.92338, 59.4188,
++        20.3225, -27.0302, 222.592,
++        121.563, 626.13, 316.627);
++    const float2x2 scaleNumerator = float2x2(0.0365463, 3.32707, 9.0632, -9.04756);
++    const float3x3 scaleDenominator = float3x3(
++        1.0, 3.59685, -1.36772,
++        9.04401, -16.3174, 9.22949,
++        5.56589, 19.7886, -20.2123);
++    float bias = dot(mul(biasNumerator, view.xy), surface.xy)
++        * rcp(dot(mul(biasDenominator, view.xyw), surface));
++    float scale = dot(mul(scaleNumerator, view.xy), surface.xy)
++        * rcp(dot(mul(scaleDenominator, view.xzw), surface));
++    bias *= saturate(f0.g * 50.0);
++    float3 positiveScale = max(0.0, scale);
++    float3 positiveBias = max(0.0, bias);
++    return mad(f0, positiveScale, positiveBias);
+ }
+
+ #define GUIDE_ROOT "RootConstants(num32BitConstants=19, b0),DescriptorTable(SRV(t0, numDescriptors=5), UAV(u0, numDescriptors=4))"
