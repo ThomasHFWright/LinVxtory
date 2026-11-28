@@ -1115,6 +1115,15 @@ maximum display steps of 6.15, 1.00 and 6.80 codes in the three arms.
 The replay left the cell late in the return arm. The table uses the
 common interval before that transition.
 
-The stationary comparison measures the correction at this pose.
-The capture runs include diagnostics whose overhead precludes performance
-comparison. [Earlier sampling-pattern comparison and turn evidence](https://github.com/TomTomAIbot/LinVxtory/pull/17#issuecomment-7237848363).
+A separate 20-second replay with the SDK fit and the default opaque
+post-filter bypass presented 108 verified RR frames and two stock SR
+fallbacks. Across 56 warmed adjacent RR pairs, the largest
+patch-median step in the three mirror tiles was 2.86 luma codes.
+The original pane, wire mesh and backlit hair were visible. An SR
+fallback immediately before the hold changed one bright patch by
+22.62 codes. The matched old-fit comparison used the native opaque
+history route described above.
+
+The capture runs include diagnostics whose overhead precludes
+performance comparison.
+[Earlier sampling-pattern comparison and turn evidence](https://github.com/TomTomAIbot/LinVxtory/pull/17#issuecomment-7237848363).
