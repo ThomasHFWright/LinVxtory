@@ -12,11 +12,12 @@ automatically on qualifying frames, with **1280×720** input and
 native global illumination (GI) run, and the renderer composites the
 title’s UI at presentation.
 
-On eligible frames, RR replaces four native reflection filter passes
-and preserves the game’s original wavy glass. Frames that miss the
+On eligible frames, RR replaces three native opaque reflection passes.
+The preset keeps the game’s alpha reflection history for steadier cell
+lighting and preserves the original wavy glass. Frames that miss the
 filter cutoff, including during startup, use stock Super Resolution
 with the native filters.
-[Native lighting and glass verification](docs/7900/ray-reconstruction.md#native-gi-with-original-glass) ·
+[Cell lighting results](docs/7900/ray-reconstruction.md#cell-lighting-stability) ·
 [Startup investigation](docs/7900/ray-reconstruction.md#continuous-startup-investigation)
 
 ## Build and run

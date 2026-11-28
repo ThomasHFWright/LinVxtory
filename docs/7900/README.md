@@ -19,11 +19,12 @@ preserves the original wavy glass. The title applies its later
 postprocessing and composites the UI at presentation.
 
 For eligible frames, the renderer commits RR before the native filter
-cutoff and replaces four reflection filter passes. When the guides or
-glass data fail to qualify in time, the renderer keeps stock Super
+cutoff and replaces three opaque reflection passes. It retains the
+game’s alpha reflection history to reduce lighting flashes. When the
+guides or glass data fail to qualify in time, the renderer keeps stock Super
 Resolution and the native filters for that frame. Startup can use
 Super Resolution until the required frame data qualifies.
-[Native GI and glass verification](ray-reconstruction.md#native-gi-with-original-glass) ·
+[Cell lighting results](ray-reconstruction.md#cell-lighting-stability) ·
 [Startup investigation](ray-reconstruction.md#continuous-startup-investigation)
 
 ## Historical 4K Super Resolution control
